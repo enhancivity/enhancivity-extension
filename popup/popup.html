@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Enhancivity Login</title>
+  <link rel="stylesheet" type="text/css" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <div id="login-view">
+      <img src="../images/icon48.png" alt="Enhancivity Logo">
+      <h2>Welcome</h2>
+      <p>Log in to access your Enhancivity tools and features.</p>
+      <button id="login-btn" class="btn">Login on Website</button>
+      <p id="error-message" class="error-message"></p>
+    </div>
+
+    <div id="logged-in-view" style="display: none;">
+      <img src="../images/icon48.png" alt="Enhancivity Logo">
+      <h2>Connected</h2>
+      <!-- Logout not fully implemented yet as it requires clearing cookie/storage -->
+      <button id="logout-btn" class="btn">Sign Out</button> 
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
