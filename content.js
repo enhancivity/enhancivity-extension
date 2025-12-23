@@ -1,41 +1,12 @@
 // Enhancivity Content Script
-
+console.log('Enhancivity: Content script loaded.');
 
 let iconElement = null;
 let formElement = null;
 let currentSelection = '';
-let shadowHost = null;
-let shadowRoot = null;
 
 function countWords(str) {
   return str.trim().split(/\s+/).filter(word => word.length > 0).length;
-}
-
-function getShadowRoot() {
-  if (!shadowHost) {
-    shadowHost = document.createElement('div');
-    shadowHost.id = 'enhancivity-extension-host';
-    Object.assign(shadowHost.style, {
-      position: 'fixed',
-      top: '0',
-      left: '0',
-      width: '100%',
-      height: '100%',
-      zIndex: '2147483647',
-      pointerEvents: 'none',
-      overflow: 'visible',
-      display: 'block',
-      margin: '0',
-      padding: '0',
-      border: 'none'
-    });
-    // Append to documentElement (<html>) to avoid body issues
-    document.documentElement.appendChild(shadowHost);
-    shadowRoot = shadowHost.attachShadow({ mode: 'open' });
-  } else if (!shadowHost.isConnected) {
-    document.documentElement.appendChild(shadowHost);
-  }
-  return shadowRoot;
 }
 
 function removeIcon() {
@@ -53,51 +24,38 @@ function removeForm() {
 }
 
 function handleSelection() {
-  // Use setTimeout to allow selection to settle
-  setTimeout(() => {
-    // If form is open, don't interfere
-    if (formElement) return;
+  // If form is open, don't interfere
+  if (formElement) return;
 
-    const selection = window.getSelection();
-    
-    // Basic validation
-    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
-       removeIcon();
-       return;
+  const selection = window.getSelection();
+  const selectedText = selection.toString();
+
+  // Remove existing icon on any selection change first
+  removeIcon();
+
+  if (selectedText && countWords(selectedText) >= 20) {
+    try {
+      currentSelection = selectedText;
+      const range = selection.getRangeAt(0);
+      const rect = range.getBoundingClientRect();
+      
+      if (rect.width === 0 || rect.height === 0) return;
+
+      createIcon(rect);
+    } catch (e) {
+      console.error('Enhancivity: Error getting selection range', e);
     }
-
-    const selectedText = selection.toString();
-
-    // Remove existing icon on any selection change first
-    removeIcon();
-
-    if (selectedText && countWords(selectedText) >= 5) {
-
-      try {
-        currentSelection = selectedText;
-        const range = selection.getRangeAt(0);
-        const rect = range.getBoundingClientRect();
-        
-        if (rect.width === 0 || rect.height === 0) return;
-
-        createIcon(rect);
-      } catch (e) {
-        console.error('Enhancivity: Error getting selection range', e);
-      }
-    }
-  }, 10);
+  }
 }
 
 function createIcon(rect) {
-
   iconElement = document.createElement('div');
   iconElement.id = 'enhancivity-floating-icon';
   
   const iconSize = 32;
-  // Position relative to the FIXED host (viewport coordinates)
   iconElement.style.position = 'absolute';
-  iconElement.style.top = `${rect.bottom + 5}px`;
-  iconElement.style.left = `${rect.right + 5}px`;
+  iconElement.style.top = `${rect.bottom + window.scrollY + 5}px`;
+  iconElement.style.left = `${rect.right + window.scrollX + 5}px`;
   iconElement.style.zIndex = '2147483647';
   iconElement.style.cursor = 'pointer';
   iconElement.style.width = `${iconSize}px`;
@@ -109,7 +67,6 @@ function createIcon(rect) {
   iconElement.style.alignItems = 'center';
   iconElement.style.justifyContent = 'center';
   iconElement.style.transition = 'transform 0.2s ease';
-  iconElement.style.pointerEvents = 'auto'; // Re-enable pointer events
 
   const img = document.createElement('img');
   img.src = chrome.runtime.getURL('images/icon48.png');
@@ -125,11 +82,10 @@ function createIcon(rect) {
   iconElement.addEventListener('mousedown', (e) => {
     e.preventDefault();
     e.stopPropagation();
-
     openTodoForm(rect);
   });
 
-  getShadowRoot().appendChild(iconElement);
+  document.body.appendChild(iconElement);
 }
 
 function openTodoForm(rect) {
@@ -154,19 +110,82 @@ function openTodoForm(rect) {
     fontFamily: "'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
     display: 'flex',
     flexDirection: 'column',
-    gap: '16px',
-    pointerEvents: 'auto' // Re-enable pointer events
+    gap: '16px'
   });
 
-  // Title
+  // Make Drag Logic
+  let isDragging = false;
+  let currentX;
+  let currentY;
+  let initialX;
+  let initialY;
+  let xOffset = 0;
+  let yOffset = 0;
+
+  // Header for dragging
+  const header = document.createElement('div');
+  Object.assign(header.style, {
+    cursor: 'move',
+    padding: '0 0 10px 0',
+    borderBottom: '1px solid #1e2545',
+    marginBottom: '8px'
+  });
+  
+  // Title inside header
   const formTitle = document.createElement('h3');
   formTitle.textContent = 'Create New Task';
-  formTitle.style.margin = '0 0 8px 0';
+  formTitle.style.margin = '0';
   formTitle.style.fontSize = '20px';
   formTitle.style.background = 'linear-gradient(135deg, #897df0, #fdbbf5)';
   formTitle.style.webkitBackgroundClip = 'text';
   formTitle.style.webkitTextFillColor = 'transparent';
-  formElement.appendChild(formTitle);
+  formTitle.style.pointerEvents = 'none'; // Ensure click passes through to header
+  
+  header.appendChild(formTitle);
+  formElement.appendChild(header);
+
+  // Drag Event Listeners
+  header.addEventListener('mousedown', dragStart);
+
+  function dragStart(e) {
+    if (e.target === header || e.target.parentElement === header) {
+      initialX = e.clientX - xOffset;
+      initialY = e.clientY - yOffset;
+      
+      isDragging = true;
+      
+      // Bind move and up to window to handle fast movements/leaving the element
+      window.addEventListener('mousemove', drag);
+      window.addEventListener('mouseup', dragEnd);
+    }
+  }
+
+  function drag(e) {
+    if (isDragging) {
+      e.preventDefault();
+      
+      currentX = e.clientX - initialX;
+      currentY = e.clientY - initialY;
+
+      xOffset = currentX;
+      yOffset = currentY;
+
+      setTranslate(currentX, currentY, formElement);
+    }
+  }
+
+  function setTranslate(xPos, yPos, el) {
+    // Keep the -50%, -50% centering logic while adding the drag offset
+    el.style.transform = `translate(calc(-50% + ${xPos}px), calc(-50% + ${yPos}px))`;
+  }
+
+  function dragEnd(e) {
+    initialX = currentX;
+    initialY = currentY;
+    isDragging = false;
+    window.removeEventListener('mousemove', drag);
+    window.removeEventListener('mouseup', dragEnd);
+  }
 
   // Form Fields Helper
   const createInputGroup = (labelText, inputType, id, value = '', isTextarea = false, options = []) => {
@@ -192,9 +211,7 @@ function openTodoForm(rect) {
       color: 'white',
       fontFamily: 'inherit',
       fontSize: '14px',
-      outline: 'none',
-      width: '100%', // Ensure input takes full width
-      boxSizing: 'border-box' // Include padding in width
+      outline: 'none'
     };
 
     if (isTextarea) {
@@ -305,23 +322,22 @@ function openTodoForm(rect) {
   btnGroup.appendChild(saveBtn);
   formElement.appendChild(btnGroup);
 
-  getShadowRoot().appendChild(formElement);
+  document.body.appendChild(formElement);
 }
 
 // Event listeners
-document.addEventListener('mouseup', handleSelection, { capture: true });
+document.addEventListener('mouseup', handleSelection);
 document.addEventListener('keyup', (e) => {
   if (e.key.includes('Arrow') || e.key === 'Shift') {
     handleSelection();
   }
-}, { capture: true });
+});
 
 document.addEventListener('scroll', () => {
   removeIcon();
 }, { passive: true });
 
 document.addEventListener('selectionchange', () => {
-  // Debounce or just clear if collapsed to avoid flickering on rapid changes
   const selection = window.getSelection();
   if (!selection || selection.isCollapsed) {
     removeIcon();
