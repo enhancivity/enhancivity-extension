@@ -1,12 +1,41 @@
 // Enhancivity Content Script
-console.log('Enhancivity: Content script loaded.');
+
 
 let iconElement = null;
 let formElement = null;
 let currentSelection = '';
+let shadowHost = null;
+let shadowRoot = null;
 
 function countWords(str) {
   return str.trim().split(/\s+/).filter(word => word.length > 0).length;
+}
+
+function getShadowRoot() {
+  if (!shadowHost) {
+    shadowHost = document.createElement('div');
+    shadowHost.id = 'enhancivity-extension-host';
+    Object.assign(shadowHost.style, {
+      position: 'fixed',
+      top: '0',
+      left: '0',
+      width: '100%',
+      height: '100%',
+      zIndex: '2147483647',
+      pointerEvents: 'none',
+      overflow: 'visible',
+      display: 'block',
+      margin: '0',
+      padding: '0',
+      border: 'none'
+    });
+    // Append to documentElement (<html>) to avoid body issues
+    document.documentElement.appendChild(shadowHost);
+    shadowRoot = shadowHost.attachShadow({ mode: 'open' });
+  } else if (!shadowHost.isConnected) {
+    document.documentElement.appendChild(shadowHost);
+  }
+  return shadowRoot;
 }
 
 function removeIcon() {
@@ -24,38 +53,51 @@ function removeForm() {
 }
 
 function handleSelection() {
-  // If form is open, don't interfere
-  if (formElement) return;
+  // Use setTimeout to allow selection to settle
+  setTimeout(() => {
+    // If form is open, don't interfere
+    if (formElement) return;
 
-  const selection = window.getSelection();
-  const selectedText = selection.toString();
-
-  // Remove existing icon on any selection change first
-  removeIcon();
-
-  if (selectedText && countWords(selectedText) >= 20) {
-    try {
-      currentSelection = selectedText;
-      const range = selection.getRangeAt(0);
-      const rect = range.getBoundingClientRect();
-      
-      if (rect.width === 0 || rect.height === 0) return;
-
-      createIcon(rect);
-    } catch (e) {
-      console.error('Enhancivity: Error getting selection range', e);
+    const selection = window.getSelection();
+    
+    // Basic validation
+    if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+       removeIcon();
+       return;
     }
-  }
+
+    const selectedText = selection.toString();
+
+    // Remove existing icon on any selection change first
+    removeIcon();
+
+    if (selectedText && countWords(selectedText) >= 5) {
+
+      try {
+        currentSelection = selectedText;
+        const range = selection.getRangeAt(0);
+        const rect = range.getBoundingClientRect();
+        
+        if (rect.width === 0 || rect.height === 0) return;
+
+        createIcon(rect);
+      } catch (e) {
+        console.error('Enhancivity: Error getting selection range', e);
+      }
+    }
+  }, 10);
 }
 
 function createIcon(rect) {
+
   iconElement = document.createElement('div');
   iconElement.id = 'enhancivity-floating-icon';
   
   const iconSize = 32;
+  // Position relative to the FIXED host (viewport coordinates)
   iconElement.style.position = 'absolute';
-  iconElement.style.top = `${rect.bottom + window.scrollY + 5}px`;
-  iconElement.style.left = `${rect.right + window.scrollX + 5}px`;
+  iconElement.style.top = `${rect.bottom + 5}px`;
+  iconElement.style.left = `${rect.right + 5}px`;
   iconElement.style.zIndex = '2147483647';
   iconElement.style.cursor = 'pointer';
   iconElement.style.width = `${iconSize}px`;
@@ -67,6 +109,7 @@ function createIcon(rect) {
   iconElement.style.alignItems = 'center';
   iconElement.style.justifyContent = 'center';
   iconElement.style.transition = 'transform 0.2s ease';
+  iconElement.style.pointerEvents = 'auto'; // Re-enable pointer events
 
   const img = document.createElement('img');
   img.src = chrome.runtime.getURL('images/icon48.png');
@@ -82,10 +125,11 @@ function createIcon(rect) {
   iconElement.addEventListener('mousedown', (e) => {
     e.preventDefault();
     e.stopPropagation();
+
     openTodoForm(rect);
   });
 
-  document.body.appendChild(iconElement);
+  getShadowRoot().appendChild(iconElement);
 }
 
 function openTodoForm(rect) {
@@ -110,7 +154,8 @@ function openTodoForm(rect) {
     fontFamily: "'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
     display: 'flex',
     flexDirection: 'column',
-    gap: '16px'
+    gap: '16px',
+    pointerEvents: 'auto' // Re-enable pointer events
   });
 
   // Make Drag Logic
@@ -128,7 +173,10 @@ function openTodoForm(rect) {
     cursor: 'move',
     padding: '0 0 10px 0',
     borderBottom: '1px solid #1e2545',
-    marginBottom: '8px'
+    marginBottom: '8px',
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center'
   });
   
   // Title inside header
@@ -139,9 +187,21 @@ function openTodoForm(rect) {
   formTitle.style.background = 'linear-gradient(135deg, #897df0, #fdbbf5)';
   formTitle.style.webkitBackgroundClip = 'text';
   formTitle.style.webkitTextFillColor = 'transparent';
-  formTitle.style.pointerEvents = 'none'; // Ensure click passes through to header
+  formTitle.style.pointerEvents = 'none'; 
   
+  // AI Status Indicator
+  const aiStatus = document.createElement('span');
+  aiStatus.textContent = '✨ AI Analyzing...';
+  Object.assign(aiStatus.style, {
+    fontSize: '12px',
+    color: '#897df0',
+    fontWeight: '600',
+    animation: 'pulse 1.5s infinite',
+    display: 'none' // Hidden by default, shown when analyzing
+  });
+
   header.appendChild(formTitle);
+  header.appendChild(aiStatus);
   formElement.appendChild(header);
 
   // Drag Event Listeners
@@ -175,7 +235,6 @@ function openTodoForm(rect) {
   }
 
   function setTranslate(xPos, yPos, el) {
-    // Keep the -50%, -50% centering logic while adding the drag offset
     el.style.transform = `translate(calc(-50% + ${xPos}px), calc(-50% + ${yPos}px))`;
   }
 
@@ -211,7 +270,9 @@ function openTodoForm(rect) {
       color: 'white',
       fontFamily: 'inherit',
       fontSize: '14px',
-      outline: 'none'
+      outline: 'none',
+      width: '100%',
+      boxSizing: 'border-box'
     };
 
     if (isTextarea) {
@@ -244,7 +305,7 @@ function openTodoForm(rect) {
   };
 
   // Inputs
-  const pageTitle = document.title || 'Untitled Page'; // Get page title
+  const pageTitle = document.title || 'Untitled Page'; 
   const { group: titleGroup, input: titleInput } = createInputGroup('Task Title', 'text', 'enh-title', pageTitle);
   formElement.appendChild(titleGroup);
 
@@ -309,7 +370,7 @@ function openTodoForm(rect) {
     chrome.runtime.sendMessage({ type: 'create_todo', data }, (response) => {
       if (response && response.success) {
         removeForm();
-        alert('Task created successfully!'); // Could be a nicer toast
+        alert('Task created successfully!');
       } else {
         saveBtn.textContent = 'Create Task';
         saveBtn.disabled = false;
@@ -322,16 +383,40 @@ function openTodoForm(rect) {
   btnGroup.appendChild(saveBtn);
   formElement.appendChild(btnGroup);
 
-  document.body.appendChild(formElement);
+  getShadowRoot().appendChild(formElement);
+
+  // --- Trigger AI Analysis ---
+  aiStatus.style.display = 'block'; // Show "Analyzing..."
+  
+  chrome.runtime.sendMessage({ 
+    type: 'analyze_text', 
+    data: { 
+      text: currentSelection,
+      pageTitle: pageTitle
+    } 
+  }, (response) => {
+    aiStatus.style.display = 'none'; // Hide indicator
+    
+    if (response && response.success && response.data) {
+      // Update form fields with AI data
+      const aiData = response.data;
+      if (aiData.title) titleInput.value = aiData.title;
+      if (aiData.description) descInput.value = aiData.description;
+      if (aiData.priority) priorityInput.value = aiData.priority;
+      if (aiData.dueDate) dateInput.value = aiData.dueDate;
+    } else {
+      console.log('Enhancivity: AI Analysis failed or returned no data', response?.error);
+    }
+  });
 }
 
 // Event listeners
-document.addEventListener('mouseup', handleSelection);
+document.addEventListener('mouseup', handleSelection, { capture: true });
 document.addEventListener('keyup', (e) => {
   if (e.key.includes('Arrow') || e.key === 'Shift') {
     handleSelection();
   }
-});
+}, { capture: true });
 
 document.addEventListener('scroll', () => {
   removeIcon();

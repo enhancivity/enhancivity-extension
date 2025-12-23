@@ -76,5 +76,32 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       });
     });
     return true;
+  } else if (request.type === 'analyze_text') {
+    chrome.storage.local.get(['apiBaseUrl'], (result) => {
+      const baseUrl = result.apiBaseUrl || 'https://enhancivity.com';
+      
+      fetch(`${baseUrl}/api/todos/analyze`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          // Include token if stored, though the API currently relies on cookies. 
+          // If the extension has the token stored, we could add it to Authorization header if needed.
+        },
+        body: JSON.stringify(request.data)
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.error) {
+          sendResponse({ success: false, error: data.error });
+        } else {
+          sendResponse({ success: true, data });
+        }
+      })
+      .catch(error => {
+        console.error('Analyze text failed:', error);
+        sendResponse({ success: false, error: 'Network error or server unreachable.' });
+      });
+    });
+    return true;
   }
 });
