@@ -5,7 +5,7 @@ body {
   background-color: #06070e; /* enhancivity-bg-1 */
   color: #ffffff;
   width: 320px;
-  min-height: 400px;
+  min-height: 450px;
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -17,6 +17,8 @@ body {
   flex-direction: column;
   align-items: center;
   text-align: center;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 /* Views */
@@ -49,10 +51,62 @@ h2 {
 }
 
 p {
-  margin: 0 0 32px 0;
+  margin: 0 0 24px 0;
   font-size: 14px;
   line-height: 1.5;
   color: #a1a1aa; /* Light gray for body text */
+}
+
+/* Form */
+#login-form {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.input-field {
+  width: 100%;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid #2d365f;
+  background-color: #1b1424;
+  color: white;
+  font-size: 14px;
+  outline: none;
+  box-sizing: border-box;
+  transition: border-color 0.2s;
+}
+
+.input-field:focus {
+  border-color: #897df0;
+}
+
+/* Separator */
+.separator {
+  display: flex;
+  align-items: center;
+  text-align: center;
+  color: #555;
+  margin: 20px 0;
+  width: 100%;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.separator::before, .separator::after {
+  content: '';
+  flex: 1;
+  border-bottom: 1px solid #2d365f;
+}
+
+.separator::before {
+  margin-right: 10px;
+}
+
+.separator::after {
+  margin-left: 10px;
 }
 
 /* Buttons */
@@ -85,6 +139,20 @@ p {
   transform: translateY(0);
 }
 
+.google-btn {
+  background: #ffffff;
+  color: #3c4043;
+  text-transform: none;
+  font-weight: 500;
+  gap: 10px;
+}
+
+.google-btn:hover {
+  background: #f8f9fa;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.24);
+  filter: none;
+}
+
 #logout-btn {
   background: #1e2545; /* Darker bg for secondary action */
   color: #ffffff;
@@ -101,6 +169,7 @@ p {
   color: #ef4444;
   margin-top: 16px;
   font-size: 13px;
+  min-height: 20px;
 }
 
 /* Animations */

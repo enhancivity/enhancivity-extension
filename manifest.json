@@ -6,8 +6,13 @@
   "permissions": [
     "storage",
     "activeTab",
-    "cookies"
+    "cookies",
+    "identity"
   ],
+  "oauth2": {
+    "client_id": "409104365095-beonfvn8d6cdtnmgcjqk42bav4uk5amc.apps.googleusercontent.com",
+    "scopes": ["email", "profile"]
+  },
   "host_permissions": [
     "https://api.enhancivity.com/*",
     "https://enhancivity.com/*",
