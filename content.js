@@ -433,7 +433,8 @@ function openTodoForm(rect) {
         title: titleInput.value,
         description: descInput.value,
         priority: priorityInput.value,
-        dueDate: dateInput.value
+        dueDate: dateInput.value,
+        url: window.location.href
       };
 
       saveBtn.textContent = 'Saving...';
