@@ -27,10 +27,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
 
   } else if (request.type === 'google_login') {
-    chrome.identity.getAuthToken({ interactive: true }, function(token) {
-      if (chrome.runtime.lastError || !token) {
+    const clientId = "409104365095-beonfvn8d6cdtnmgcjqk42bav4uk5amc.apps.googleusercontent.com";
+    const redirectUri = chrome.identity.getRedirectURL(); 
+    console.log("Enhancivity: Expected Redirect URI:", redirectUri);
+    
+    const scopes = "email profile openid";
+    const authUrl = `https://accounts.google.com/o/oauth2/auth?client_id=${clientId}&response_type=token&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent(scopes)}`;
+
+    chrome.identity.launchWebAuthFlow({
+      url: authUrl,
+      interactive: true
+    }, function(redirectUrl) {
+      if (chrome.runtime.lastError || !redirectUrl) {
         console.error('Google Auth Error:', chrome.runtime.lastError);
-        sendResponse({ success: false, message: 'Google sign-in canceled or failed.' });
+        sendResponse({ success: false, message: 'Google sign-in failed. Check extension console.' });
+        return;
+      }
+
+      // Parse token from hash (fragment)
+      const matches = redirectUrl.match(/access_token=([^&]*)/);
+      const token = matches && matches[1];
+
+      if (!token) {
+        sendResponse({ success: false, message: 'No access token returned.' });
         return;
       }
 
