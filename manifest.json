@@ -1,29 +1,36 @@
 {
   "manifest_version": 3,
   "name": "Enhancivity",
-  "version": "1.0",
-  "description": "Log in to your Enhancivity account.",
+  "version": "2.0",
+  "description": "Your AI-powered productivity companion. Powered by 3-Tier Memory.",
   "permissions": [
-    "storage",
     "activeTab",
-    "cookies",
+    "storage",
+    "scripting",
     "identity"
   ],
-  "oauth2": {
-    "client_id": "409104365095-beonfvn8d6cdtnmgcjqk42bav4uk5amc.apps.googleusercontent.com",
-    "scopes": ["email", "profile"]
-  },
   "host_permissions": [
     "https://api.enhancivity.com/*",
     "https://enhancivity.com/*",
-    "http://localhost/*",
-    "<all_urls>"
+    "http://localhost:3000/*"
   ],
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "all_frames": true
+      "matches": ["https://mail.google.com/*"],
+      "js": ["content_gmail.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.amazon.com/*",
+        "https://www.amazon.co.uk/*",
+        "https://www.amazon.de/*",
+        "https://www.amazon.fr/*",
+        "https://www.amazon.ca/*",
+        "https://www.amazon.com.au/*"
+      ],
+      "js": ["content_amazon.js"],
+      "run_at": "document_idle"
     }
   ],
   "action": {
@@ -42,10 +49,14 @@
     "48": "images/icon48.png",
     "128": "images/icon128.png"
   },
+  "oauth2": {
+    "client_id": "409104365095-beonfvn8d6cdtnmgcjqk42bav4uk5amc.apps.googleusercontent.com",
+    "scopes": ["email", "profile"]
+  },
   "web_accessible_resources": [
     {
       "resources": ["images/*.png"],
-      "matches": ["<all_urls>"]
+      "matches": ["https://mail.google.com/*", "https://www.amazon.com/*"]
     }
   ]
 }

@@ -1,16 +1,19 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title>Enhancivity Login</title>
-  <link rel="stylesheet" type="text/css" href="popup.css">
+  <meta charset="UTF-8">
+  <title>Enhancivity</title>
+  <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <div class="container">
-    <div id="login-view">
-      <img src="../images/icon48.png" alt="Enhancivity Logo">
+
+  <!-- ── AUTH VIEW ─────────────────────────────────────────── -->
+  <div id="auth-view" class="view hidden">
+    <div class="auth-container">
+      <img src="../images/icon48.png" alt="Enhancivity Logo" class="logo">
       <h2>Welcome</h2>
-      <p>Log in to access your Enhancivity tools.</p>
-      
+      <p>Log in to access your AI companion.</p>
+
       <form id="login-form">
         <input type="email" id="email" placeholder="Email" required class="input-field">
         <input type="password" id="password" placeholder="Password" required class="input-field">
@@ -20,20 +23,78 @@
       <div class="separator">or</div>
 
       <button id="google-login-btn" class="btn google-btn">
-        <svg width="18" height="18" viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg"><path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 0 1-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615z" fill="#4285F4"/><path d="M9 18c2.43 0 4.467-.806 5.927-2.184l-2.909-2.259c-.806.54-1.837.86-3.018.86-2.344 0-4.486-1.584-5.195-3.715H.802v2.411C2.318 15.923 5.426 18 9 18z" fill="#34A853"/><path d="M3.805 10.702a5.36 5.36 0 0 1 0-3.404V4.887H.802a9.018 9.018 0 0 0 0 6.627l3.003-2.412z" fill="#FBBC05"/><path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0 5.426 0 2.318 2.077.802 5.288l3.003 2.411C4.514 5.474 6.656 3.89 9 3.58z" fill="#EA4335"/></svg>
+        <svg width="18" height="18" viewBox="0 0 18 18" xmlns="http://www.w3.org/2000/svg">
+          <path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 0 1-1.796 2.716v2.259h2.908C16.658 12.075 17.64 9.767 17.64 9.2z" fill="#4285F4"/>
+          <path d="M9 18c2.43 0 4.467-.806 5.927-2.184l-2.909-2.259c-.806.54-1.837.86-3.018.86-2.344 0-4.486-1.584-5.195-3.715H.802v2.411C2.318 15.923 5.426 18 9 18z" fill="#34A853"/>
+          <path d="M3.805 10.702a5.36 5.36 0 0 1 0-3.404V4.887H.802a9.018 9.018 0 0 0 0 8.226l3.003-2.411z" fill="#FBBC05"/>
+          <path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0 5.426 0 2.318 2.077.802 5.288l3.003 2.411C4.514 5.474 6.656 3.89 9 3.58z" fill="#EA4335"/>
+        </svg>
         Sign in with Google
       </button>
-      
-      <p id="error-message" class="error-message"></p>
-    </div>
 
-    <div id="logged-in-view" style="display: none;">
-      <img src="../images/icon48.png" alt="Enhancivity Logo">
-      <h2>Connected</h2>
-      <!-- Logout not fully implemented yet as it requires clearing cookie/storage -->
-      <button id="logout-btn" class="btn">Sign Out</button> 
+      <p id="auth-error" class="error-message"></p>
     </div>
   </div>
+
+  <!-- ── MAIN VIEW ─────────────────────────────────────────── -->
+  <div id="main-view" class="view hidden">
+
+    <!-- Header -->
+    <header class="main-header">
+      <div class="header-left">
+        <img src="../images/icon48.png" alt="Logo" class="header-logo">
+        <span class="brand-name">Enhancivity</span>
+      </div>
+      <div class="header-right">
+        <span id="context-badge" class="context-badge">General</span>
+        <button id="sign-out-btn" class="sign-out-btn" title="Sign Out">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <polyline points="16 17 21 12 16 7"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Memory Status Bar -->
+    <div id="memory-bar" class="memory-bar hidden">
+      <span class="memory-dot"></span>
+      <span id="memory-label">3-Tier Memory active</span>
+    </div>
+
+    <!-- Chat Input -->
+    <div class="chat-area">
+      <textarea
+        id="prompt-input"
+        class="prompt-input"
+        placeholder="Ask anything..."
+        rows="3"
+      ></textarea>
+      <button id="submit-btn" class="submit-btn" title="Send">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <line x1="22" y1="2" x2="11" y2="13"/>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Loading Indicator -->
+    <div id="loading-bar" class="loading-bar hidden">
+      <div class="loading-spinner"></div>
+      <span>Thinking with your memory...</span>
+    </div>
+
+    <!-- Results Area -->
+    <div id="results-area" class="results-area hidden">
+      <!-- Rendered dynamically by popup.js -->
+    </div>
+
+    <!-- Error Area -->
+    <p id="main-error" class="error-message" style="padding: 0 16px 12px;"></p>
+
+  </div>
+
   <script src="popup.js"></script>
 </body>
 </html>
