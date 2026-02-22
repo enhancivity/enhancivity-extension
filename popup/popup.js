@@ -1,24 +1,17 @@
 // ============================================================
-// Enhancivity Popup Script — Grand Extension v2.0
-// Responsibilities:
-//   1. Auth state check → show login or main view
-//   2. Detect active tab context (Gmail / Amazon / General)
-//   3. Send prompt + tab context to background brain
-//   4. Render results: task list OR product list OR text
+// Enhancivity Popup Script — Chief of Staff Edition
 // ============================================================
 
-// Context placeholder hints shown in the textarea
 const PLACEHOLDERS = {
-  gmail:   "Type 'extract tasks' or ask anything about this email...",
-  amazon:  "Type 'recommend' or ask about this product...",
-  general: "Type 'create task' or ask anything..."
+  gmail:   "Analyze this email...",
+  amazon:  "Evaluate this product...",
+  general: "Command Enhancivity..."
 };
 
-// Context badge styles
 const BADGE_CONFIG = {
-  gmail:   { label: 'Gmail',   color: '#ea4335' },
-  amazon:  { label: 'Amazon',  color: '#ff9900' },
-  general: { label: 'General', color: '#6b7280' }
+  gmail:   { label: 'Gmail',   color: '#ef4444' },
+  amazon:  { label: 'Amazon',  color: '#f59e0b' },
+  general: { label: 'General', color: '' }         // default styling
 };
 
 let currentTabId   = null;
@@ -40,10 +33,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 // ── Auth Handlers ────────────────────────────────────────────
 
 function setupAuthHandlers() {
-  const loginForm    = document.getElementById('login-form');
-  const loginBtn     = document.getElementById('login-btn');
-  const googleBtn    = document.getElementById('google-login-btn');
-  const errorEl      = document.getElementById('auth-error');
+  const loginForm = document.getElementById('login-form');
+  const loginBtn  = document.getElementById('login-btn');
+  const googleBtn = document.getElementById('google-login-btn');
+  const errorEl   = document.getElementById('auth-error');
 
   loginForm.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -92,17 +85,12 @@ async function initMainView() {
     currentSite   = detectSite(currentTabUrl);
   }
 
-  // Update context badge and placeholder
   applyContext(currentSite);
 
   // Show memory indicator if memory is cached
   const { userMemory } = await chrome.storage.local.get(['userMemory']);
   if (userMemory) {
-    document.getElementById('memory-bar').classList.remove('hidden');
-    const tier2Count = userMemory?.tier2?.goals?.length || 0;
-    const tier3Count = userMemory?.tier3?.traits?.length || 0;
-    document.getElementById('memory-label').textContent =
-      `Memory active · ${tier2Count} goals · ${tier3Count} traits`;
+    document.getElementById('memory-indicator').classList.remove('hidden');
   }
 
   // Sign out
@@ -112,17 +100,27 @@ async function initMainView() {
     setupAuthHandlers();
   });
 
-  // Submit handler
+  // Input & send button interaction
   const submitBtn   = document.getElementById('submit-btn');
   const promptInput = document.getElementById('prompt-input');
 
+  // Highlight send button when text is entered
+  promptInput.addEventListener('input', () => {
+    const hasText = promptInput.value.trim().length > 0;
+    submitBtn.disabled = !hasText;
+    submitBtn.classList.toggle('active', hasText);
+  });
+
   submitBtn.addEventListener('click', () => handleSubmit());
   promptInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter') {
       e.preventDefault();
       handleSubmit();
     }
   });
+
+  // Focus input on open
+  promptInput.focus();
 }
 
 function detectSite(url) {
@@ -137,9 +135,12 @@ function applyContext(site) {
   const input  = document.getElementById('prompt-input');
   const config = BADGE_CONFIG[site] || BADGE_CONFIG.general;
 
-  badge.textContent        = config.label;
-  badge.style.background   = config.color;
-  input.placeholder        = PLACEHOLDERS[site] || PLACEHOLDERS.general;
+  badge.textContent = config.label;
+  if (config.color) {
+    badge.style.background = config.color;
+    badge.style.color = '#fff';
+  }
+  input.placeholder = PLACEHOLDERS[site] || PLACEHOLDERS.general;
 }
 
 // ── Submit & Process ─────────────────────────────────────────
@@ -148,6 +149,10 @@ async function handleSubmit() {
   const promptInput = document.getElementById('prompt-input');
   const userPrompt  = promptInput.value.trim();
   if (!userPrompt) return;
+
+  // Hide greeting on first submit
+  const greeting = document.getElementById('chat-greeting');
+  if (greeting) greeting.style.display = 'none';
 
   setLoading(true);
   clearResults();
@@ -166,6 +171,10 @@ async function handleSubmit() {
   }
 
   promptInput.value = '';
+  // Reset send button state
+  document.getElementById('submit-btn').disabled = true;
+  document.getElementById('submit-btn').classList.remove('active');
+
   renderResults(res.data);
 }
 
@@ -183,12 +192,14 @@ function renderResults(data) {
   } else if (data.type === 'products') {
     renderProductList(area, data.items || []);
   } else {
-    // Plain text / fallback
     const msg = document.createElement('p');
     msg.className = 'text-result';
     msg.textContent = data.message || JSON.stringify(data);
     area.appendChild(msg);
   }
+
+  // Scroll chat area to bottom
+  document.getElementById('chat-area').scrollTop = document.getElementById('chat-area').scrollHeight;
 }
 
 function renderTaskList(container, tasks) {
@@ -238,9 +249,8 @@ function renderTaskList(container, tasks) {
 
   container.appendChild(list);
 
-  // Create Selected button
   const createBtn = document.createElement('button');
-  createBtn.className = 'btn create-btn';
+  createBtn.className = 'btn btn-primary create-btn';
   createBtn.textContent = 'Create Selected Tasks';
   createBtn.addEventListener('click', async () => {
     const selected = [...list.querySelectorAll('.task-checkbox:checked')]
@@ -254,7 +264,7 @@ function renderTaskList(container, tasks) {
     const res = await sendToBackground('create_todos_bulk', selected);
 
     if (res?.success) {
-      container.innerHTML = `<p class="success-message">✓ ${selected.length} task${selected.length > 1 ? 's' : ''} created in Enhancivity!</p>`;
+      container.innerHTML = `<p class="success-message">${selected.length} task${selected.length > 1 ? 's' : ''} created in Enhancivity</p>`;
     } else {
       createBtn.textContent = 'Create Selected Tasks';
       createBtn.disabled = false;
