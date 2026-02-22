@@ -10,6 +10,24 @@
 const API_BASE = 'https://enhancivity.com';
 const MEMORY_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
+// --- Site Type Detection (for universal scraper) ---
+
+function detectSiteType(url) {
+  if (!url) return 'general';
+  if (url.includes('slack.com')) return 'slack';
+  if (url.includes('linkedin.com')) return 'linkedin';
+  if (url.includes('docs.google.com')) return 'google-docs';
+  if (url.includes('sheets.google.com')) return 'google-sheets';
+  if (url.includes('outlook.live.com') || url.includes('outlook.office.com')) return 'outlook';
+  if (/indeed|glassdoor|monster|ziprecruiter/i.test(url)) return 'job-board';
+  if (/trello|asana|notion|jira/i.test(url)) return 'project-tool';
+  if (/twitter|x\.com|facebook|instagram/i.test(url)) return 'social';
+  if (/github\.com/i.test(url)) return 'github';
+  if (/stackoverflow|stackexchange/i.test(url)) return 'stackoverflow';
+  if (/youtube\.com/i.test(url)) return 'youtube';
+  return 'webpage';
+}
+
 // --- JWT Decoder (read-only, no verification needed client-side) ---
 function decodeJwt(token) {
   try {
@@ -196,6 +214,26 @@ async function handleMessage(request) {
         }
       } catch {
         // Proceed without scrape
+      }
+
+    } else if (tabId) {
+      // Universal scrape — inject on-demand for ALL other sites
+      pageContext.site = detectSiteType(url);
+      try {
+        const results = await chrome.scripting.executeScript({
+          target: { tabId },
+          files: ['content_universal.js'],
+        });
+        const scraped = results?.[0]?.result;
+        if (scraped) {
+          pageContext.pageTitle = scraped.pageTitle;
+          pageContext.mainContent = scraped.mainContent;
+          pageContext.selectedText = scraped.selectedText;
+          pageContext.siteType = scraped.siteType;
+          pageContext.meta = scraped.meta;
+        }
+      } catch {
+        // Some pages block injection (chrome://, extension pages, etc.) — proceed without
       }
     }
 
