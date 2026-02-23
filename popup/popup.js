@@ -191,6 +191,12 @@ function renderResults(data) {
     renderTaskList(area, data.items || []);
   } else if (data.type === 'products') {
     renderProductList(area, data.items || []);
+  } else if (data.consent_level && data.consent_level !== 'auto' && data.dom_actions) {
+    // DOM Action with consent required
+    renderActionPreview(area, data);
+  } else if (data.primary_content) {
+    // Standard agent response (RECOMMENDATION, WARNING, TASK_DRAFT without dom_actions)
+    renderAgentResponse(area, data);
   } else {
     const msg = document.createElement('p');
     msg.className = 'text-result';
@@ -329,6 +335,192 @@ function renderProductList(container, products) {
   });
 
   container.appendChild(list);
+}
+
+// ── Agent Response (text-based: RECOMMENDATION, WARNING, TASK_DRAFT) ──
+
+function renderAgentResponse(container, data) {
+  const card = document.createElement('div');
+  card.className = 'action-card';
+
+  const headline = document.createElement('p');
+  headline.className = 'action-headline';
+  headline.textContent = data.headline;
+  card.appendChild(headline);
+
+  const content = document.createElement('p');
+  content.className = 'action-content';
+  content.textContent = data.primary_content;
+  card.appendChild(content);
+
+  if (data.rationale) {
+    const rationale = document.createElement('p');
+    rationale.className = 'action-rationale';
+    rationale.textContent = data.rationale;
+    card.appendChild(rationale);
+  }
+
+  container.appendChild(card);
+}
+
+// ── Action Preview with Consent ───────────────────────────────
+
+function renderActionPreview(container, data) {
+  const isBlocked = data.consent_level === 'blocked';
+  const isHard    = data.consent_level === 'hard';
+
+  const card = document.createElement('div');
+  card.className = `action-card ${isBlocked ? 'consent-blocked' : isHard ? 'consent-hard' : 'consent-soft'}`;
+
+  // Headline
+  const headline = document.createElement('p');
+  headline.className = 'action-headline';
+  headline.textContent = data.headline;
+  card.appendChild(headline);
+
+  // Preview summary
+  if (data.preview?.summary) {
+    const summary = document.createElement('p');
+    summary.className = 'action-summary';
+    summary.textContent = data.preview.summary;
+    card.appendChild(summary);
+  }
+
+  // Preview details (email draft, etc.) — scrollable
+  if (data.preview?.details) {
+    const details = document.createElement('div');
+    details.className = 'action-preview';
+    details.textContent = data.preview.details;
+    card.appendChild(details);
+  }
+
+  // Step list for multi-step actions
+  if (data.dom_actions && data.dom_actions.length > 0 && !isBlocked) {
+    const stepList = document.createElement('ol');
+    stepList.className = 'action-steps';
+    for (const step of data.dom_actions) {
+      const li = document.createElement('li');
+      li.textContent = step.description;
+      stepList.appendChild(li);
+    }
+    card.appendChild(stepList);
+  }
+
+  // Rationale (muted)
+  if (data.rationale) {
+    const rationale = document.createElement('p');
+    rationale.className = 'action-rationale';
+    rationale.textContent = data.rationale;
+    card.appendChild(rationale);
+  }
+
+  // Action buttons
+  const btnRow = document.createElement('div');
+  btnRow.className = 'action-btn-row';
+
+  if (isBlocked) {
+    // Blocked: just an "Understood" button
+    const understood = document.createElement('button');
+    understood.className = 'btn consent-btn-blocked';
+    understood.textContent = 'Understood';
+    understood.addEventListener('click', () => {
+      container.innerHTML = '';
+      container.classList.add('hidden');
+    });
+    btnRow.appendChild(understood);
+  } else {
+    // Cancel button
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn consent-btn-cancel';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', () => {
+      container.innerHTML = '';
+      container.classList.add('hidden');
+    });
+    btnRow.appendChild(cancelBtn);
+
+    // Confirm button
+    const confirmBtn = document.createElement('button');
+    confirmBtn.className = `btn ${isHard ? 'consent-btn-hard' : 'consent-btn-soft'}`;
+    confirmBtn.textContent = getConfirmLabel(data.action_type);
+    confirmBtn.addEventListener('click', () => executeAction(container, confirmBtn, data));
+    btnRow.appendChild(confirmBtn);
+  }
+
+  card.appendChild(btnRow);
+  container.appendChild(card);
+}
+
+function getConfirmLabel(actionType) {
+  switch (actionType) {
+    case 'COMPOSE_EMAIL': return 'Insert Draft';
+    case 'NAVIGATE':      return 'Yes, Open It';
+    case 'SEARCH_SITE':   return 'Yes, Search';
+    case 'ADD_TO_CART':    return 'Yes, Add to Cart';
+    case 'FILL_FORM':     return 'Yes, Fill It';
+    case 'MULTI_STEP':    return 'Yes, Do This';
+    case 'EXTRACT_TASKS': return 'Extract Tasks';
+    default:              return 'Confirm';
+  }
+}
+
+async function executeAction(container, btn, data) {
+  btn.textContent = 'Working...';
+  btn.disabled = true;
+
+  let res;
+
+  // Gmail-specific compose/reply handling
+  if (data.action_type === 'COMPOSE_EMAIL' && currentSite === 'gmail') {
+    // Extract compose data from primary_content and dom_actions
+    const composeData = {};
+    for (const step of (data.dom_actions || [])) {
+      if (step.action === 'fill_field') {
+        if (step.selector?.includes('to'))      composeData.to = step.value;
+        if (step.selector?.includes('subject')) composeData.subject = step.value;
+        if (step.selector?.includes('body') || step.selector?.includes('editable'))
+          composeData.body = step.value;
+      }
+    }
+    // Fallback: use primary_content as body if no body in dom_actions
+    if (!composeData.body && data.primary_content) {
+      composeData.body = data.primary_content;
+    }
+    res = await sendToBackground('gmail_compose', { tabId: currentTabId, data: composeData });
+
+  } else if (data.dom_actions && data.dom_actions.length > 1) {
+    // Multi-step execution
+    res = await sendToBackground('execute_multi_step', {
+      steps: data.dom_actions,
+      tabId: currentTabId,
+    });
+
+  } else if (data.dom_actions && data.dom_actions.length === 1) {
+    // Single action
+    res = await sendToBackground('execute_action', {
+      action: data.dom_actions[0],
+      tabId: currentTabId,
+    });
+
+  } else {
+    res = { success: false, error: 'No actions to execute.' };
+  }
+
+  // Show result
+  if (res?.success) {
+    container.innerHTML = '<p class="success-message">Done! Action completed successfully.</p>';
+  } else {
+    const errorMsg = res?.error || 'Action failed. Please try again.';
+    if (errorMsg === 'BLOCKED_SENSITIVE') {
+      container.innerHTML = '<p class="blocked-message">Blocked: This action involves sensitive data (passwords, payment info). Enhancivity never automates these fields.</p>';
+    } else if (errorMsg === 'BLOCKED_DANGEROUS_CLICK') {
+      container.innerHTML = '<p class="blocked-message">Blocked: Enhancivity won\'t click Send/Pay/Submit buttons. You\'re always in control of final actions.</p>';
+    } else {
+      btn.textContent = getConfirmLabel(data.action_type);
+      btn.disabled = false;
+      showError(errorMsg);
+    }
+  }
 }
 
 // ── Utilities ────────────────────────────────────────────────

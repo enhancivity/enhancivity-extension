@@ -510,6 +510,130 @@ h2 {
   padding: 4px 0;
 }
 
+/* ── Action Card (agent responses & consent previews) ─────── */
+.action-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  background: #18181b;
+  border: 1px solid #27272a;
+  border-radius: 12px;
+  animation: fadeIn 0.2s ease;
+}
+
+.action-headline {
+  font-size: 14px;
+  font-weight: 600;
+  color: #fafafa;
+  line-height: 1.3;
+}
+
+.action-summary {
+  font-size: 12px;
+  color: #a1a1aa;
+  line-height: 1.4;
+}
+
+.action-content {
+  font-size: 13px;
+  color: #d4d4d8;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.action-preview {
+  font-size: 12px;
+  color: #d4d4d8;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  max-height: 140px;
+  overflow-y: auto;
+  padding: 10px;
+  background: #09090b;
+  border: 1px solid #1c1c1f;
+  border-radius: 8px;
+}
+.action-preview::-webkit-scrollbar { width: 3px; }
+.action-preview::-webkit-scrollbar-thumb { background: #27272a; border-radius: 3px; }
+
+.action-steps {
+  margin: 2px 0;
+  padding-left: 20px;
+  font-size: 12px;
+  color: #a1a1aa;
+  line-height: 1.8;
+}
+.action-steps li { color: #d4d4d8; }
+
+.action-rationale {
+  font-size: 11px;
+  color: #52525b;
+  font-style: italic;
+  line-height: 1.4;
+}
+
+/* Consent button row */
+.action-btn-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.action-btn-row .btn {
+  flex: 1;
+  padding: 8px 16px;
+  font-size: 12px;
+  margin-top: 0;
+}
+
+/* Cancel button */
+.consent-btn-cancel {
+  background: #27272a;
+  color: #a1a1aa;
+}
+.consent-btn-cancel:hover { background: #3f3f46; color: #fafafa; }
+
+/* Soft consent (indigo — safe, reversible) */
+.consent-btn-soft {
+  background: #6366f1;
+  color: #fff;
+}
+.consent-btn-soft:hover { background: #4f46e5; }
+.consent-btn-soft:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Hard consent (amber — significant action) */
+.consent-btn-hard {
+  background: #d97706;
+  color: #fff;
+}
+.consent-btn-hard:hover { background: #b45309; }
+.consent-btn-hard:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Card border tints for consent levels */
+.consent-soft { border-color: rgba(99, 102, 241, 0.3); }
+.consent-hard { border-color: rgba(217, 119, 6, 0.3); }
+.consent-blocked {
+  border-color: rgba(239, 68, 68, 0.3);
+  background: #1a1011;
+}
+
+/* Blocked button */
+.consent-btn-blocked {
+  background: #27272a;
+  color: #a1a1aa;
+}
+.consent-btn-blocked:hover { background: #3f3f46; }
+
+/* Blocked message */
+.blocked-message {
+  color: #ef4444;
+  font-size: 12px;
+  text-align: center;
+  padding: 14px;
+  line-height: 1.5;
+}
+
 /* ── Animations ───────────────────────────────────────────── */
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(4px); }

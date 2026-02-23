@@ -10,6 +10,25 @@
 const API_BASE = 'https://enhancivity.com';
 const MEMORY_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
+// --- URL Allowlist for Navigate Actions (v1 safety) ---
+
+const ALLOWED_DOMAINS = [
+  'etsy.com', 'amazon.com', 'ebay.com', 'google.com',
+  'mail.google.com', 'slack.com', 'linkedin.com',
+  'github.com', 'notion.so', 'trello.com', 'asana.com',
+  'indeed.com', 'glassdoor.com', 'monster.com', 'ziprecruiter.com',
+  'youtube.com', 'twitter.com', 'x.com', 'reddit.com',
+];
+
+function isAllowedUrl(url) {
+  try {
+    const host = new URL(url).hostname;
+    return ALLOWED_DOMAINS.some(d => host === d || host.endsWith('.' + d));
+  } catch {
+    return false;
+  }
+}
+
 // --- Site Type Detection (for universal scraper) ---
 
 function detectSiteType(url) {
@@ -251,6 +270,91 @@ async function handleMessage(request) {
 
     const data = await res.json();
     return { success: true, data };
+  }
+
+  // ── EXECUTE SINGLE DOM ACTION ─────────────────────────────
+  if (request.type === 'execute_action') {
+    const { action, tabId } = request.data;
+
+    // Navigate is handled by background.js directly (no content script)
+    if (action.action === 'navigate') {
+      if (!isAllowedUrl(action.value)) {
+        return { success: false, error: `Navigation to ${action.value} is not allowed.` };
+      }
+      const tab = await chrome.tabs.create({ url: action.value, active: true });
+      return { success: true, tabId: tab.id };
+    }
+
+    // For DOM actions, inject content_actions.js then send the step
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ['content_actions.js'],
+      });
+    } catch {
+      return { success: false, error: 'Cannot inject action script into this page.' };
+    }
+
+    const result = await chrome.tabs.sendMessage(tabId, {
+      type: 'execute_dom_action',
+      step: action,
+    });
+    return result;
+  }
+
+  // ── EXECUTE MULTI-STEP FLOW ─────────────────────────────
+  if (request.type === 'execute_multi_step') {
+    const { steps, tabId } = request.data;
+    const results = [];
+    let currentTabId = tabId;
+
+    for (const step of steps) {
+      const stepResult = await handleMessage({
+        type: 'execute_action',
+        data: { action: step, tabId: currentTabId },
+      });
+      results.push(stepResult);
+
+      if (!stepResult.success) {
+        return { success: false, failedAt: results.length - 1, results };
+      }
+
+      // If the step was a navigation, update tabId and wait for page load
+      if (step.action === 'navigate' && stepResult.tabId) {
+        currentTabId = stepResult.tabId;
+        await new Promise(r => setTimeout(r, 2500));
+      }
+    }
+
+    return { success: true, results };
+  }
+
+  // ── GMAIL COMPOSE (site-specific action) ────────────────
+  if (request.type === 'gmail_compose') {
+    const { tabId, data } = request.data;
+    try {
+      const result = await chrome.tabs.sendMessage(tabId, {
+        type: 'gmail_compose',
+        data,
+      });
+      return result;
+    } catch {
+      return { success: false, error: 'Gmail content script not ready. Please reload Gmail.' };
+    }
+  }
+
+  // ── GMAIL REPLY (site-specific action) ──────────────────
+  if (request.type === 'gmail_reply') {
+    const { tabId, data } = request.data;
+    try {
+      const result = await chrome.tabs.sendMessage(tabId, {
+        type: 'gmail_reply',
+        data,
+      });
+      return result;
+    } catch {
+      return { success: false, error: 'Gmail content script not ready. Please reload Gmail.' };
+    }
   }
 
   return { success: false, error: `Unknown message type: ${request.type}` };
