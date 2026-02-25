@@ -5,12 +5,14 @@
 const PLACEHOLDERS = {
   gmail:   "Analyze this email...",
   amazon:  "Evaluate this product...",
+  global:  "Search across the web...",
   general: "Command Enhancivity..."
 };
 
 const BADGE_CONFIG = {
   gmail:   { label: 'Gmail',   color: '#ef4444' },
   amazon:  { label: 'Amazon',  color: '#f59e0b' },
+  global:  { label: 'Global',  color: '#6366f1' },
   general: { label: 'General', color: '' }         // default styling
 };
 
@@ -124,7 +126,8 @@ async function initMainView() {
 }
 
 function detectSite(url) {
-  if (!url) return 'general';
+  if (!url) return 'global';
+  if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url === 'about:blank') return 'global';
   if (url.includes('mail.google.com')) return 'gmail';
   if (/amazon\.(com|co\.uk|de|fr|ca|com\.au)/.test(url)) return 'amazon';
   return 'general';
@@ -174,6 +177,12 @@ async function handleSubmit() {
   // Reset send button state
   document.getElementById('submit-btn').disabled = true;
   document.getElementById('submit-btn').classList.remove('active');
+
+  // Check if this is an ORCHESTRATE response — needs special handling
+  if (res.data?.action_type === 'ORCHESTRATE' && res.data?.search_plan) {
+    renderOrchestratePlan(res.data);
+    return;
+  }
 
   renderResults(res.data);
 }
@@ -519,6 +528,332 @@ async function executeAction(container, btn, data) {
       btn.textContent = getConfirmLabel(data.action_type);
       btn.disabled = false;
       showError(errorMsg);
+    }
+  }
+}
+
+// ── Orchestration: Multi-Site Search HUD ─────────────────────
+
+let orchestrationListener = null;
+
+function renderOrchestratePlan(data) {
+  const area = document.getElementById('results-area');
+  area.innerHTML = '';
+  area.classList.remove('hidden');
+
+  const card = document.createElement('div');
+  card.className = 'action-card consent-soft';
+
+  // Headline
+  const headline = document.createElement('p');
+  headline.className = 'action-headline';
+  headline.textContent = data.headline;
+  card.appendChild(headline);
+
+  // Show the search plan
+  const plan = data.search_plan;
+  const planInfo = document.createElement('div');
+  planInfo.className = 'orch-plan-info';
+
+  const siteBadges = document.createElement('div');
+  siteBadges.className = 'orch-site-badges';
+  for (const site of plan.sites) {
+    const badge = document.createElement('span');
+    badge.className = 'orch-site-badge';
+    badge.textContent = site;
+    siteBadges.appendChild(badge);
+  }
+  planInfo.appendChild(siteBadges);
+
+  const criteria = document.createElement('p');
+  criteria.className = 'orch-criteria';
+  criteria.textContent = `Comparing by: ${plan.criteria}`;
+  planInfo.appendChild(criteria);
+
+  card.appendChild(planInfo);
+
+  // Rationale
+  if (data.rationale) {
+    const rationale = document.createElement('p');
+    rationale.className = 'action-rationale';
+    rationale.textContent = data.rationale;
+    card.appendChild(rationale);
+  }
+
+  // Action buttons
+  const btnRow = document.createElement('div');
+  btnRow.className = 'action-btn-row';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'btn consent-btn-cancel';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', () => {
+    area.innerHTML = '';
+    area.classList.add('hidden');
+  });
+  btnRow.appendChild(cancelBtn);
+
+  const searchBtn = document.createElement('button');
+  searchBtn.className = 'btn consent-btn-soft';
+  searchBtn.textContent = 'Search Now';
+  searchBtn.addEventListener('click', () => {
+    startOrchestration(data.search_plan, data.primary_content || '');
+  });
+  btnRow.appendChild(searchBtn);
+
+  card.appendChild(btnRow);
+  area.appendChild(card);
+}
+
+async function startOrchestration(searchPlan, userPrompt) {
+  const area = document.getElementById('results-area');
+  area.innerHTML = '';
+
+  // Build the orchestration HUD
+  const hud = document.createElement('div');
+  hud.className = 'orch-hud';
+  hud.id = 'orch-hud';
+
+  const header = document.createElement('div');
+  header.className = 'orch-header';
+
+  const badge = document.createElement('span');
+  badge.className = 'orch-badge-label';
+  badge.textContent = 'Global Search';
+  header.appendChild(badge);
+
+  const status = document.createElement('span');
+  status.className = 'orch-status';
+  status.id = 'orch-status';
+  status.textContent = 'Launching searches...';
+  header.appendChild(status);
+
+  hud.appendChild(header);
+
+  // Site progress badges
+  const sitesRow = document.createElement('div');
+  sitesRow.className = 'orch-sites-row';
+  sitesRow.id = 'orch-sites-row';
+
+  for (const site of searchPlan.sites) {
+    const siteEl = document.createElement('div');
+    siteEl.className = 'orch-site-status pending';
+    siteEl.id = `orch-site-${site}`;
+    siteEl.innerHTML = `<span class="orch-site-icon">⏳</span><span>${site}</span>`;
+    sitesRow.appendChild(siteEl);
+  }
+
+  hud.appendChild(sitesRow);
+  area.appendChild(hud);
+
+  // Listen for progress updates from background.js via chrome.storage
+  if (orchestrationListener) {
+    chrome.storage.onChanged.removeListener(orchestrationListener);
+  }
+
+  orchestrationListener = (changes) => {
+    if (!changes.orchestrationProgress) return;
+    const progress = changes.orchestrationProgress.newValue;
+    if (!progress) return;
+
+    const statusEl = document.getElementById('orch-status');
+    if (statusEl) statusEl.textContent = progress.detail || progress.phase;
+
+    // Update individual site badges
+    if (progress.phase?.startsWith('searching:')) {
+      const site = progress.phase.split(':')[1];
+      const siteEl = document.getElementById(`orch-site-${site}`);
+      if (siteEl) {
+        siteEl.className = 'orch-site-status active';
+        siteEl.querySelector('.orch-site-icon').textContent = '🔍';
+      }
+    }
+
+    if (progress.phase === 'comparing') {
+      // Mark all sites as done
+      for (const site of searchPlan.sites) {
+        const siteEl = document.getElementById(`orch-site-${site}`);
+        if (siteEl) {
+          siteEl.className = 'orch-site-status done';
+          siteEl.querySelector('.orch-site-icon').textContent = '✓';
+        }
+      }
+      if (statusEl) statusEl.textContent = 'AI is picking the best option...';
+    }
+  };
+
+  chrome.storage.onChanged.addListener(orchestrationListener);
+
+  // Trigger the actual orchestration
+  const res = await sendToBackground('orchestrate_search', { searchPlan, userPrompt });
+
+  // Clean up listener
+  chrome.storage.onChanged.removeListener(orchestrationListener);
+  orchestrationListener = null;
+
+  if (!res?.success) {
+    area.innerHTML = `<div class="action-card"><p class="error-message">${res?.error || 'Search failed. Please try again.'}</p></div>`;
+    return;
+  }
+
+  // Render comparison results
+  renderComparison(area, res.data);
+}
+
+function renderComparison(container, data) {
+  container.innerHTML = '';
+
+  if (!data || !data.winner) {
+    container.innerHTML = '<div class="action-card"><p class="no-results">No comparison results returned.</p></div>';
+    return;
+  }
+
+  // Summary line
+  if (data.summary) {
+    const summary = document.createElement('p');
+    summary.className = 'orch-summary';
+    summary.textContent = data.summary;
+    container.appendChild(summary);
+  }
+
+  // Winner card (large, prominent)
+  const winnerCard = document.createElement('div');
+  winnerCard.className = 'orch-winner-card';
+
+  const winnerLabel = document.createElement('span');
+  winnerLabel.className = 'orch-winner-label';
+  winnerLabel.textContent = '★ Best Pick';
+  winnerCard.appendChild(winnerLabel);
+
+  const winnerTitle = document.createElement('p');
+  winnerTitle.className = 'orch-winner-title';
+  winnerTitle.textContent = data.winner.title;
+  winnerCard.appendChild(winnerTitle);
+
+  const winnerMeta = document.createElement('div');
+  winnerMeta.className = 'orch-winner-meta';
+
+  const winnerPrice = document.createElement('span');
+  winnerPrice.className = 'orch-winner-price';
+  winnerPrice.textContent = data.winner.price;
+  winnerMeta.appendChild(winnerPrice);
+
+  const winnerSite = document.createElement('span');
+  winnerSite.className = 'orch-site-badge';
+  winnerSite.textContent = data.winner.site;
+  winnerMeta.appendChild(winnerSite);
+
+  // Trust badge
+  if (data.winner.trustBadge) {
+    const trustBadge = document.createElement('span');
+    trustBadge.className = `trust-badge trust-${data.winner.trustBadge}`;
+    trustBadge.textContent = data.winner.trustBadge === 'verified' ? '✓ Verified' :
+                             data.winner.trustBadge === 'aggregator' ? '◆ Aggregator' :
+                             data.winner.trustBadge === 'caution' ? '⚠ Caution' : '✕ Rejected';
+    winnerMeta.appendChild(trustBadge);
+  }
+
+  winnerCard.appendChild(winnerMeta);
+
+  if (data.winner.rationale) {
+    const rationale = document.createElement('p');
+    rationale.className = 'orch-winner-rationale';
+    rationale.textContent = data.winner.rationale;
+    winnerCard.appendChild(rationale);
+  }
+
+  // "Go to Product" button
+  if (data.winner.url) {
+    const goBtn = document.createElement('button');
+    goBtn.className = 'btn btn-primary orch-go-btn';
+    goBtn.textContent = 'Go to Product →';
+    goBtn.addEventListener('click', async () => {
+      goBtn.textContent = 'Navigating...';
+      goBtn.disabled = true;
+      const navRes = await sendToBackground('navigate_to_winner', {
+        url: data.winner.url,
+        tabId: currentTabId,
+      });
+      if (navRes?.success) {
+        goBtn.textContent = '✓ Opened';
+      } else {
+        // Fallback: open in new tab
+        chrome.tabs.create({ url: data.winner.url, active: true });
+        goBtn.textContent = '✓ Opened in new tab';
+      }
+    });
+    winnerCard.appendChild(goBtn);
+  }
+
+  container.appendChild(winnerCard);
+
+  // Alternatives
+  if (data.alternatives && data.alternatives.length > 0) {
+    const altHeader = document.createElement('p');
+    altHeader.className = 'orch-alt-header';
+    altHeader.textContent = 'Also worth considering';
+    container.appendChild(altHeader);
+
+    for (const alt of data.alternatives) {
+      const altCard = document.createElement('div');
+      altCard.className = 'orch-alt-card';
+
+      const altInfo = document.createElement('div');
+      altInfo.className = 'orch-alt-info';
+
+      const altTitle = document.createElement('span');
+      altTitle.className = 'orch-alt-title';
+      altTitle.textContent = alt.title;
+      altInfo.appendChild(altTitle);
+
+      const altMeta = document.createElement('div');
+      altMeta.className = 'orch-alt-meta';
+      let altMetaHtml = `<span>${alt.price}</span><span class="orch-site-badge">${alt.site}</span>`;
+      if (alt.trustBadge) {
+        const badgeLabel = alt.trustBadge === 'verified' ? '✓' :
+                           alt.trustBadge === 'aggregator' ? '◆' :
+                           alt.trustBadge === 'caution' ? '⚠' : '✕';
+        altMetaHtml += `<span class="trust-badge trust-${alt.trustBadge}">${badgeLabel}</span>`;
+      }
+      altMeta.innerHTML = altMetaHtml;
+      altInfo.appendChild(altMeta);
+
+      if (alt.note) {
+        const altNote = document.createElement('p');
+        altNote.className = 'orch-alt-note';
+        altNote.textContent = alt.note;
+        altInfo.appendChild(altNote);
+      }
+
+      altCard.appendChild(altInfo);
+
+      if (alt.url) {
+        const altLink = document.createElement('button');
+        altLink.className = 'btn orch-alt-btn';
+        altLink.textContent = 'View';
+        altLink.addEventListener('click', () => {
+          chrome.tabs.create({ url: alt.url, active: true });
+        });
+        altCard.appendChild(altLink);
+      }
+
+      container.appendChild(altCard);
+    }
+  }
+
+  // Rejected sites (trust < 4.0)
+  if (data.rejectedSites && data.rejectedSites.length > 0) {
+    const rejHeader = document.createElement('p');
+    rejHeader.className = 'orch-alt-header trust-rejected-header';
+    rejHeader.textContent = 'Excluded (low trust)';
+    container.appendChild(rejHeader);
+
+    for (const rej of data.rejectedSites) {
+      const rejEl = document.createElement('div');
+      rejEl.className = 'trust-rejected-item';
+      rejEl.innerHTML = `<span class="trust-badge trust-rejected">✕</span> ` +
+        `<span>${rej.site}</span> — <span class="trust-rejected-reason">${rej.reason}</span>`;
+      container.appendChild(rejEl);
     }
   }
 }

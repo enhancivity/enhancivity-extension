@@ -123,6 +123,41 @@
       return { success: true, value: (el.innerText || '').trim().slice(0, 3000) };
     },
 
+    highlight(step) {
+      if (!step.selector) {
+        return { success: false, error: 'No selector provided for highlight' };
+      }
+
+      const el = document.querySelector(step.selector);
+      if (!el) {
+        return { success: false, error: `Element not found: ${step.selector}` };
+      }
+
+      // Scroll into view
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+      // Add glowing outline (preserve originals for cleanup)
+      const origOutline    = el.style.outline;
+      const origOffset     = el.style.outlineOffset;
+      const origTransition = el.style.transition;
+      const origBoxShadow  = el.style.boxShadow;
+
+      el.style.transition    = 'outline 0.3s ease, box-shadow 0.3s ease';
+      el.style.outline       = '3px solid #6366f1';
+      el.style.outlineOffset = '3px';
+      el.style.boxShadow     = '0 0 12px rgba(99, 102, 241, 0.4)';
+
+      // Auto-remove after 4 seconds
+      setTimeout(() => {
+        el.style.outline       = origOutline;
+        el.style.outlineOffset = origOffset;
+        el.style.transition    = origTransition;
+        el.style.boxShadow     = origBoxShadow;
+      }, 4000);
+
+      return { success: true };
+    },
+
     wait(step) {
       const ms = Math.min(parseInt(step.value) || 1000, 5000);
       return new Promise(resolve =>

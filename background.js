@@ -1,10 +1,12 @@
 // ============================================================
-// Enhancivity Background Service Worker — Grand Extension v2.0
+// Enhancivity Background Service Worker — Grand Extension v4.0
 // Responsibilities:
 //   1. Auth (email/password + Google OAuth)
 //   2. 3-Tier Memory caching (30-min TTL)
 //   3. Message routing (popup → Gmail/Amazon scripts → backend)
 //   4. API orchestration with memory-enriched payloads
+//   5. Universal Ghost-Driver: AI-driven semantic scraping via hidden tabs
+//   6. stageAction: Ghost-Driver form filling (travel, bills, etc.)
 // ============================================================
 
 const API_BASE = 'https://enhancivity.com';
@@ -18,6 +20,7 @@ const ALLOWED_DOMAINS = [
   'github.com', 'notion.so', 'trello.com', 'asana.com',
   'indeed.com', 'glassdoor.com', 'monster.com', 'ziprecruiter.com',
   'youtube.com', 'twitter.com', 'x.com', 'reddit.com',
+  'expedia.com', 'kayak.com', 'skyscanner.net',
 ];
 
 function isAllowedUrl(url) {
@@ -100,6 +103,283 @@ chrome.runtime.onStartup.addListener(async () => {
   const { token } = await chrome.storage.local.get(['token']);
   if (token) await refreshMemory(token).catch(() => {});
 });
+
+// --- Orchestration Engine: Universal Ghost-Driver ---
+
+const SEARCH_URLS = {
+  amazon:    (q) => `https://www.amazon.com/s?k=${encodeURIComponent(q)}`,
+  ebay:      (q) => `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(q)}`,
+  etsy:      (q) => `https://www.etsy.com/search?q=${encodeURIComponent(q)}`,
+  google:    (q) => `https://www.google.com/search?q=${encodeURIComponent(q)}&tbm=shop`,
+  expedia:   (q) => `https://www.expedia.com/Hotel-Search?destination=${encodeURIComponent(q)}`,
+  kayak:     (q) => `https://www.kayak.com/flights?search=${encodeURIComponent(q)}`,
+  skyscanner:(q) => `https://www.skyscanner.net/transport/flights/?query=${encodeURIComponent(q)}`,
+};
+
+// Universal semantic scraper — replaces all site-specific scrapers
+const SEMANTIC_SCRAPER = 'content_search_semantic.js';
+
+function waitForTabLoad(tabId, timeout = 15000) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve(); // Resolve anyway — partial scrape is better than nothing
+    }, timeout);
+
+    function listener(id, info) {
+      if (id === tabId && info.status === 'complete') {
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        // Extra delay for JS rendering (SPAs, lazy-loaded product cards)
+        setTimeout(resolve, 2000);
+      }
+    }
+    chrome.tabs.onUpdated.addListener(listener);
+  });
+}
+
+async function updateOrchestrationProgress(phase, detail) {
+  await chrome.storage.local.set({
+    orchestrationProgress: { phase, detail, timestamp: Date.now() }
+  });
+}
+
+// --- Semantic Search Tab: inject semantic scraper → parse-intent API ---
+
+async function spawnSearchTab(site, query, category, token) {
+  const urlBuilder = SEARCH_URLS[site];
+  if (!urlBuilder) {
+    return { site, results: [], error: `No URL builder for site: ${site}` };
+  }
+
+  const url = urlBuilder(query);
+  let tab;
+
+  try {
+    // Create hidden tab (active: false = no focus steal)
+    tab = await chrome.tabs.create({ url, active: false });
+
+    await updateOrchestrationProgress(`searching:${site}`, `Searching ${site}...`);
+
+    // Wait for page to fully load
+    await waitForTabLoad(tab.id, 15000);
+
+    // Phase 1: Inject semantic scraper → get DOM Semantic Map
+    const injected = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: [SEMANTIC_SCRAPER],
+    }).catch((err) => {
+      console.warn(`[Ghost-Driver] Failed to inject semantic scraper for ${site}:`, err.message);
+      return null;
+    });
+
+    const semanticMap = injected?.[0]?.result;
+    if (!semanticMap || !semanticMap.elements || semanticMap.elements.length === 0) {
+      console.warn(`[Ghost-Driver] ${site}: semantic map empty`);
+      return { site, results: [], error: 'Semantic map empty' };
+    }
+
+    console.log(`[Ghost-Driver] ${site}: mapped ${semanticMap.mappedCount} elements`);
+
+    // Phase 2: Send semantic map to parse-intent for AI interpretation
+    const parseRes = await fetch(`${API_BASE}/api/agent/parse-intent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        semanticMap,
+        userGoal: query,
+        pageUrl: url,
+        category: category || 'shopping',
+        mode: 'extract_products',
+      }),
+    });
+
+    if (!parseRes.ok) {
+      const err = await parseRes.json().catch(() => ({}));
+      console.warn(`[Ghost-Driver] ${site}: parse-intent failed:`, err.error);
+      return { site, results: [], error: err.error || `Parse failed (${parseRes.status})` };
+    }
+
+    const parsed = await parseRes.json();
+    const results = parsed.products || [];
+
+    // Pass trust scores through to the compare endpoint
+    const trustScore = parsed.trustScore || 5.0;
+    const trustRationale = parsed.trustRationale || '';
+
+    console.log(`[Ghost-Driver] ${site}: extracted ${results.length} products (trust: ${trustScore})`);
+    return { site, results, trustScore, trustRationale };
+
+  } catch (err) {
+    console.warn(`[Ghost-Driver] ${site} search failed:`, err.message);
+    return { site, results: [], error: err.message };
+  } finally {
+    // Always clean up — close the hidden tab
+    if (tab?.id) {
+      await chrome.tabs.remove(tab.id).catch(() => {});
+    }
+  }
+}
+
+async function runOrchestration(userPrompt, searchPlan, token) {
+  try {
+    await updateOrchestrationProgress('searching', `Searching ${searchPlan.sites.length} sites...`);
+
+    // Parallel search across all sites (now using semantic scraper)
+    const searchPromises = searchPlan.sites.map(site => {
+      const query = searchPlan.queries[site] || searchPlan.queries.default || userPrompt;
+      return spawnSearchTab(site, query, searchPlan.category, token);
+    });
+
+    const searchResults = await Promise.allSettled(searchPromises);
+
+    // Collect successful results
+    const allResults = searchResults
+      .filter(r => r.status === 'fulfilled')
+      .map(r => r.value)
+      .filter(r => r.results && r.results.length > 0);
+
+    if (allResults.length === 0) {
+      await updateOrchestrationProgress('error', 'No results found across any site.');
+      return { success: false, error: 'No results found. Try rephrasing your search.' };
+    }
+
+    const totalProducts = allResults.reduce((sum, r) => sum + r.results.length, 0);
+    await updateOrchestrationProgress('comparing', `AI is comparing ${totalProducts} products...`);
+
+    // Send to backend for trust-weighted comparison
+    const compareRes = await fetch(`${API_BASE}/api/agent/compare`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        results: allResults,
+        criteria: searchPlan.criteria,
+        category: searchPlan.category,
+        userPrompt,
+      }),
+    });
+
+    if (!compareRes.ok) {
+      const err = await compareRes.json().catch(() => ({}));
+      await updateOrchestrationProgress('error', err.error || 'Comparison failed.');
+      return { success: false, error: err.error || `Comparison failed (${compareRes.status})` };
+    }
+
+    const comparison = await compareRes.json();
+    await updateOrchestrationProgress('done', null);
+
+    return { success: true, data: comparison };
+
+  } catch (err) {
+    console.error('[Orchestrator] Unhandled error:', err);
+    await updateOrchestrationProgress('error', err.message);
+    return { success: false, error: err.message || 'Orchestration failed.' };
+  }
+}
+
+// --- Ghost-Driver: stageAction (AI-driven form filling) ---
+
+async function stageAction(tabId, userGoal, category, token) {
+  // Step 1: Inject semantic scraper into the target tab
+  let semanticMap;
+  try {
+    const injected = await chrome.scripting.executeScript({
+      target: { tabId },
+      files: [SEMANTIC_SCRAPER],
+    });
+    semanticMap = injected?.[0]?.result;
+  } catch (err) {
+    return { success: false, error: 'Cannot inject semantic scraper into this page.' };
+  }
+
+  if (!semanticMap || !semanticMap.elements?.length) {
+    return { success: false, error: 'Page has no interactable elements.' };
+  }
+
+  // Step 2: Send to parse-intent in fill_form mode
+  const parseRes = await fetch(`${API_BASE}/api/agent/parse-intent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      semanticMap,
+      userGoal,
+      pageUrl: semanticMap.pageUrl,
+      category: category || 'forms',
+      mode: 'fill_form',
+    }),
+  });
+
+  if (!parseRes.ok) {
+    const err = await parseRes.json().catch(() => ({}));
+    return { success: false, error: err.error || 'Form analysis failed.' };
+  }
+
+  const parsed = await parseRes.json();
+  const actions = parsed.actions || [];
+
+  if (actions.length === 0) {
+    return { success: false, error: 'No form fields identified on this page.' };
+  }
+
+  // Step 3: Resolve semanticIds → CSS selectors via data-enh-sid attributes
+  const resolveResult = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (actionsToResolve) => {
+      // Run inside the page context — resolve data-enh-sid to CSS selectors
+      return actionsToResolve.map(action => {
+        const el = document.querySelector(`[data-enh-sid="${action.semanticId}"]`);
+        if (!el) return null;
+
+        // Build a reliable selector
+        let selector;
+        if (el.id) {
+          selector = `#${el.id}`;
+        } else if (el.name) {
+          selector = `[name="${el.name}"]`;
+        } else {
+          // Use the data-enh-sid attribute itself as the selector
+          selector = `[data-enh-sid="${action.semanticId}"]`;
+        }
+
+        return {
+          action: action.action,
+          selector,
+          value: action.value || undefined,
+          description: action.rationale || `${action.action} on ${action.semanticId}`,
+        };
+      }).filter(Boolean);
+    },
+    args: [actions],
+  });
+
+  const resolvedActions = resolveResult?.[0]?.result;
+  if (!resolvedActions || resolvedActions.length === 0) {
+    return { success: false, error: 'Could not locate form fields on page.' };
+  }
+
+  // Step 4: Inject content_actions.js and execute each resolved action
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['content_actions.js'],
+  });
+
+  const results = [];
+  for (const action of resolvedActions) {
+    const result = await chrome.tabs.sendMessage(tabId, {
+      type: 'execute_dom_action',
+      step: action,
+    });
+    results.push(result);
+    if (!result.success) break;
+  }
+
+  return {
+    success: results.every(r => r.success),
+    results,
+    actionsPlanned: actions.length,
+    actionsExecuted: results.length,
+  };
+}
 
 // --- Central Message Handler ---
 
@@ -285,6 +565,11 @@ async function handleMessage(request) {
       return { success: true, tabId: tab.id };
     }
 
+    // semantic_fill: Ghost-Driver AI form filling
+    if (action.action === 'semantic_fill') {
+      return await stageAction(tabId, action.value || '', action.category || 'forms', token);
+    }
+
     // For DOM actions, inject content_actions.js then send the step
     try {
       await chrome.scripting.executeScript({
@@ -324,9 +609,138 @@ async function handleMessage(request) {
         currentTabId = stepResult.tabId;
         await new Promise(r => setTimeout(r, 2500));
       }
+
+      // If the step was semantic_fill, allow time for fields to settle
+      if (step.action === 'semantic_fill') {
+        await new Promise(r => setTimeout(r, 1000));
+      }
     }
 
     return { success: true, results };
+  }
+
+  // ── ORCHESTRATE: Multi-site parallel search ──────────────
+  if (request.type === 'orchestrate_search') {
+    const { searchPlan, userPrompt } = request.data;
+
+    if (!searchPlan || !searchPlan.sites || searchPlan.sites.length === 0) {
+      return { success: false, error: 'Invalid search plan: no sites specified.' };
+    }
+
+    return await runOrchestration(userPrompt, searchPlan, token);
+  }
+
+  // ── SEMANTIC SCRAPE: On-demand semantic analysis of any tab ──
+  if (request.type === 'semantic_scrape') {
+    const { tabId, userGoal, category, mode } = request.data;
+
+    try {
+      const injected = await chrome.scripting.executeScript({
+        target: { tabId },
+        files: [SEMANTIC_SCRAPER],
+      });
+      const semanticMap = injected?.[0]?.result;
+      if (!semanticMap || !semanticMap.elements?.length) {
+        return { success: false, error: 'Could not build semantic map from this page.' };
+      }
+
+      const parseRes = await fetch(`${API_BASE}/api/agent/parse-intent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          semanticMap,
+          userGoal: userGoal || '',
+          pageUrl: semanticMap.pageUrl,
+          category: category || 'general',
+          mode: mode || 'extract_products',
+        }),
+      });
+
+      if (!parseRes.ok) {
+        const err = await parseRes.json().catch(() => ({}));
+        return { success: false, error: err.error || 'Parse intent failed.' };
+      }
+
+      const parsed = await parseRes.json();
+      return { success: true, data: parsed };
+
+    } catch (err) {
+      return { success: false, error: err.message || 'Semantic scrape failed.' };
+    }
+  }
+
+  // ── STAGE ACTION: Ghost-Driver form filling ──────────────
+  if (request.type === 'stage_action') {
+    const { tabId, userGoal, category } = request.data;
+    return await stageAction(tabId, userGoal, category || 'forms', token);
+  }
+
+  // ── NAVIGATE TO WINNER (Closer Logic — now AI-driven) ────
+  if (request.type === 'navigate_to_winner') {
+    const { url, tabId } = request.data;
+
+    if (!isAllowedUrl(url)) {
+      return { success: false, error: `Navigation to ${new URL(url).hostname} is not allowed.` };
+    }
+
+    // Navigate the active tab to the winner URL
+    await chrome.tabs.update(tabId, { url });
+
+    // Wait for page to load
+    await waitForTabLoad(tabId, 15000);
+
+    // Use semantic scraper + parse-intent to find the Buy button (AI-driven, not hardcoded)
+    try {
+      const injected = await chrome.scripting.executeScript({
+        target: { tabId },
+        files: [SEMANTIC_SCRAPER],
+      });
+
+      const semanticMap = injected?.[0]?.result;
+      if (semanticMap && semanticMap.elements?.length) {
+        // Ask AI to find the purchase/cart button
+        const parseRes = await fetch(`${API_BASE}/api/agent/parse-intent`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            semanticMap,
+            userGoal: 'Find the Add to Cart or Buy button',
+            pageUrl: url,
+            category: 'shopping',
+            mode: 'find_element',
+          }),
+        });
+
+        if (parseRes.ok) {
+          const parsed = await parseRes.json();
+          if (parsed.target?.semanticId) {
+            // Inject content_actions.js and highlight the found element
+            await chrome.scripting.executeScript({
+              target: { tabId },
+              files: ['content_actions.js'],
+            });
+
+            const result = await chrome.tabs.sendMessage(tabId, {
+              type: 'execute_dom_action',
+              step: {
+                action: 'highlight',
+                selector: `[data-enh-sid="${parsed.target.semanticId}"]`,
+                description: parsed.target.rationale || 'Highlighting the purchase button',
+              },
+            }).catch(() => null);
+
+            return { success: true, navigated: true, highlighted: !!result?.success };
+          }
+        }
+      }
+
+      // Fallback: navigation succeeded but couldn't find button
+      return { success: true, navigated: true, highlighted: false };
+
+    } catch {
+      // Navigation succeeded but highlighting failed — still ok
+      return { success: true, navigated: true, highlighted: false };
+    }
   }
 
   // ── GMAIL COMPOSE (site-specific action) ────────────────
