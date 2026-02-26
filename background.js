@@ -21,6 +21,7 @@ const ALLOWED_DOMAINS = [
   'indeed.com', 'glassdoor.com', 'monster.com', 'ziprecruiter.com',
   'youtube.com', 'twitter.com', 'x.com', 'reddit.com',
   'expedia.com', 'kayak.com', 'skyscanner.net',
+  'enhancivity.com',
 ];
 
 function isAllowedUrl(url) {
@@ -118,6 +119,62 @@ const SEARCH_URLS = {
 
 // Universal semantic scraper — replaces all site-specific scrapers
 const SEMANTIC_SCRAPER = 'content_search_semantic.js';
+
+// Progress HUD content script
+const HUD_SCRIPT = 'content_hud.js';
+
+// ─── HUD Helpers (inject + send messages) ─────────────────
+
+async function injectHud(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: [HUD_SCRIPT],
+    });
+  } catch {
+    // HUD injection failed — non-fatal (e.g., chrome:// pages)
+  }
+}
+
+async function hudShow(tabId, taskTitle, initialSteps) {
+  await injectHud(tabId);
+  return chrome.tabs.sendMessage(tabId, {
+    type: 'hud_show',
+    taskTitle,
+    initialSteps,
+  }).catch(() => null);
+}
+
+async function hudUpdate(tabId, stepId, status, detail, label) {
+  return chrome.tabs.sendMessage(tabId, {
+    type: 'hud_update',
+    stepId,
+    status,
+    detail,
+    label,
+  }).catch(() => null);
+}
+
+async function hudTrust(tabId, trustBadge, trustScore, siteName) {
+  return chrome.tabs.sendMessage(tabId, {
+    type: 'hud_trust',
+    trustBadge,
+    trustScore,
+    siteName,
+  }).catch(() => null);
+}
+
+async function hudConsent(tabId, message, targetSelector) {
+  return chrome.tabs.sendMessage(tabId, {
+    type: 'hud_consent',
+    message,
+    targetSelector,
+  }).catch(() => ({ approved: false, reason: 'hud_not_available' }));
+}
+
+async function hudHide(tabId) {
+  return chrome.tabs.sendMessage(tabId, { type: 'hud_hide' }).catch(() => null);
+}
 
 function waitForTabLoad(tabId, timeout = 15000) {
   return new Promise((resolve) => {
@@ -280,7 +337,16 @@ async function runOrchestration(userPrompt, searchPlan, token) {
 // --- Ghost-Driver: stageAction (AI-driven form filling) ---
 
 async function stageAction(tabId, userGoal, category, token) {
+  // Show HUD with progress steps
+  await hudShow(tabId, 'Ghost-Driver', [
+    { id: 'scan', label: 'Scanning page elements' },
+    { id: 'analyze', label: 'AI analyzing form structure' },
+    { id: 'resolve', label: 'Mapping fields' },
+    { id: 'execute', label: 'Filling form fields' },
+  ]);
+
   // Step 1: Inject semantic scraper into the target tab
+  await hudUpdate(tabId, 'scan', 'processing');
   let semanticMap;
   try {
     const injected = await chrome.scripting.executeScript({
@@ -289,14 +355,18 @@ async function stageAction(tabId, userGoal, category, token) {
     });
     semanticMap = injected?.[0]?.result;
   } catch (err) {
+    await hudUpdate(tabId, 'scan', 'error', 'Cannot access this page');
     return { success: false, error: 'Cannot inject semantic scraper into this page.' };
   }
 
   if (!semanticMap || !semanticMap.elements?.length) {
+    await hudUpdate(tabId, 'scan', 'error', 'No interactable elements found');
     return { success: false, error: 'Page has no interactable elements.' };
   }
+  await hudUpdate(tabId, 'scan', 'success', `${semanticMap.elements.length} elements found`);
 
   // Step 2: Send to parse-intent in fill_form mode
+  await hudUpdate(tabId, 'analyze', 'processing');
   const parseRes = await fetch(`${API_BASE}/api/agent/parse-intent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -311,6 +381,7 @@ async function stageAction(tabId, userGoal, category, token) {
 
   if (!parseRes.ok) {
     const err = await parseRes.json().catch(() => ({}));
+    await hudUpdate(tabId, 'analyze', 'error', err.error || 'Analysis failed');
     return { success: false, error: err.error || 'Form analysis failed.' };
   }
 
@@ -318,26 +389,32 @@ async function stageAction(tabId, userGoal, category, token) {
   const actions = parsed.actions || [];
 
   if (actions.length === 0) {
+    await hudUpdate(tabId, 'analyze', 'error', 'No fields identified');
     return { success: false, error: 'No form fields identified on this page.' };
+  }
+  await hudUpdate(tabId, 'analyze', 'success', `${actions.length} field${actions.length > 1 ? 's' : ''} to fill`);
+
+  // Show trust info if available from parse-intent
+  if (parsed.siteName) {
+    const trustBadge = parsed.trustScore >= 7 ? 'verified' : parsed.trustScore >= 4 ? 'aggregator' : 'caution';
+    await hudTrust(tabId, trustBadge, parsed.trustScore, parsed.siteName);
   }
 
   // Step 3: Resolve semanticIds → CSS selectors via data-enh-sid attributes
+  await hudUpdate(tabId, 'resolve', 'processing');
   const resolveResult = await chrome.scripting.executeScript({
     target: { tabId },
     func: (actionsToResolve) => {
-      // Run inside the page context — resolve data-enh-sid to CSS selectors
       return actionsToResolve.map(action => {
         const el = document.querySelector(`[data-enh-sid="${action.semanticId}"]`);
         if (!el) return null;
 
-        // Build a reliable selector
         let selector;
         if (el.id) {
           selector = `#${el.id}`;
         } else if (el.name) {
           selector = `[name="${el.name}"]`;
         } else {
-          // Use the data-enh-sid attribute itself as the selector
           selector = `[data-enh-sid="${action.semanticId}"]`;
         }
 
@@ -354,10 +431,13 @@ async function stageAction(tabId, userGoal, category, token) {
 
   const resolvedActions = resolveResult?.[0]?.result;
   if (!resolvedActions || resolvedActions.length === 0) {
+    await hudUpdate(tabId, 'resolve', 'error', 'Fields not found on page');
     return { success: false, error: 'Could not locate form fields on page.' };
   }
+  await hudUpdate(tabId, 'resolve', 'success', `${resolvedActions.length} field${resolvedActions.length > 1 ? 's' : ''} located`);
 
   // Step 4: Inject content_actions.js and execute each resolved action
+  await hudUpdate(tabId, 'execute', 'processing');
   await chrome.scripting.executeScript({
     target: { tabId },
     files: ['content_actions.js'],
@@ -373,8 +453,18 @@ async function stageAction(tabId, userGoal, category, token) {
     if (!result.success) break;
   }
 
+  const allSuccess = results.every(r => r.success);
+  await hudUpdate(tabId, 'execute', allSuccess ? 'success' : 'error',
+    allSuccess ? `${results.length} action${results.length > 1 ? 's' : ''} completed` : 'Some actions failed'
+  );
+
+  // Auto-hide HUD after 3 seconds on success
+  if (allSuccess) {
+    setTimeout(() => hudHide(tabId), 3000);
+  }
+
   return {
-    success: results.every(r => r.success),
+    success: allSuccess,
     results,
     actionsPlanned: actions.length,
     actionsExecuted: results.length,
@@ -675,7 +765,7 @@ async function handleMessage(request) {
     return await stageAction(tabId, userGoal, category || 'forms', token);
   }
 
-  // ── NAVIGATE TO WINNER (Closer Logic — now AI-driven) ────
+  // ── NAVIGATE TO WINNER (Closer Logic — HUD + Consent + AI-driven) ────
   if (request.type === 'navigate_to_winner') {
     const { url, tabId } = request.data;
 
@@ -689,8 +779,17 @@ async function handleMessage(request) {
     // Wait for page to load
     await waitForTabLoad(tabId, 15000);
 
-    // Use semantic scraper + parse-intent to find the Buy button (AI-driven, not hardcoded)
+    // Show HUD on the product page
+    await hudShow(tabId, 'Enhancivity Agent', [
+      { id: 'navigate', label: 'Navigating to product page' },
+      { id: 'scan', label: 'Scanning page for Buy button' },
+      { id: 'consent', label: 'Awaiting your approval' },
+    ]);
+    await hudUpdate(tabId, 'navigate', 'success', new URL(url).hostname);
+
+    // Use semantic scraper + parse-intent to find the Buy button
     try {
+      await hudUpdate(tabId, 'scan', 'processing');
       const injected = await chrome.scripting.executeScript({
         target: { tabId },
         files: [SEMANTIC_SCRAPER],
@@ -698,7 +797,6 @@ async function handleMessage(request) {
 
       const semanticMap = injected?.[0]?.result;
       if (semanticMap && semanticMap.elements?.length) {
-        // Ask AI to find the purchase/cart button
         const parseRes = await fetch(`${API_BASE}/api/agent/parse-intent`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -713,32 +811,62 @@ async function handleMessage(request) {
 
         if (parseRes.ok) {
           const parsed = await parseRes.json();
+
+          // Show trust info
+          if (parsed.siteName) {
+            const badge = parsed.trustScore >= 7 ? 'verified' : parsed.trustScore >= 4 ? 'aggregator' : 'caution';
+            await hudTrust(tabId, badge, parsed.trustScore, parsed.siteName);
+          }
+
           if (parsed.target?.semanticId) {
-            // Inject content_actions.js and highlight the found element
-            await chrome.scripting.executeScript({
-              target: { tabId },
-              files: ['content_actions.js'],
-            });
+            await hudUpdate(tabId, 'scan', 'success', parsed.target.rationale || 'Buy button found');
 
-            const result = await chrome.tabs.sendMessage(tabId, {
-              type: 'execute_dom_action',
-              step: {
-                action: 'highlight',
-                selector: `[data-enh-sid="${parsed.target.semanticId}"]`,
-                description: parsed.target.rationale || 'Highlighting the purchase button',
-              },
-            }).catch(() => null);
+            const targetSelector = `[data-enh-sid="${parsed.target.semanticId}"]`;
 
-            return { success: true, navigated: true, highlighted: !!result?.success };
+            // Show consent modal with indigo glow on the target button
+            await hudUpdate(tabId, 'consent', 'processing', 'Waiting for your approval...');
+            const consent = await hudConsent(
+              tabId,
+              `The agent found the purchase button and wants to highlight it for you. Approve to proceed?`,
+              targetSelector
+            );
+
+            if (consent?.approved) {
+              await hudUpdate(tabId, 'consent', 'success', 'Approved');
+
+              // Execute the highlight
+              await chrome.scripting.executeScript({
+                target: { tabId },
+                files: ['content_actions.js'],
+              });
+
+              const result = await chrome.tabs.sendMessage(tabId, {
+                type: 'execute_dom_action',
+                step: {
+                  action: 'highlight',
+                  selector: targetSelector,
+                  description: parsed.target.rationale || 'Highlighting the purchase button',
+                },
+              }).catch(() => null);
+
+              setTimeout(() => hudHide(tabId), 3000);
+              return { success: true, navigated: true, highlighted: !!result?.success };
+            } else {
+              await hudUpdate(tabId, 'consent', 'error', 'Cancelled by user');
+              setTimeout(() => hudHide(tabId), 2000);
+              return { success: true, navigated: true, highlighted: false, cancelled: true };
+            }
           }
         }
       }
 
-      // Fallback: navigation succeeded but couldn't find button
+      await hudUpdate(tabId, 'scan', 'error', 'Button not found');
+      setTimeout(() => hudHide(tabId), 3000);
       return { success: true, navigated: true, highlighted: false };
 
     } catch {
-      // Navigation succeeded but highlighting failed — still ok
+      await hudUpdate(tabId, 'scan', 'error', 'Scan failed');
+      setTimeout(() => hudHide(tabId), 3000);
       return { success: true, navigated: true, highlighted: false };
     }
   }
@@ -771,5 +899,176 @@ async function handleMessage(request) {
     }
   }
 
+  // ── GHOST DRIVE TASK: Delegated from Command Center dashboard ──
+  if (request.type === 'ghost_drive_task') {
+    const { taskId, taskTitle, taskDescription, priority, dueDate } = request.payload || {};
+
+    if (!taskId || !taskTitle) {
+      return { success: false, error: 'Missing task data for delegation.' };
+    }
+
+    // Run the delegation asynchronously and notify the dashboard on completion
+    handleDelegatedTask(taskId, taskTitle, taskDescription, token).catch((err) => {
+      console.error('[GhostDrive] Delegation failed:', err.message);
+      notifyDashboardTabs('TASK_FAILED', { taskId, error: err.message });
+    });
+
+    return { success: true, message: 'Task accepted for delegation.' };
+  }
+
   return { success: false, error: `Unknown message type: ${request.type}` };
+}
+
+// ── Ghost-Driver: Delegated Task Execution ─────────────────────
+// Called when the Command Center dashboard delegates a task.
+// Flow: get memory → ask AI for execution plan → navigate → scrape → execute
+
+async function handleDelegatedTask(taskId, taskTitle, taskDescription, authToken) {
+  console.log(`[GhostDrive] Starting delegation: "${taskTitle}"`);
+
+  const { token } = await chrome.storage.local.get(['token']);
+  const activeToken = authToken || token;
+  if (!activeToken) throw new Error('Not authenticated');
+
+  // Try to show HUD on the active tab (best-effort — user might be on any page)
+  let hudTabId = null;
+  try {
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (activeTab?.id) {
+      hudTabId = activeTab.id;
+      await hudShow(hudTabId, `Delegating: ${taskTitle}`, [
+        { id: 'memory', label: 'Loading memory context' },
+        { id: 'plan', label: 'AI planning execution' },
+        { id: 'execute', label: 'Executing task' },
+      ]);
+      await hudUpdate(hudTabId, 'memory', 'processing');
+    }
+  } catch { /* No active tab — skip HUD */ }
+
+  // 1. Gather memory context
+  const memory = await getOrRefreshMemory();
+  const memoryContext = memory
+    ? [
+        memory.tier1 ? `Identity: ${JSON.stringify(memory.tier1).substring(0, 300)}` : '',
+        memory.tier2?.length ? `Goals: ${memory.tier2.map(g => g.name).join(', ')}` : '',
+      ].filter(Boolean).join('\n')
+    : '';
+
+  if (hudTabId) await hudUpdate(hudTabId, 'memory', 'success', memory ? 'Memory loaded' : 'No memory available');
+
+  // 2. Ask AI agent for an execution plan
+  if (hudTabId) await hudUpdate(hudTabId, 'plan', 'processing');
+  const agentRes = await fetch(`${API_BASE}/api/agent/process`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${activeToken}` },
+    body: JSON.stringify({
+      userMessage: `Complete this delegated task: "${taskTitle}". ${taskDescription || ''}`,
+      pageUrl: '',
+      pageContent: '',
+      siteType: 'delegation',
+    }),
+  });
+
+  if (!agentRes.ok) {
+    if (hudTabId) await hudUpdate(hudTabId, 'plan', 'error', 'AI planning failed');
+    throw new Error('Agent process failed');
+  }
+
+  const agentData = await agentRes.json();
+  const actionType = agentData.action_type;
+  if (hudTabId) await hudUpdate(hudTabId, 'plan', 'success', `Plan: ${actionType}`);
+
+  // 3. Execute based on action type
+  if (hudTabId) await hudUpdate(hudTabId, 'execute', 'processing');
+
+  if (actionType === 'NAVIGATE' && agentData.action?.url) {
+    // Simple navigation task — HUD moves to the new tab
+    const tab = await chrome.tabs.create({ url: agentData.action.url, active: false });
+    await waitForTabLoad(tab.id, 15000);
+
+    // If there's form filling to do, use stageAction (which has its own HUD)
+    if (taskDescription && taskDescription.length > 10) {
+      if (hudTabId) await hudUpdate(hudTabId, 'execute', 'success', 'Navigated, filling form...');
+      const fillResult = await stageAction(tab.id, `${taskTitle}. ${taskDescription}`, 'delegation', activeToken);
+      if (fillResult.success) {
+        if (hudTabId) setTimeout(() => hudHide(hudTabId), 2000);
+        notifyDashboardTabs('TASK_COMPLETE', {
+          taskId,
+          summary: `Navigated to ${agentData.action.url} and filled ${fillResult.actionsExecuted || 0} fields.`,
+        });
+        return;
+      }
+    }
+
+    if (hudTabId) {
+      await hudUpdate(hudTabId, 'execute', 'success', `Opened ${new URL(agentData.action.url).hostname}`);
+      setTimeout(() => hudHide(hudTabId), 3000);
+    }
+    notifyDashboardTabs('TASK_COMPLETE', {
+      taskId,
+      summary: `Navigated to ${agentData.action.url}. Page is ready for your review.`,
+    });
+
+  } else if (actionType === 'ORCHESTRATE' && agentData.action?.search_plan) {
+    // Shopping/comparison orchestration
+    if (hudTabId) await hudUpdate(hudTabId, 'execute', 'processing', 'Searching multiple sites...');
+    const orchestrationResult = await runOrchestration(agentData, activeToken);
+    if (hudTabId) {
+      await hudUpdate(hudTabId, 'execute', 'success', orchestrationResult?.winner ? `Found: ${orchestrationResult.winner.title}` : 'Search complete');
+      setTimeout(() => hudHide(hudTabId), 3000);
+    }
+    notifyDashboardTabs('TASK_COMPLETE', {
+      taskId,
+      summary: orchestrationResult?.winner
+        ? `Found: ${orchestrationResult.winner.title} at ${orchestrationResult.winner.price}`
+        : 'Search completed. Check the extension popup for results.',
+    });
+
+  } else if (actionType === 'MULTI_STEP' && agentData.action?.steps) {
+    // Multi-step execution
+    const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
+    const totalSteps = agentData.action.steps.length;
+
+    for (let i = 0; i < totalSteps; i++) {
+      const step = agentData.action.steps[i];
+      if (hudTabId) await hudUpdate(hudTabId, 'execute', 'processing', `Step ${i + 1}/${totalSteps}: ${step.action || step.type || 'executing'}`);
+      await handleMessage({
+        type: 'execute_action',
+        data: { action: step, tabId: tab.id },
+      });
+      await new Promise(r => setTimeout(r, 1500));
+    }
+
+    if (hudTabId) {
+      await hudUpdate(hudTabId, 'execute', 'success', `${totalSteps} steps completed`);
+      setTimeout(() => hudHide(hudTabId), 3000);
+    }
+    notifyDashboardTabs('TASK_COMPLETE', {
+      taskId,
+      summary: `Executed ${totalSteps} steps for "${taskTitle}".`,
+    });
+
+  } else {
+    // AI gave a recommendation/info response — no action to execute
+    if (hudTabId) {
+      await hudUpdate(hudTabId, 'execute', 'success', 'Response received');
+      setTimeout(() => hudHide(hudTabId), 3000);
+    }
+    notifyDashboardTabs('TASK_COMPLETE', {
+      taskId,
+      summary: agentData.response || `Task "${taskTitle}" processed. AI response received.`,
+    });
+  }
+}
+
+// Notify all enhancivity.com tabs (where the dashboard bridge runs)
+async function notifyDashboardTabs(type, payload) {
+  try {
+    const tabs = await chrome.tabs.query({ url: ['https://enhancivity.com/*', 'https://*.enhancivity.com/*', 'http://localhost:3001/*'] });
+    for (const tab of tabs) {
+      chrome.tabs.sendMessage(tab.id, { type, payload }).catch(() => {});
+    }
+  } catch {
+    // No dashboard tabs open — that's fine
+  }
 }

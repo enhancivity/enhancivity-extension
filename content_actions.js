@@ -14,6 +14,17 @@
 (() => {
   'use strict';
 
+  // ── HTML Sanitization ─────────────────────────────────────
+
+  function escapeHtml(str) {
+    return (str || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
   // ── Sensitive Field Detection ──────────────────────────────
 
   const SENSITIVE_SELECTORS = [
@@ -80,7 +91,7 @@
 
       // Handle contenteditable elements (like Gmail compose body)
       if (el.isContentEditable) {
-        el.innerHTML = (step.value || '').replace(/\n/g, '<br>');
+        el.innerHTML = escapeHtml(step.value).replace(/\n/g, '<br>');
       } else {
         el.value = step.value || '';
       }

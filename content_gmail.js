@@ -4,6 +4,15 @@
 // On trigger: extracts the open email's subject, sender, body.
 // ============================================================
 
+function escapeHtml(str) {
+  return (str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
 
   // ── Gmail Compose: Fill compose window with AI draft ─────
@@ -104,7 +113,7 @@ async function handleGmailCompose(data) {
     const bodyField = document.querySelector('.Am.Al.editable[role="textbox"]');
     if (bodyField) {
       bodyField.focus();
-      bodyField.innerHTML = body.replace(/\n/g, '<br>');
+      bodyField.innerHTML = escapeHtml(body).replace(/\n/g, '<br>');
       bodyField.dispatchEvent(new Event('input', { bubbles: true }));
     }
   }
@@ -137,7 +146,7 @@ async function handleGmailReply(data) {
     const bodyField = bodyFields.length ? bodyFields[bodyFields.length - 1] : null;
     if (bodyField) {
       bodyField.focus();
-      bodyField.innerHTML = body.replace(/\n/g, '<br>');
+      bodyField.innerHTML = escapeHtml(body).replace(/\n/g, '<br>');
       bodyField.dispatchEvent(new Event('input', { bubbles: true }));
     }
   }
