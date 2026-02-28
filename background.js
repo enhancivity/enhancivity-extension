@@ -475,10 +475,12 @@ async function stageAction(tabId, userGoal, category, token) {
 
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   handleMessage(request)
-    .then(sendResponse)
+    .then(result => {
+      try { sendResponse(result); } catch (_) { /* channel closed */ }
+    })
     .catch(err => {
       console.error('Enhancivity background error:', err);
-      sendResponse({ success: false, error: err.message || 'Unknown error' });
+      try { sendResponse({ success: false, error: (err && err.message) || 'Unknown error' }); } catch (_) { /* channel closed */ }
     });
   return true; // Keep message channel open for async response
 });
