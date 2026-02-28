@@ -24,7 +24,7 @@ body {
   background: #08080a;
   color: #ededef;
   width: 380px;
-  max-height: 500px;
+  height: 500px;
   display: flex;
   flex-direction: column;
   overflow: hidden;
