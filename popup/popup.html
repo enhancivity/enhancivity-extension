@@ -3,6 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <title>Enhancivity</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
@@ -49,7 +52,7 @@
       <div class="header-right">
         <div id="memory-indicator" class="memory-indicator hidden">
           <span class="memory-pulse"></span>
-          <span class="memory-text">Memory Synced</span>
+          <span class="memory-text">MEMORY SYNCED</span>
         </div>
         <button id="sign-out-btn" class="icon-btn" title="Sign Out">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -61,34 +64,36 @@
       </div>
     </header>
 
-    <!-- Context Badge (subtle, below header) -->
+    <!-- Context Badge -->
     <div class="context-strip">
       <span id="context-badge" class="context-badge">General</span>
     </div>
 
     <!-- Chat Area (scrollable) -->
     <div id="chat-area" class="chat-area">
-      <!-- Greeting / placeholder -->
+      <!-- Greeting -->
       <div id="chat-greeting" class="chat-greeting">
         <div class="greeting-icon">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.4">
             <circle cx="12" cy="12" r="10"/>
             <path d="M12 16v-4"/>
             <path d="M12 8h.01"/>
           </svg>
         </div>
-        <p class="greeting-text">Ready to analyze current context...</p>
+        <p class="greeting-text">Ready when you are.</p>
       </div>
 
       <!-- Loading Indicator -->
       <div id="loading-bar" class="loading-bar hidden">
-        <div class="loading-spinner"></div>
-        <span>Thinking with your memory...</span>
+        <div class="loading-glow"></div>
+        <div class="loading-content">
+          <div class="loading-spinner"></div>
+          <span class="loading-label">Thinking with your memory...</span>
+        </div>
       </div>
 
-      <!-- Results Area (rendered dynamically — includes orchestration HUD) -->
-      <div id="results-area" class="results-area hidden">
-      </div>
+      <!-- Results Area -->
+      <div id="results-area" class="results-area hidden"></div>
 
       <!-- Error Area -->
       <p id="main-error" class="error-message"></p>
@@ -101,11 +106,11 @@
           type="text"
           id="prompt-input"
           class="prompt-field"
-          placeholder="Command Enhancivity..."
+          placeholder="Ask anything..."
           autocomplete="off"
         >
         <button id="submit-btn" class="send-btn" title="Send" disabled>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <line x1="12" y1="19" x2="12" y2="5"/>
             <polyline points="5 12 12 5 19 12"/>
           </svg>

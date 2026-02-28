@@ -975,8 +975,7 @@ const STAGE_LABELS = {
 };
 
 function setStage(stage) {
-  const bar = document.getElementById('loading-bar');
-  const label = bar?.querySelector('span');
+  const label = document.querySelector('.loading-label');
   if (label) {
     label.textContent = STAGE_LABELS[stage] || 'Thinking with your memory...';
   }
