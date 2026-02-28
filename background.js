@@ -477,11 +477,20 @@ async function stageAction(tabId, userGoal, category, token) {
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   handleMessage(request)
     .then(result => {
-      try { sendResponse(result); } catch (_) { /* channel closed */ }
+      // Ensure we ALWAYS send a valid response object
+      const safeResult = (result && typeof result === 'object')
+        ? result
+        : { success: false, errorType: 'EMPTY_HANDLER', error: `Handler for '${request.type}' returned no data.` };
+      try { sendResponse(safeResult); } catch (_) { /* channel closed */ }
     })
     .catch(err => {
-      console.error('Enhancivity background error:', err);
-      try { sendResponse({ success: false, error: (err && err.message) || 'Unknown error' }); } catch (_) { /* channel closed */ }
+      console.error(`[BG_ERROR] ${request.type}:`, err);
+      const errorObj = {
+        success: false,
+        errorType: 'HANDLER_CRASH',
+        error: (err && err.message) || 'Background handler crashed unexpectedly.',
+      };
+      try { sendResponse(errorObj); } catch (_) { /* channel closed */ }
     });
   return true; // Keep message channel open for async response
 });
@@ -588,7 +597,13 @@ async function handleMessage(request) {
     const { userPrompt, tabId, url, availableTabs } = request.data;
 
     // Load memory (from cache or fresh fetch)
-    const userMemory = await getOrRefreshMemory();
+    let userMemory;
+    try {
+      userMemory = await getOrRefreshMemory();
+    } catch (memErr) {
+      console.warn('[BG] Memory fetch failed, proceeding without:', memErr.message);
+      userMemory = {}; // Non-critical — proceed without memory
+    }
 
     // Build page context by detecting site and optionally scraping
     const pageContext = { url, site: 'general' };
@@ -597,7 +612,7 @@ async function handleMessage(request) {
     if (availableTabs && availableTabs.length > 0) {
       pageContext.availableTabs = availableTabs
         .filter(t => t.url && !t.url.startsWith('chrome://') && !t.url.startsWith('chrome-extension://'))
-        .slice(0, 15) // Cap at 15 tabs to limit payload size
+        .slice(0, 15)
         .map(t => ({ title: t.title, url: t.url, active: t.active }));
     }
 
@@ -610,9 +625,7 @@ async function handleMessage(request) {
           pageContext.subject = scraped.subject;
           pageContext.sender = scraped.sender;
         }
-      } catch {
-        // Content script may not be ready on this specific tab — proceed without scrape
-      }
+      } catch { /* Content script not ready — proceed without scrape */ }
 
     } else if (url && /amazon\.(com|co\.uk|de|fr|ca|com\.au)/.test(url)) {
       pageContext.site = 'amazon';
@@ -624,12 +637,9 @@ async function handleMessage(request) {
           pageContext.price = scraped.price;
           pageContext.rating = scraped.rating;
         }
-      } catch {
-        // Proceed without scrape
-      }
+      } catch { /* Proceed without scrape */ }
 
     } else if (tabId) {
-      // Universal scrape — inject on-demand for ALL other sites
       pageContext.site = detectSiteType(url);
       try {
         const results = await chrome.scripting.executeScript({
@@ -644,24 +654,33 @@ async function handleMessage(request) {
           pageContext.siteType = scraped.siteType;
           pageContext.meta = scraped.meta;
         }
-      } catch {
-        // Some pages block injection (chrome://, extension pages, etc.) — proceed without
-      }
+      } catch { /* Some pages block injection — proceed without */ }
     }
 
     // Send enriched payload to backend agent endpoint
-    const res = await fetch(`${API_BASE}/api/agent/process`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ userPrompt, pageContext, userMemory })
-    });
+    let res;
+    try {
+      res = await fetch(`${API_BASE}/api/agent/process`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ userPrompt, pageContext, userMemory })
+      });
+    } catch (fetchErr) {
+      return { success: false, errorType: 'NETWORK_ERROR', error: `Cannot reach server: ${fetchErr.message}` };
+    }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      return { success: false, error: err.error || `Server error (${res.status})` };
+      return { success: false, errorType: 'SERVER_ERROR', error: err.error || `Server error (${res.status})` };
     }
 
-    const data = await res.json();
+    let data;
+    try {
+      data = await res.json();
+    } catch (parseErr) {
+      return { success: false, errorType: 'PARSE_ERROR', error: 'Server returned invalid JSON.' };
+    }
+
     return { success: true, data };
   }
 
@@ -669,13 +688,24 @@ async function handleMessage(request) {
   if (request.type === 'switch_tab') {
     const { targetTabUrl } = request.data;
     if (!targetTabUrl) {
-      return { success: false, error: 'No target tab URL provided.' };
+      return { success: false, errorType: 'INVALID_INPUT', error: 'No target tab URL provided.' };
     }
 
     // Find the tab by matching URL
-    const allTabs = await chrome.tabs.query({});
-    const match = allTabs.find(t => t.url && t.url.includes(targetTabUrl)) ||
-                  allTabs.find(t => t.url && new URL(t.url).hostname === new URL(targetTabUrl).hostname);
+    let allTabs;
+    try {
+      allTabs = await chrome.tabs.query({});
+    } catch (tabErr) {
+      return { success: false, errorType: 'TAB_QUERY_FAILED', error: 'Could not query browser tabs.' };
+    }
+
+    let match;
+    try {
+      match = allTabs.find(t => t.url && t.url.includes(targetTabUrl)) ||
+              allTabs.find(t => t.url && new URL(t.url).hostname === new URL(targetTabUrl).hostname);
+    } catch {
+      match = null; // URL parsing failed — treat as not found
+    }
 
     if (!match) {
       // Fallback: open the URL in a new tab

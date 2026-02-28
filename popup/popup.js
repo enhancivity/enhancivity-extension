@@ -160,13 +160,17 @@ async function handleSubmit() {
   setLoading(true);
   clearResults();
 
-  // Zero-Token Triage: fetch lightweight tab map for spatial awareness
+  // ── STAGE 1: Tab Triage ──────────────────────────────────
+  setStage('STAGE_TRIAGE');
   let availableTabs = [];
   try {
-    const triageRes = await sendToBackground('GET_TAB_TRIAGE_MAP', {});
+    const triageRes = await sendToBackground('GET_TAB_TRIAGE_MAP', {}, 5000);
     if (triageRes?.success) availableTabs = triageRes.tabs;
-  } catch { /* non-critical — proceed without tab context */ }
+    // Non-critical: proceed without tabs if triage fails
+  } catch { /* proceed without tab context */ }
 
+  // ── STAGE 2: Backend AI Call ─────────────────────────────
+  setStage('STAGE_BACKEND');
   const res = await sendToBackground('process_request', {
     userPrompt,
     tabId: currentTabId,
@@ -174,10 +178,13 @@ async function handleSubmit() {
     availableTabs,
   });
 
+  // ── STAGE 3: Parse & Validate ────────────────────────────
+  setStage('STAGE_PARSING');
   setLoading(false);
 
   if (!res?.success) {
-    showError(res?.error || 'Something went wrong. Please try again.');
+    const errLabel = res?.errorType ? `[${res.errorType}] ` : '';
+    showError(errLabel + (res?.error || 'Something went wrong. Please try again.'));
     return;
   }
 
@@ -483,6 +490,7 @@ function getConfirmLabel(actionType) {
 }
 
 async function executeAction(container, btn, data) {
+  setStage('STAGE_EXECUTION');
   btn.textContent = 'Working...';
   btn.disabled = true;
 
@@ -902,15 +910,47 @@ function renderComparison(container, data) {
 
 // ── Utilities ────────────────────────────────────────────────
 
-function sendToBackground(type, data) {
+// ── Defensive Pipeline: typed errors + timeout ───────────────
+
+const PIPELINE_TIMEOUT_MS = 20000; // 20 seconds
+
+function sendToBackground(type, data, timeoutMs = PIPELINE_TIMEOUT_MS) {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type, data }, (response) => {
-      if (chrome.runtime.lastError) {
-        resolve({ success: false, error: chrome.runtime.lastError.message });
-      } else {
-        resolve(response);
-      }
-    });
+    const timer = setTimeout(() => {
+      resolve({
+        success: false,
+        errorType: 'BACKEND_TIMEOUT',
+        error: `Request timed out after ${timeoutMs / 1000}s. The server may be busy — try again.`,
+      });
+    }, timeoutMs);
+
+    try {
+      chrome.runtime.sendMessage({ type, data }, (response) => {
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) {
+          resolve({
+            success: false,
+            errorType: 'EXTENSION_ERROR',
+            error: chrome.runtime.lastError.message,
+          });
+        } else if (response === undefined || response === null) {
+          resolve({
+            success: false,
+            errorType: 'NO_RESPONSE',
+            error: 'Background returned no response. Try reloading the extension.',
+          });
+        } else {
+          resolve(response);
+        }
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      resolve({
+        success: false,
+        errorType: 'SEND_FAILED',
+        error: err.message || 'Failed to reach background script.',
+      });
+    }
   });
 }
 
@@ -922,6 +962,24 @@ function showView(id) {
 function setLoading(on) {
   document.getElementById('loading-bar').classList.toggle('hidden', !on);
   document.getElementById('submit-btn').disabled = on;
+  if (!on) setStage(''); // Clear stage when loading stops
+}
+
+// ── Stage Tracker: visual feedback during pipeline ───────────
+
+const STAGE_LABELS = {
+  STAGE_TRIAGE:    'Scanning your tabs...',
+  STAGE_BACKEND:   'Thinking with your memory...',
+  STAGE_PARSING:   'Validating response...',
+  STAGE_EXECUTION: 'Executing action...',
+};
+
+function setStage(stage) {
+  const bar = document.getElementById('loading-bar');
+  const label = bar?.querySelector('span');
+  if (label) {
+    label.textContent = STAGE_LABELS[stage] || 'Thinking with your memory...';
+  }
 }
 
 function clearResults() {
@@ -932,5 +990,24 @@ function clearResults() {
 }
 
 function showError(msg) {
-  document.getElementById('main-error').textContent = msg;
+  // Map technical error types to user-friendly hints
+  const FRIENDLY_HINTS = {
+    '[BACKEND_TIMEOUT]': 'The server took too long. Try again in a moment.',
+    '[NETWORK_ERROR]': 'Cannot reach the server. Check your internet connection.',
+    '[NO_RESPONSE]': 'Extension communication failed. Try reloading the extension.',
+    '[HANDLER_CRASH]': 'Something broke internally. Try again or reload the extension.',
+    '[SERVER_ERROR]': 'The server returned an error. Try again.',
+    '[PARSE_ERROR]': 'Got an invalid response from the server.',
+  };
+
+  let displayMsg = msg;
+  for (const [prefix, hint] of Object.entries(FRIENDLY_HINTS)) {
+    if (msg.startsWith(prefix)) {
+      displayMsg = hint;
+      break;
+    }
+  }
+
+  document.getElementById('main-error').textContent = displayMsg;
+  console.warn('[Enhancivity] Error shown to user:', msg); // Full detail in console
 }
