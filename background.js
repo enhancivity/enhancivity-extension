@@ -9,7 +9,8 @@
 //   6. stageAction: Ghost-Driver form filling (travel, bills, etc.)
 // ============================================================
 
-const API_BASE = 'https://enhancivity.com';
+// TODO: Change back to 'https://enhancivity.com' before production deployment
+const API_BASE = 'http://localhost:3001';
 const MEMORY_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // --- URL Allowlist for Navigate Actions (v1 safety) ---
@@ -761,7 +762,7 @@ async function handleMessage(request) {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           semanticMap,
-          userGoal: userGoal || '',
+          userGoal: userGoal || 'Analyze this page',
           pageUrl: semanticMap.pageUrl,
           category: category || 'general',
           mode: mode || 'extract_products',
