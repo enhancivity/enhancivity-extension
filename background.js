@@ -665,6 +665,33 @@ async function handleMessage(request) {
     return { success: true, data };
   }
 
+  // ── SWITCH TO EXISTING TAB ───────────────────────────────
+  if (request.type === 'switch_tab') {
+    const { targetTabUrl } = request.data;
+    if (!targetTabUrl) {
+      return { success: false, error: 'No target tab URL provided.' };
+    }
+
+    // Find the tab by matching URL
+    const allTabs = await chrome.tabs.query({});
+    const match = allTabs.find(t => t.url && t.url.includes(targetTabUrl)) ||
+                  allTabs.find(t => t.url && new URL(t.url).hostname === new URL(targetTabUrl).hostname);
+
+    if (!match) {
+      // Fallback: open the URL in a new tab
+      const newTab = await chrome.tabs.create({ url: targetTabUrl, active: true });
+      return { success: true, tabId: newTab.id, opened: true, message: 'Tab not found — opened in new tab.' };
+    }
+
+    // Activate the existing tab
+    await chrome.tabs.update(match.id, { active: true });
+    // Bring its window to focus
+    if (match.windowId) {
+      await chrome.windows.update(match.windowId, { focused: true });
+    }
+    return { success: true, tabId: match.id, switched: true, tabTitle: match.title };
+  }
+
   // ── EXECUTE SINGLE DOM ACTION ─────────────────────────────
   if (request.type === 'execute_action') {
     const { action, tabId } = request.data;

@@ -472,6 +472,7 @@ function getConfirmLabel(actionType) {
   switch (actionType) {
     case 'COMPOSE_EMAIL': return 'Insert Draft';
     case 'NAVIGATE':      return 'Yes, Open It';
+    case 'USE_EXISTING_TAB': return 'Switch to Tab';
     case 'SEARCH_SITE':   return 'Yes, Search';
     case 'ADD_TO_CART':    return 'Yes, Add to Cart';
     case 'FILL_FORM':     return 'Yes, Fill It';
@@ -487,8 +488,19 @@ async function executeAction(container, btn, data) {
 
   let res;
 
+  // USE_EXISTING_TAB: switch to an already-open tab
+  if (data.action_type === 'USE_EXISTING_TAB' && data.target_tab_url) {
+    res = await sendToBackground('switch_tab', { targetTabUrl: data.target_tab_url });
+    if (res?.success) {
+      const msg = res.switched
+        ? `Switched to: ${res.tabTitle || data.target_tab_url}`
+        : `Opened: ${data.target_tab_url}`;
+      container.innerHTML = `<p class="success-message">${msg}</p>`;
+      return;
+    }
+
   // EXTRACT_TASKS: scrape page and send back to agent for task extraction
-  if (data.action_type === 'EXTRACT_TASKS') {
+  } else if (data.action_type === 'EXTRACT_TASKS') {
     const goalText = data.headline || data.primary_content || 'Extract tasks from this page';
     res = await sendToBackground('semantic_scrape', {
       tabId: currentTabId,
