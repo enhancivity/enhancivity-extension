@@ -9,7 +9,7 @@
 //   6. stageAction: Ghost-Driver form filling (travel, bills, etc.)
 // ============================================================
 
-// TODO: Change back to 'https://enhancivity.com' before production deployment
+// Toggle for deployment: 'https://service.enhancivity.com' for production, 'http://localhost:3001' for local dev
 const API_BASE = 'http://localhost:3001';
 const MEMORY_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
@@ -23,6 +23,13 @@ const ALLOWED_DOMAINS = [
   'youtube.com', 'twitter.com', 'x.com', 'reddit.com',
   'expedia.com', 'kayak.com', 'skyscanner.net',
   'enhancivity.com',
+  'platform.openai.com', 'openai.com',
+  'stripe.com', 'dashboard.stripe.com',
+  'vercel.com', 'netlify.com', 'aws.amazon.com',
+  'docs.google.com', 'drive.google.com', 'calendar.google.com',
+  'outlook.live.com', 'outlook.office.com',
+  'fiverr.com', 'upwork.com',
+  'wise.com', 'paypal.com',
 ];
 
 function isAllowedUrl(url) {
@@ -509,6 +516,100 @@ async function handleMessage(request) {
     return { success: true, tabs: triageMap };
   }
 
+  // ── FETCH_TODOS: Pull tasks from backend API ────────────
+  if (request.type === 'fetch_todos') {
+    const { token } = await chrome.storage.local.get(['token']);
+    if (!token) return { success: false, errorType: 'AUTH_REQUIRED', error: 'Not logged in.' };
+
+    const { status, period } = request.data || {};
+    const params = new URLSearchParams();
+    if (status) params.append('status', status);
+
+    try {
+      const pendingRes = await fetch(`${API_BASE}/api/todos?status=PENDING`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const inProgressRes = await fetch(`${API_BASE}/api/todos?status=IN_PROGRESS`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const completedRes = await fetch(`${API_BASE}/api/todos?status=COMPLETED`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      if (!pendingRes.ok && !inProgressRes.ok && !completedRes.ok) {
+        return { success: false, errorType: 'API_ERROR', error: 'Failed to fetch tasks from server.' };
+      }
+
+      const [pendingData, inProgressData, completedData] = await Promise.all([
+        pendingRes.ok ? pendingRes.json() : { todos: [] },
+        inProgressRes.ok ? inProgressRes.json() : { todos: [] },
+        completedRes.ok ? completedRes.json() : { todos: [] },
+      ]);
+
+      let allTodos = [
+        ...(inProgressData.todos || []),
+        ...(pendingData.todos || []),
+        ...(completedData.todos || []),
+      ];
+
+      // Period filtering: if user specified a month/period, filter by it
+      if (period) {
+        const periodLower = period.toLowerCase();
+        const now = new Date();
+        let filterStart, filterEnd;
+
+        // Parse month names
+        const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+        const monthIdx = months.findIndex(m => periodLower.includes(m) || periodLower.includes(m.slice(0,3)));
+        if (monthIdx !== -1) {
+          const year = now.getFullYear();
+          filterStart = new Date(year, monthIdx, 1);
+          filterEnd = new Date(year, monthIdx + 1, 0, 23, 59, 59);
+        } else if (periodLower.includes('this week')) {
+          const dayOfWeek = now.getDay();
+          filterStart = new Date(now);
+          filterStart.setDate(now.getDate() - dayOfWeek);
+          filterStart.setHours(0, 0, 0, 0);
+          filterEnd = new Date(filterStart);
+          filterEnd.setDate(filterStart.getDate() + 6);
+          filterEnd.setHours(23, 59, 59);
+        } else if (periodLower.includes('today')) {
+          filterStart = new Date(now);
+          filterStart.setHours(0, 0, 0, 0);
+          filterEnd = new Date(now);
+          filterEnd.setHours(23, 59, 59);
+        }
+
+        if (filterStart && filterEnd) {
+          allTodos = allTodos.filter(t => {
+            const due = t.dueDate ? new Date(t.dueDate) : null;
+            const created = t.createdAt ? new Date(t.createdAt) : null;
+            // Match if due date OR created date falls within period
+            return (due && due >= filterStart && due <= filterEnd) ||
+                   (created && created >= filterStart && created <= filterEnd);
+          });
+        }
+      }
+
+      return {
+        success: true,
+        todos: allTodos.map(t => ({
+          id: t.id,
+          title: t.title,
+          description: t.description || '',
+          status: t.status,
+          priority: t.priority,
+          dueDate: t.dueDate,
+          createdAt: t.createdAt,
+        })),
+        count: allTodos.length,
+        period: period || 'all',
+      };
+    } catch (err) {
+      return { success: false, errorType: 'NETWORK_ERROR', error: err.message || 'Network error fetching tasks.' };
+    }
+  }
+
   // ── LOGIN: Email + Password ──────────────────────────────
   if (request.type === 'extension_login') {
     const { email, password } = request.data;
@@ -594,7 +695,7 @@ async function handleMessage(request) {
 
   // ── MAIN: Process a user request with 3-Tier Memory ─────
   if (request.type === 'process_request') {
-    const { userPrompt, tabId, url, availableTabs } = request.data;
+    const { userPrompt, tabId, url, availableTabs, conversationHistory, siteHint } = request.data;
 
     // Load memory (from cache or fresh fetch)
     let userMemory;
@@ -663,7 +764,7 @@ async function handleMessage(request) {
       res = await fetch(`${API_BASE}/api/agent/process`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ userPrompt, pageContext, userMemory })
+        body: JSON.stringify({ userPrompt, pageContext: { ...pageContext, siteHint: siteHint || null }, userMemory, conversationHistory: conversationHistory || [] })
       });
     } catch (fetchErr) {
       return { success: false, errorType: 'NETWORK_ERROR', error: `Cannot reach server: ${fetchErr.message}` };
@@ -996,6 +1097,22 @@ async function handleMessage(request) {
     return { success: true, message: 'Task accepted for delegation.' };
   }
 
+  // ── GET CURRENT TAB (for content_panel.js) ─────────────────
+  if (request.type === 'GET_CURRENT_TAB') {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      return { success: true, tab: tab ? { id: tab.id, url: tab.url, title: tab.title } : null };
+    } catch {
+      return { success: false, error: 'Could not query current tab.' };
+    }
+  }
+
+  // ── OPEN POPUP TAB (auth fallback from floating panel) ─────
+  if (request.type === 'open_popup_tab') {
+    await chrome.tabs.create({ url: chrome.runtime.getURL('popup/popup.html') });
+    return { success: true };
+  }
+
   return { success: false, error: `Unknown message type: ${request.type}` };
 }
 
@@ -1152,3 +1269,82 @@ async function notifyDashboardTabs(type, payload) {
     // No dashboard tabs open — that's fine
   }
 }
+
+// ── Floating Panel: Icon Click → Inject/Toggle ─────────────────
+
+// List of restricted URL prefixes where content scripts cannot be injected
+const RESTRICTED_URL_PREFIXES = ['chrome://', 'chrome-extension://', 'edge://', 'about:', 'devtools://'];
+
+function isRestrictedUrl(url) {
+  return !url || RESTRICTED_URL_PREFIXES.some(p => url.startsWith(p));
+}
+
+chrome.action.onClicked.addListener(async (tab) => {
+  // If the tab is restricted (chrome://, about:, etc.), open a new tab and inject panel there
+  if (isRestrictedUrl(tab.url)) {
+    const newTab = await chrome.tabs.create({ url: 'https://www.google.com', active: true });
+    const injectOnLoad = (tabId, changeInfo) => {
+      if (tabId === newTab.id && changeInfo.status === 'complete') {
+        chrome.tabs.onUpdated.removeListener(injectOnLoad);
+        chrome.scripting.insertCSS({ target: { tabId: newTab.id }, files: ['content_panel.css'] }).catch(() => {});
+        chrome.scripting.executeScript({ target: { tabId: newTab.id }, files: ['content_panel.js'] }).catch(() => {});
+      }
+    };
+    chrome.tabs.onUpdated.addListener(injectOnLoad);
+    return;
+  }
+
+  try {
+    // Try toggling — if panel is already injected, it will respond
+    await chrome.tabs.sendMessage(tab.id, { type: 'enh_panel_toggle' });
+  } catch {
+    // Panel not injected yet — inject it
+    try {
+      await chrome.scripting.insertCSS({
+        target: { tabId: tab.id },
+        files: ['content_panel.css'],
+      });
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ['content_panel.js'],
+      });
+    } catch (err) {
+      console.warn('[Enhancivity] Panel injection failed:', err.message);
+      // Last-resort fallback: open popup.html in a new tab
+      await chrome.tabs.create({ url: chrome.runtime.getURL('popup/popup.html') });
+    }
+  }
+});
+
+// ── Re-inject panel when user switches tabs (if panel was open) ──
+
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  try {
+    const { enhPanelState } = await chrome.storage.session.get('enhPanelState');
+    if (!enhPanelState?.isOpen) return;
+
+    // Get tab info to check if restricted
+    const tab = await chrome.tabs.get(tabId);
+    if (isRestrictedUrl(tab.url)) return;
+
+    // Check if panel already exists
+    await chrome.tabs.sendMessage(tabId, { type: 'enh_panel_ping' });
+  } catch {
+    // Panel not injected on this tab — inject it
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (isRestrictedUrl(tab.url)) return;
+
+      await chrome.scripting.insertCSS({
+        target: { tabId },
+        files: ['content_panel.css'],
+      });
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ['content_panel.js'],
+      });
+    } catch {
+      // Non-fatal — tab might not support injection
+    }
+  }
+});

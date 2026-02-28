@@ -199,7 +199,97 @@ async function handleSubmit() {
     return;
   }
 
+  // FETCH_TASKS: pull tasks from backend API and render inline
+  if (res.data?.action_type === 'FETCH_TASKS') {
+    await handleFetchTasks(res.data);
+    return;
+  }
+
   renderResults(res.data);
+}
+
+// ── FETCH_TASKS Handler ──────────────────────────────────────
+
+async function handleFetchTasks(data) {
+  const area = document.getElementById('results-area');
+  area.innerHTML = '';
+  area.classList.remove('hidden');
+
+  setStage('STAGE_EXECUTION');
+  setLoading(true);
+
+  const period = data.task_period || '';
+  const fetchRes = await sendToBackground('fetch_todos', { period });
+
+  setLoading(false);
+
+  if (!fetchRes?.success) {
+    area.innerHTML = `<p class="error-message">${fetchRes?.error || 'Failed to fetch tasks.'}</p>`;
+    return;
+  }
+
+  const todos = fetchRes.todos || [];
+  const periodLabel = period ? ` for ${period.charAt(0).toUpperCase() + period.slice(1)}` : '';
+
+  if (todos.length === 0) {
+    area.innerHTML = `
+      <div class="action-card">
+        <p class="action-headline">No Tasks Found${periodLabel}</p>
+        <p class="action-summary">There are no tasks${periodLabel} in your Enhancivity account. You can create new tasks from the dashboard or by processing emails.</p>
+      </div>`;
+    document.getElementById('chat-area').scrollTop = document.getElementById('chat-area').scrollHeight;
+    return;
+  }
+
+  // Header
+  const header = document.createElement('p');
+  header.className = 'results-header';
+  header.textContent = `${todos.length} task${todos.length !== 1 ? 's' : ''}${periodLabel}`;
+  area.appendChild(header);
+
+  // Task cards
+  const list = document.createElement('div');
+  list.className = 'task-list';
+
+  todos.forEach(todo => {
+    const row = document.createElement('div');
+    row.className = 'task-row';
+
+    const statusDot = document.createElement('span');
+    statusDot.style.cssText = `width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-top:5px;background:${
+      todo.status === 'COMPLETED' ? '#34d399' :
+      todo.status === 'IN_PROGRESS' ? '#6366f1' : '#fbbf24'
+    }`;
+
+    const info = document.createElement('div');
+    info.className = 'task-info';
+
+    const title = document.createElement('span');
+    title.className = 'task-title';
+    title.textContent = todo.title;
+
+    const meta = document.createElement('span');
+    meta.className = 'task-meta';
+    const parts = [];
+    if (todo.status) parts.push(todo.status.replace('_', ' '));
+    if (todo.priority) parts.push(todo.priority);
+    if (todo.dueDate) {
+      const d = new Date(todo.dueDate);
+      parts.push(d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }));
+    }
+    meta.textContent = parts.join(' · ');
+
+    info.appendChild(title);
+    info.appendChild(meta);
+    row.appendChild(statusDot);
+    row.appendChild(info);
+    list.appendChild(row);
+  });
+
+  area.appendChild(list);
+
+  // Scroll to bottom
+  document.getElementById('chat-area').scrollTop = document.getElementById('chat-area').scrollHeight;
 }
 
 // ── Results Rendering ─────────────────────────────────────────
