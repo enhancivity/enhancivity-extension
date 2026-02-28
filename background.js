@@ -485,6 +485,18 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
 
 async function handleMessage(request) {
 
+  // ── TAB TRIAGE MAP: Zero-Token spatial awareness ─────────
+  if (request.type === 'GET_TAB_TRIAGE_MAP') {
+    const tabs = await chrome.tabs.query({});
+    const triageMap = tabs.map(tab => ({
+      tabId: tab.id,
+      title: (tab.title || '').slice(0, 80),
+      url: tab.url || '',
+      active: tab.active,
+    }));
+    return { success: true, tabs: triageMap };
+  }
+
   // ── LOGIN: Email + Password ──────────────────────────────
   if (request.type === 'extension_login') {
     const { email, password } = request.data;
@@ -570,13 +582,21 @@ async function handleMessage(request) {
 
   // ── MAIN: Process a user request with 3-Tier Memory ─────
   if (request.type === 'process_request') {
-    const { userPrompt, tabId, url } = request.data;
+    const { userPrompt, tabId, url, availableTabs } = request.data;
 
     // Load memory (from cache or fresh fetch)
     const userMemory = await getOrRefreshMemory();
 
     // Build page context by detecting site and optionally scraping
     const pageContext = { url, site: 'general' };
+
+    // Zero-Token Triage: attach lightweight tab map for spatial awareness
+    if (availableTabs && availableTabs.length > 0) {
+      pageContext.availableTabs = availableTabs
+        .filter(t => t.url && !t.url.startsWith('chrome://') && !t.url.startsWith('chrome-extension://'))
+        .slice(0, 15) // Cap at 15 tabs to limit payload size
+        .map(t => ({ title: t.title, url: t.url, active: t.active }));
+    }
 
     if (url && url.includes('mail.google.com')) {
       pageContext.site = 'gmail';

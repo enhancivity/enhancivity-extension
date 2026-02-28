@@ -160,10 +160,18 @@ async function handleSubmit() {
   setLoading(true);
   clearResults();
 
+  // Zero-Token Triage: fetch lightweight tab map for spatial awareness
+  let availableTabs = [];
+  try {
+    const triageRes = await sendToBackground('GET_TAB_TRIAGE_MAP', {});
+    if (triageRes?.success) availableTabs = triageRes.tabs;
+  } catch { /* non-critical — proceed without tab context */ }
+
   const res = await sendToBackground('process_request', {
     userPrompt,
     tabId: currentTabId,
-    url:   currentTabUrl
+    url:   currentTabUrl,
+    availableTabs,
   });
 
   setLoading(false);
