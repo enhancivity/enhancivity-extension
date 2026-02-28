@@ -487,8 +487,26 @@ async function executeAction(container, btn, data) {
 
   let res;
 
+  // EXTRACT_TASKS: scrape page and parse for tasks (no DOM execution)
+  if (data.action_type === 'EXTRACT_TASKS') {
+    res = await sendToBackground('semantic_scrape', { tabId: currentTabId, url: currentTabUrl });
+    if (res?.success && res?.data?.visibleText) {
+      // Send scraped text to parse-intent for task extraction
+      const parseRes = await sendToBackground('process_request', {
+        userPrompt: `Extract actionable tasks from this page content: ${res.data.visibleText.slice(0, 3000)}`,
+        tabId: currentTabId,
+        url: currentTabUrl,
+      });
+      if (parseRes?.success && parseRes?.data) {
+        container.innerHTML = '';
+        renderResults(parseRes.data);
+        return;
+      }
+    }
+    res = res || { success: false, error: 'Could not extract tasks from this page.' };
+
   // Gmail-specific compose/reply handling
-  if (data.action_type === 'COMPOSE_EMAIL' && currentSite === 'gmail') {
+  } else if (data.action_type === 'COMPOSE_EMAIL' && currentSite === 'gmail') {
     // Extract compose data from primary_content and dom_actions
     const composeData = {};
     for (const step of (data.dom_actions || [])) {
