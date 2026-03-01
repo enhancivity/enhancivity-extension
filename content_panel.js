@@ -1302,7 +1302,11 @@
       '[NETWORK_ERROR]': 'Cannot reach the server. Check your internet connection.',
       '[NO_RESPONSE]': 'Extension communication failed. Try reloading the extension.',
       '[HANDLER_CRASH]': 'Something broke internally. Try again or reload the extension.',
-      '[SERVER_ERROR]': 'The server returned an error. Try again.',
+      '[SERVER_ERROR]': 'Server error — try again or check if the backend is running.',
+      '[BACKEND_DOWN]': 'Backend server is down (5xx). Check if the server is running.',
+      '[AUTH_ERROR]': 'Authentication failed. Please sign out and sign back in.',
+      '[RATE_LIMITED]': 'Too many requests — wait a moment and try again.',
+      '[TOKEN_LIMIT]': 'Request too large — try a shorter prompt or clear conversation.',
       '[PARSE_ERROR]': 'Got an invalid response from the server.',
     };
 
@@ -1314,7 +1318,15 @@
       }
     }
 
-    mainError.textContent = displayMsg;
+    // Show as error bubble in chat instead of just bottom text
+    const errorBubble = document.createElement('div');
+    errorBubble.className = 'enh-msg enh-msg-error';
+    errorBubble.textContent = displayMsg;
+    resultsArea.appendChild(errorBubble);
+    resultsArea.classList.remove('enh-hidden');
+    chatArea.scrollTop = chatArea.scrollHeight;
+
+    mainError.textContent = '';
     console.warn('[Enhancivity Panel] Error:', msg);
   }
 

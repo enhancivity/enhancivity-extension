@@ -772,7 +772,13 @@ async function handleMessage(request) {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      return { success: false, errorType: 'SERVER_ERROR', error: err.error || `Server error (${res.status})` };
+      // Categorize by HTTP status for more specific UI feedback
+      let errorType = 'SERVER_ERROR';
+      if (res.status === 401 || res.status === 403) errorType = 'AUTH_ERROR';
+      else if (res.status === 429) errorType = 'RATE_LIMITED';
+      else if (res.status === 413 || (err.error && /token|limit|too long/i.test(err.error))) errorType = 'TOKEN_LIMIT';
+      else if (res.status >= 500) errorType = 'BACKEND_DOWN';
+      return { success: false, errorType, error: err.error || `Server error (HTTP ${res.status})`, httpStatus: res.status };
     }
 
     let data;
