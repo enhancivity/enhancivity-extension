@@ -132,6 +132,13 @@
         </div>
       </div>
       <div class="enh-header-right">
+        <button class="enh-icon-btn enh-signout-btn" id="enh-signout-btn" title="Sign Out">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <polyline points="16 17 21 12 16 7"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+          </svg>
+        </button>
         <button class="enh-icon-btn enh-minimize-btn" id="enh-minimize-btn" title="Minimize">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="5" y1="12" x2="19" y2="12"/>
@@ -201,8 +208,13 @@
 
     <!-- Auth fallback (shown if no token) -->
     <div class="enh-auth-fallback enh-hidden" id="enh-auth-fallback">
-      <p class="enh-auth-fallback-text">Please log in to Enhancivity first.</p>
-      <button class="enh-auth-fallback-link" id="enh-auth-link">Open Extension Settings</button>
+      <p class="enh-auth-fallback-text">Sign in to Enhancivity</p>
+      <form id="enh-auth-form">
+        <input type="email" id="enh-auth-email" class="enh-auth-input" placeholder="Email" autocomplete="email" required />
+        <input type="password" id="enh-auth-password" class="enh-auth-input" placeholder="Password" autocomplete="current-password" required />
+        <button type="submit" class="enh-btn enh-btn-primary" id="enh-auth-submit">Sign In</button>
+      </form>
+      <p class="enh-auth-error enh-hidden" id="enh-auth-error"></p>
     </div>
   `;
 
@@ -215,6 +227,7 @@
   const dragHeader   = $('#enh-drag-header');
   const closeBtn     = $('#enh-close-btn');
   const minimizeBtn  = $('#enh-minimize-btn');
+  const signOutBtn   = $('#enh-signout-btn');
   const contextBadge = $('#enh-context-badge');
   const chatArea     = $('#enh-chat-area');
   const greeting     = $('#enh-chat-greeting');
@@ -281,6 +294,8 @@
     }
     promptInput.placeholder = PLACEHOLDERS[site] || PLACEHOLDERS.general;
   }
+
+  // ── Delegate Auto-Fill (removed — now handled via chrome.runtime.onMessage below) ──
 
   // ── Drag Logic ───────────────────────────────────────────────
 
@@ -351,6 +366,14 @@
 
   closeBtn.addEventListener('click', closePanel);
   minimizeBtn.addEventListener('click', togglePanel);
+  signOutBtn?.addEventListener('click', async () => {
+    await chrome.storage.local.clear();
+    // Reload panel to show auth fallback
+    authFallback.classList.remove('enh-hidden');
+    chatArea.classList.add('enh-hidden');
+    $('#enh-context-strip')?.classList.add('enh-hidden');
+    $('.enh-input-area')?.classList.add('enh-hidden');
+  });
 
   // ── Communication ────────────────────────────────────────────
 
@@ -498,15 +521,26 @@
     conversationMessages.push({ role: 'assistant', content: assistantContent, data: res.data, timestamp: Date.now() });
     saveConversation();
 
-    // ORCHESTRATE
-    if (res.data?.action_type === 'ORCHESTRATE' && res.data?.search_plan) {
-      renderOrchestratePlan(res.data);
+    // FETCH_TASKS: pull from API and render inline (no consent needed)
+    if (res.data?.action_type === 'FETCH_TASKS') {
+      await handleFetchTasks(res.data);
       return;
     }
 
-    // FETCH_TASKS
-    if (res.data?.action_type === 'FETCH_TASKS') {
-      await handleFetchTasks(res.data);
+    // ORCHESTRATE: auto-start immediately (non-consequential search)
+    if (res.data?.action_type === 'ORCHESTRATE' && res.data?.search_plan) {
+      if (res.data.consent_level === 'auto') {
+        // Show plan preview first (site badges), then auto-start after 800ms
+        renderOrchestratePlan(res.data, /* autoStart= */ true);
+      } else {
+        renderOrchestratePlan(res.data, /* autoStart= */ false);
+      }
+      return;
+    }
+
+    // FIND_AND_REPLY: auto-execute (searches inbox + pre-fills reply)
+    if (res.data?.action_type === 'FIND_AND_REPLY') {
+      await handleFindAndReply(res.data);
       return;
     }
 
@@ -600,6 +634,91 @@
     chatArea.scrollTop = chatArea.scrollHeight;
   }
 
+  // ── FIND_AND_REPLY Handler ───────────────────────────────────
+  // Agentic: searches Gmail for the email, opens it, pre-fills reply.
+  // User only clicks Send — that's the 1% mile.
+
+  async function handleFindAndReply(data) {
+    resultsArea.classList.remove('enh-hidden');
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'enh-msg enh-msg-assistant';
+
+    const card = document.createElement('div');
+    card.className = 'enh-action-card enh-consent-soft';
+
+    const headline = document.createElement('p');
+    headline.className = 'enh-action-headline';
+    headline.textContent = data.headline || 'Finding email & drafting reply…';
+    card.appendChild(headline);
+
+    const statusEl = document.createElement('p');
+    statusEl.className = 'enh-action-summary';
+    statusEl.textContent = 'Searching your inbox…';
+    card.appendChild(statusEl);
+
+    wrapper.appendChild(card);
+    resultsArea.appendChild(wrapper);
+    chatArea.scrollTop = chatArea.scrollHeight;
+
+    // Parse FIND_AND_REPLY payload from primary_content (may be object or JSON string)
+    let payload = {};
+    if (typeof data.primary_content === 'object' && data.primary_content !== null) {
+      payload = data.primary_content;
+    } else {
+      try {
+        payload = JSON.parse(data.primary_content);
+      } catch {
+        payload = { replyBody: data.primary_content };
+      }
+    }
+
+    const { searchQuery, replyBody, subject } = payload;
+
+    // Step 1: If we're already on Gmail, search for the email
+    if (!currentTabUrl.includes('mail.google.com')) {
+      // Navigate to Gmail first
+      statusEl.textContent = 'Opening Gmail…';
+      const navRes = await sendToBackground('switch_tab', { targetTabUrl: 'https://mail.google.com' });
+      if (!navRes?.success) {
+        statusEl.textContent = 'Could not open Gmail. Please navigate there manually.';
+        statusEl.style.color = '#f87171';
+        return;
+      }
+      // Update our tab reference
+      currentTabUrl = 'https://mail.google.com/mail/';
+      await new Promise(r => setTimeout(r, 2000));
+    }
+
+    statusEl.textContent = `Searching for emails from "${searchQuery}"…`;
+
+    // Step 2: Send search + reply request to Gmail content script via background
+    const res = await sendToBackground('gmail_find_and_reply', {
+      tabId: currentTabId,
+      searchQuery: searchQuery || '',
+      replyBody: replyBody || '',
+      subject: subject || '',
+    });
+
+    if (res?.success) {
+      card.innerHTML = '';
+      const successHeadline = document.createElement('p');
+      successHeadline.className = 'enh-action-headline';
+      successHeadline.textContent = 'Reply ready — click Send when you\'re done';
+      card.appendChild(successHeadline);
+
+      const successNote = document.createElement('p');
+      successNote.className = 'enh-action-summary';
+      successNote.textContent = `Found email from "${searchQuery}". Reply pre-filled. Review and click Send in Gmail.`;
+      card.appendChild(successNote);
+    } else {
+      statusEl.textContent = res?.error || 'Could not find the email or fill the reply.';
+      statusEl.style.color = '#f87171';
+    }
+
+    chatArea.scrollTop = chatArea.scrollHeight;
+  }
+
   // ── Results Rendering ────────────────────────────────────────
 
   function renderResultsInto(container, data) {
@@ -611,11 +730,34 @@
       return;
     }
 
+    // TASK_DRAFT: Show editable task preview with Create button
+    if (data.action_type === 'TASK_DRAFT') {
+      renderTaskDraftPreview(container, data);
+      return;
+    }
+
+    // EXTRACT_TASKS: JSON array in primary_content → checklist with Create All button
+    if (data.action_type === 'EXTRACT_TASKS' && data.primary_content) {
+      try {
+        const tasks = JSON.parse(data.primary_content);
+        if (Array.isArray(tasks) && tasks.length > 0) {
+          renderTaskList(container, tasks);
+          return;
+        }
+      } catch { /* fall through to renderTaskDraftPreview */ }
+      renderTaskDraftPreview(container, data);
+      return;
+    }
+
     if (data.type === 'tasks') {
       renderTaskList(container, data.items || []);
     } else if (data.type === 'products') {
       renderProductList(container, data.items || []);
+    } else if (data.consent_level === 'auto' && data.dom_actions && data.dom_actions.length > 0) {
+      // Fully agentic: auto-execute immediately, show a "doing it" status card
+      renderAutoExecute(container, data);
     } else if (data.consent_level && data.consent_level !== 'auto' && data.dom_actions) {
+      // Consequential action: show consent card
       renderActionPreview(container, data);
     } else if (data.primary_content) {
       renderAgentResponse(container, data);
@@ -706,6 +848,104 @@
     container.appendChild(createBtn);
   }
 
+  // ── Task Draft Preview: Editable card for AI-extracted task ──
+  function renderTaskDraftPreview(container, data) {
+    let taskData;
+    try {
+      taskData = JSON.parse(data.primary_content);
+    } catch {
+      taskData = { title: data.headline || '', description: data.primary_content || '' };
+    }
+
+    const card = document.createElement('div');
+    card.className = 'enh-action-card enh-consent-soft';
+
+    card.innerHTML = `
+      <p class="enh-action-headline">New Task</p>
+      <div class="enh-task-draft-form">
+        <label class="enh-draft-label">Title</label>
+        <input type="text" class="enh-draft-input" id="enh-draft-title" value="" placeholder="Task title" />
+        <label class="enh-draft-label">Description</label>
+        <textarea class="enh-draft-textarea" id="enh-draft-desc" rows="3" placeholder="Optional description"></textarea>
+        <div class="enh-draft-row">
+          <div class="enh-draft-field">
+            <label class="enh-draft-label">Priority</label>
+            <select class="enh-draft-select" id="enh-draft-priority">
+              <option value="HIGH">High</option>
+              <option value="MEDIUM" selected>Medium</option>
+              <option value="LOW">Low</option>
+            </select>
+          </div>
+          <div class="enh-draft-field">
+            <label class="enh-draft-label">Due Date</label>
+            <input type="date" class="enh-draft-input" id="enh-draft-date" />
+          </div>
+        </div>
+      </div>
+    `;
+
+    // Set values after innerHTML so special chars are handled safely
+    const titleInput = card.querySelector('#enh-draft-title');
+    const descInput = card.querySelector('#enh-draft-desc');
+    const prioritySelect = card.querySelector('#enh-draft-priority');
+    const dateInput = card.querySelector('#enh-draft-date');
+
+    titleInput.value = taskData.title || '';
+    descInput.value = taskData.description || '';
+    if (taskData.priority && ['HIGH', 'MEDIUM', 'LOW'].includes(taskData.priority)) {
+      prioritySelect.value = taskData.priority;
+    }
+    if (taskData.dueDate) {
+      try {
+        const d = new Date(taskData.dueDate);
+        if (!isNaN(d.getTime())) dateInput.value = d.toISOString().split('T')[0];
+      } catch { /* ignore bad date */ }
+    }
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'enh-action-btn-row';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'enh-btn enh-consent-btn-cancel';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', () => {
+      container.innerHTML = '';
+      container.classList.add('enh-hidden');
+    });
+    btnRow.appendChild(cancelBtn);
+
+    const createBtn = document.createElement('button');
+    createBtn.className = 'enh-btn enh-consent-btn-soft';
+    createBtn.textContent = 'Create Task';
+    createBtn.addEventListener('click', async () => {
+      const title = titleInput.value.trim();
+      if (!title) { titleInput.focus(); return; }
+
+      createBtn.textContent = 'Creating...';
+      createBtn.disabled = true;
+
+      const todoData = {
+        title,
+        description: descInput.value.trim() || null,
+        priority: prioritySelect.value,
+        dueDate: dateInput.value || null,
+      };
+
+      const res = await sendToBackground('create_todo', todoData);
+      if (res?.success) {
+        container.innerHTML = '<p class="enh-success-message">Task created! View it in your dashboard.</p>';
+      } else {
+        createBtn.textContent = 'Create Task';
+        createBtn.disabled = false;
+        showError(res?.error || 'Failed to create task. Please try again.');
+      }
+    });
+    btnRow.appendChild(createBtn);
+
+    card.appendChild(btnRow);
+    container.appendChild(card);
+  }
+
   function renderProductList(container, products) {
     if (!products.length) {
       container.innerHTML = '<p class="enh-no-results">No products found.</p>';
@@ -761,6 +1001,64 @@
     });
 
     container.appendChild(list);
+  }
+
+  // ── Auto-Execute (non-consequential actions run immediately) ─
+  // Shows a slim status card while executing, updates to result.
+
+  function renderAutoExecute(container, data) {
+    const card = document.createElement('div');
+    card.className = 'enh-action-card';
+
+    const headline = document.createElement('p');
+    headline.className = 'enh-action-headline';
+    headline.textContent = data.headline;
+    card.appendChild(headline);
+
+    if (data.preview?.summary) {
+      const summary = document.createElement('p');
+      summary.className = 'enh-action-summary';
+      summary.textContent = data.preview.summary;
+      card.appendChild(summary);
+    }
+
+    const statusEl = document.createElement('p');
+    statusEl.className = 'enh-action-rationale';
+    statusEl.textContent = 'Working…';
+    card.appendChild(statusEl);
+
+    container.appendChild(card);
+
+    // Execute immediately — no user approval needed
+    executeAutoAction(data).then(res => {
+      if (res?.success) {
+        statusEl.textContent = 'Done.';
+        statusEl.style.color = '#34d399';
+      } else {
+        const errorMsg = res?.error || 'Action failed.';
+        if (errorMsg === 'BLOCKED_SENSITIVE' || errorMsg === 'BLOCKED_DANGEROUS_CLICK') {
+          // These are safety blocks — this shouldn't happen for auto actions, but handle gracefully
+          statusEl.textContent = 'Stopped: this step requires your manual action.';
+          statusEl.style.color = '#f59e0b';
+        } else {
+          statusEl.textContent = `Couldn't complete: ${errorMsg}`;
+          statusEl.style.color = '#f87171';
+        }
+      }
+    });
+  }
+
+  async function executeAutoAction(data) {
+    if (data.action_type === 'USE_EXISTING_TAB' && data.target_tab_url) {
+      return sendToBackground('switch_tab', { targetTabUrl: data.target_tab_url });
+    }
+    if (data.dom_actions && data.dom_actions.length > 1) {
+      return sendToBackground('execute_multi_step', { steps: data.dom_actions, tabId: currentTabId });
+    }
+    if (data.dom_actions && data.dom_actions.length === 1) {
+      return sendToBackground('execute_action', { action: data.dom_actions[0], tabId: currentTabId });
+    }
+    return { success: false, error: 'No actions to execute.' };
   }
 
   // ── Agent Response ───────────────────────────────────────────
@@ -878,6 +1176,7 @@
       case 'FILL_FORM':        return 'Yes, Fill It';
       case 'MULTI_STEP':       return 'Yes, Do This';
       case 'EXTRACT_TASKS':    return 'Extract Tasks';
+      case 'TASK_DRAFT':       return 'Create Task';
       default:                 return 'Confirm';
     }
   }
@@ -901,16 +1200,23 @@
         return;
       }
 
+    } else if (data.action_type === 'TASK_DRAFT') {
+      // Fallback: if consent card shown instead of custom preview, create directly
+      let taskData;
+      try {
+        taskData = JSON.parse(data.primary_content);
+      } catch {
+        taskData = { title: data.headline, description: data.primary_content };
+      }
+      res = await sendToBackground('create_todo', taskData);
+      if (res?.success) {
+        container.innerHTML = '<p class="enh-success-message">Task created! View it in your dashboard.</p>';
+        return;
+      }
+
     } else if (data.action_type === 'EXTRACT_TASKS') {
-      const goalText = data.headline || data.primary_content || 'Extract tasks from this page';
-      res = await sendToBackground('semantic_scrape', {
-        tabId: currentTabId,
-        url: currentTabUrl,
-        userGoal: goalText,
-        mode: 'fill_form',
-      });
       const parseRes = await sendToBackground('process_request', {
-        userPrompt: `Extract actionable tasks from this page. Focus on: ${goalText}`,
+        userPrompt: 'Extract all actionable tasks from the current page. For each task include title, description, dueDate (YYYY-MM-DD or null), and priority (HIGH/MEDIUM/LOW). Use EXTRACT_TASKS with a JSON array in primary_content.',
         tabId: currentTabId,
         url: currentTabUrl,
       });
@@ -970,7 +1276,9 @@
 
   // ── Orchestration: Multi-Site Search HUD ─────────────────────
 
-  function renderOrchestratePlan(data) {
+  // autoStart=true: agentic law — show plan for 800ms then auto-begin
+  // autoStart=false: show plan with manual "Search Now" button (legacy fallback)
+  function renderOrchestratePlan(data, autoStart = true) {
     resultsArea.classList.remove('enh-hidden');
 
     const wrapper = document.createElement('div');
@@ -1012,29 +1320,44 @@
       card.appendChild(rationale);
     }
 
-    const btnRow = document.createElement('div');
-    btnRow.className = 'enh-action-btn-row';
+    if (autoStart) {
+      // Show a slim status line then auto-launch
+      const statusEl = document.createElement('p');
+      statusEl.className = 'enh-action-rationale';
+      statusEl.textContent = 'Launching searches…';
+      card.appendChild(statusEl);
 
-    const cancelBtn = document.createElement('button');
-    cancelBtn.className = 'enh-btn enh-consent-btn-cancel';
-    cancelBtn.textContent = 'Cancel';
-    cancelBtn.addEventListener('click', () => {
-      resultsArea.innerHTML = '';
-      resultsArea.classList.add('enh-hidden');
-    });
-    btnRow.appendChild(cancelBtn);
+      wrapper.appendChild(card);
+      resultsArea.appendChild(wrapper);
 
-    const searchBtn = document.createElement('button');
-    searchBtn.className = 'enh-btn enh-consent-btn-soft';
-    searchBtn.textContent = 'Search Now';
-    searchBtn.addEventListener('click', () => {
-      startOrchestration(data.search_plan, data.primary_content || '');
-    });
-    btnRow.appendChild(searchBtn);
+      setTimeout(() => {
+        startOrchestration(data.search_plan, data.primary_content || '');
+      }, 800);
+    } else {
+      const btnRow = document.createElement('div');
+      btnRow.className = 'enh-action-btn-row';
 
-    card.appendChild(btnRow);
-    wrapper.appendChild(card);
-    resultsArea.appendChild(wrapper);
+      const cancelBtn = document.createElement('button');
+      cancelBtn.className = 'enh-btn enh-consent-btn-cancel';
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.addEventListener('click', () => {
+        resultsArea.innerHTML = '';
+        resultsArea.classList.add('enh-hidden');
+      });
+      btnRow.appendChild(cancelBtn);
+
+      const searchBtn = document.createElement('button');
+      searchBtn.className = 'enh-btn enh-consent-btn-soft';
+      searchBtn.textContent = 'Search Now';
+      searchBtn.addEventListener('click', () => {
+        startOrchestration(data.search_plan, data.primary_content || '');
+      });
+      btnRow.appendChild(searchBtn);
+
+      card.appendChild(btnRow);
+      wrapper.appendChild(card);
+      resultsArea.appendChild(wrapper);
+    }
   }
 
   async function startOrchestration(searchPlan, userPrompt) {
@@ -1307,7 +1630,7 @@
       '[AUTH_ERROR]': 'Authentication failed. Please sign out and sign back in.',
       '[RATE_LIMITED]': 'Too many requests — wait a moment and try again.',
       '[TOKEN_LIMIT]': 'Request too large — try a shorter prompt or clear conversation.',
-      '[PARSE_ERROR]': 'Got an invalid response from the server.',
+      '[PARSE_ERROR]': 'Could not process that request — try rephrasing it.',
     };
 
     let displayMsg = msg;
@@ -1403,15 +1726,112 @@
       sendResponse({ ok: true });
       return true;
     }
+
+    // ── Delegate Auto-Fill: background.js sends task payload to pre-fill prompt ──
+    if (message.type === 'enh_delegate_autofill') {
+      const { taskTitle, taskDescription, priority, dueDate, tags } = message.payload || {};
+      if (!taskTitle) { sendResponse({ ok: false }); return true; }
+
+      console.log('[Panel] Auto-filling delegated task:', taskTitle);
+
+      // Show panel if hidden
+      if (panel.classList.contains('enh-hidden')) {
+        panel.classList.remove('enh-hidden');
+      }
+
+      // Build the auto-fill prompt
+      const parts = [`Task: ${taskTitle}`];
+      if (taskDescription) parts.push(`Description: ${taskDescription}`);
+      if (dueDate) {
+        try { parts.push(`Due: ${new Date(dueDate).toLocaleDateString()}`); } catch { parts.push(`Due: ${dueDate}`); }
+      }
+      if (priority) parts.push(`Importance: ${priority}`);
+      if (tags && tags.length) parts.push(`Tags: ${Array.isArray(tags) ? tags.join(', ') : tags}`);
+      parts.push('Please help me complete this.');
+
+      promptInput.value = parts.join(', ');
+      submitBtn.disabled = false;
+      submitBtn.classList.add('active');
+
+      // Hide greeting
+      if (greeting) greeting.style.display = 'none';
+
+      promptInput.focus();
+      saveState();
+
+      sendResponse({ ok: true });
+      return true;
+    }
   });
 
-  // ── Auth fallback link ───────────────────────────────────────
+  // ── Delegate Auto-Fill via window.postMessage (from dashboard_bridge.js) ──
+  // Bridge and panel are both content scripts on the same page, so window.postMessage works.
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    if (event.data?.type !== 'ENHANCIVITY_DELEGATE_AUTOFILL') return;
+    if (event.data?.source !== 'enhancivity-bridge') return;
 
-  const authLink = $('#enh-auth-link');
-  if (authLink) {
-    authLink.addEventListener('click', () => {
-      // Open the popup.html in a new tab as fallback for auth
-      chrome.runtime.sendMessage({ type: 'open_popup_tab' });
+    const { taskTitle, taskDescription, priority, dueDate, tags } = event.data.payload || {};
+    if (!taskTitle) return;
+
+    console.log('[Panel] Auto-filling delegated task via postMessage:', taskTitle);
+
+    // Show panel if hidden
+    if (panel.classList.contains('enh-hidden')) {
+      panel.classList.remove('enh-hidden');
+    }
+
+    // Build the auto-fill prompt
+    const parts = [`Task: ${taskTitle}`];
+    if (taskDescription) parts.push(`Description: ${taskDescription}`);
+    if (dueDate) {
+      try { parts.push(`Due: ${new Date(dueDate).toLocaleDateString()}`); } catch { parts.push(`Due: ${dueDate}`); }
+    }
+    if (priority) parts.push(`Importance: ${priority}`);
+    if (tags && tags.length) parts.push(`Tags: ${Array.isArray(tags) ? tags.join(', ') : tags}`);
+    parts.push('Please help me complete this.');
+
+    promptInput.value = parts.join(', ');
+    submitBtn.disabled = false;
+    submitBtn.classList.add('active');
+
+    if (greeting) greeting.style.display = 'none';
+    promptInput.focus();
+    saveState();
+  });
+
+  // ── Inline auth form (panel login) ──────────────────────────
+
+  const authForm    = $('#enh-auth-form');
+  const authSubmit  = $('#enh-auth-submit');
+  const authError   = $('#enh-auth-error');
+
+  if (authForm) {
+    authForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email    = $('#enh-auth-email').value.trim();
+      const password = $('#enh-auth-password').value;
+      if (!email || !password) return;
+
+      authSubmit.textContent = 'Signing in...';
+      authSubmit.disabled = true;
+      authError.classList.add('enh-hidden');
+
+      const res = await sendToBackground('extension_login', { email, password });
+
+      if (res?.success) {
+        // Hide auth, show main UI
+        authFallback.classList.add('enh-hidden');
+        chatArea.classList.remove('enh-hidden');
+        $('#enh-context-strip')?.classList.remove('enh-hidden');
+        $('.enh-input-area')?.classList.remove('enh-hidden');
+        await init();
+      } else {
+        authError.textContent = res?.message || 'Login failed. Check your email and password.';
+        authError.classList.remove('enh-hidden');
+        authSubmit.textContent = 'Sign In';
+        authSubmit.disabled = false;
+      }
     });
   }
 

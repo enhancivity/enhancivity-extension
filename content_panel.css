@@ -933,6 +933,69 @@
   font-style: italic;
 }
 
+/* ── Task Draft Form ──────────────────────────────────────── */
+.enh-task-draft-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.enh-draft-label {
+  font-size: 11px;
+  color: #8888a0;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.enh-draft-input,
+.enh-draft-textarea,
+.enh-draft-select {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 13px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #ededef;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  outline: none;
+  font-family: inherit;
+  transition: border-color 0.2s;
+}
+
+.enh-draft-input:focus,
+.enh-draft-textarea:focus,
+.enh-draft-select:focus {
+  border-color: rgba(99, 102, 241, 0.5);
+}
+
+.enh-draft-textarea {
+  resize: vertical;
+  min-height: 60px;
+}
+
+.enh-draft-select {
+  cursor: pointer;
+  appearance: auto;
+}
+
+.enh-draft-select option {
+  background: #1a1a24;
+  color: #ededef;
+}
+
+.enh-draft-row {
+  display: flex;
+  gap: 10px;
+}
+
+.enh-draft-field {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 /* ── Utilities ────────────────────────────────────────────── */
 .enh-hidden { display: none !important; }
 
@@ -955,21 +1018,40 @@
 }
 
 .enh-auth-fallback-text {
-  font-size: 13px;
-  color: #6b6b76;
-  line-height: 1.5;
+  font-size: 14px;
+  font-weight: 600;
+  color: #e2e8f0;
+  margin-bottom: 4px;
 }
 
-.enh-auth-fallback-link {
-  color: #818cf8;
-  font-size: 12px;
-  cursor: pointer;
-  text-decoration: underline;
-  background: none;
-  border: none;
-  font-family: inherit;
+#enh-auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
 }
-.enh-auth-fallback-link:hover { color: #a5b4fc; }
+
+.enh-auth-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  color: #e2e8f0;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.enh-auth-input:focus { border-color: #6366f1; }
+.enh-auth-input::placeholder { color: #4b5563; }
+
+.enh-auth-error {
+  font-size: 12px;
+  color: #f87171;
+  text-align: center;
+}
 
 /* ── Chat Bubble Styles ────────────────────────────────────── */
 

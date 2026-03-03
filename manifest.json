@@ -15,7 +15,8 @@
     "https://api.enhancivity.com/*",
     "https://enhancivity.com/*",
     "http://localhost:3000/*",
-    "http://localhost:3001/*"
+    "http://localhost:3001/*",
+    "http://localhost:3002/*"
   ],
   "content_scripts": [
     {
@@ -39,7 +40,8 @@
       "matches": [
         "https://enhancivity.com/*",
         "https://*.enhancivity.com/*",
-        "http://localhost:3001/*"
+        "http://localhost:3001/*",
+        "http://localhost:3002/*"
       ],
       "js": ["dashboard_bridge.js"],
       "run_at": "document_idle"

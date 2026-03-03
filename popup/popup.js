@@ -193,15 +193,15 @@ async function handleSubmit() {
   document.getElementById('submit-btn').disabled = true;
   document.getElementById('submit-btn').classList.remove('active');
 
-  // Check if this is an ORCHESTRATE response — needs special handling
-  if (res.data?.action_type === 'ORCHESTRATE' && res.data?.search_plan) {
-    renderOrchestratePlan(res.data);
+  // FETCH_TASKS: pull from API and render inline
+  if (res.data?.action_type === 'FETCH_TASKS') {
+    await handleFetchTasks(res.data);
     return;
   }
 
-  // FETCH_TASKS: pull tasks from backend API and render inline
-  if (res.data?.action_type === 'FETCH_TASKS') {
-    await handleFetchTasks(res.data);
+  // ORCHESTRATE: auto-start if consent_level is 'auto' (agentic law)
+  if (res.data?.action_type === 'ORCHESTRATE' && res.data?.search_plan) {
+    renderOrchestratePlan(res.data, res.data.consent_level === 'auto');
     return;
   }
 
@@ -305,11 +305,29 @@ function renderResults(data) {
     renderTaskList(area, data.items || []);
   } else if (data.type === 'products') {
     renderProductList(area, data.items || []);
+  } else if (data.action_type === 'TASK_DRAFT' && data.primary_content) {
+    // Single task extracted from page — show structured card with Create button
+    renderTaskDraft(area, data);
+  } else if (data.action_type === 'EXTRACT_TASKS' && data.primary_content) {
+    // Multiple tasks extracted — parse JSON array and show checklist
+    try {
+      const tasks = JSON.parse(data.primary_content);
+      if (Array.isArray(tasks) && tasks.length > 0) {
+        renderTaskList(area, tasks);
+      } else {
+        renderTaskDraft(area, data);
+      }
+    } catch {
+      renderTaskDraft(area, data);
+    }
+  } else if (data.consent_level === 'auto' && data.dom_actions && data.dom_actions.length > 0) {
+    // Fully agentic: execute immediately, show slim status card
+    renderAutoExecute(area, data);
   } else if (data.consent_level && data.consent_level !== 'auto' && data.dom_actions) {
-    // DOM Action with consent required
+    // Consequential action: show consent card
     renderActionPreview(area, data);
   } else if (data.primary_content) {
-    // Standard agent response (RECOMMENDATION, WARNING, TASK_DRAFT without dom_actions)
+    // Standard agent response (RECOMMENDATION, WARNING)
     renderAgentResponse(area, data);
   } else {
     const msg = document.createElement('p');
@@ -451,7 +469,126 @@ function renderProductList(container, products) {
   container.appendChild(list);
 }
 
-// ── Agent Response (text-based: RECOMMENDATION, WARNING, TASK_DRAFT) ──
+// ── Task Draft Card (single task from TASK_DRAFT) ─────────────
+
+function renderTaskDraft(container, data) {
+  let task = {};
+  try {
+    task = JSON.parse(data.primary_content);
+  } catch {
+    // primary_content isn't JSON — treat headline as title
+    task = { title: data.headline || data.primary_content };
+  }
+
+  const card = document.createElement('div');
+  card.className = 'action-card';
+
+  const headline = document.createElement('p');
+  headline.className = 'action-headline';
+  headline.textContent = 'Task Ready to Create';
+  card.appendChild(headline);
+
+  const titleEl = document.createElement('p');
+  titleEl.className = 'task-title';
+  titleEl.style.cssText = 'font-size:14px;font-weight:600;margin:8px 0 4px;color:#f1f5f9;';
+  titleEl.textContent = task.title || data.headline;
+  card.appendChild(titleEl);
+
+  if (task.description) {
+    const desc = document.createElement('p');
+    desc.className = 'action-content';
+    desc.style.cssText = 'font-size:12px;color:#94a3b8;margin:0 0 8px;';
+    desc.textContent = task.description;
+    card.appendChild(desc);
+  }
+
+  const meta = document.createElement('p');
+  meta.className = 'task-meta';
+  meta.style.cssText = 'font-size:11px;margin:0 0 12px;';
+  const parts = [];
+  if (task.priority) parts.push(task.priority);
+  if (task.dueDate) parts.push(`Due: ${task.dueDate}`);
+  meta.textContent = parts.join(' · ');
+  card.appendChild(meta);
+
+  const createBtn = document.createElement('button');
+  createBtn.className = 'btn btn-primary create-btn';
+  createBtn.textContent = 'Create Task';
+  createBtn.addEventListener('click', async () => {
+    createBtn.textContent = 'Creating...';
+    createBtn.disabled = true;
+    const res = await sendToBackground('create_todo', {
+      title: task.title || data.headline,
+      description: task.description || '',
+      dueDate: task.dueDate || null,
+      priority: task.priority || 'MEDIUM',
+    });
+    if (res?.success) {
+      card.innerHTML = '<p class="success-message">Task created in Enhancivity</p>';
+    } else {
+      createBtn.textContent = 'Create Task';
+      createBtn.disabled = false;
+      showError('Failed to create task. Please try again.');
+    }
+  });
+  card.appendChild(createBtn);
+
+  container.appendChild(card);
+}
+
+// ── Auto-Execute (non-consequential actions run immediately) ──
+
+function renderAutoExecute(container, data) {
+  const card = document.createElement('div');
+  card.className = 'action-card';
+
+  const headline = document.createElement('p');
+  headline.className = 'action-headline';
+  headline.textContent = data.headline;
+  card.appendChild(headline);
+
+  if (data.preview?.summary) {
+    const summary = document.createElement('p');
+    summary.className = 'action-summary';
+    summary.textContent = data.preview.summary;
+    card.appendChild(summary);
+  }
+
+  const statusEl = document.createElement('p');
+  statusEl.className = 'action-rationale';
+  statusEl.textContent = 'Working…';
+  card.appendChild(statusEl);
+
+  container.appendChild(card);
+  document.getElementById('chat-area').scrollTop = document.getElementById('chat-area').scrollHeight;
+
+  // Fire immediately — no user approval needed
+  executeAutoAction(data).then(res => {
+    if (res?.success) {
+      statusEl.textContent = 'Done.';
+      statusEl.style.color = '#34d399';
+    } else {
+      const errorMsg = res?.error || 'Action failed.';
+      statusEl.textContent = `Couldn't complete: ${errorMsg}`;
+      statusEl.style.color = '#f87171';
+    }
+  });
+}
+
+async function executeAutoAction(data) {
+  if (data.action_type === 'USE_EXISTING_TAB' && data.target_tab_url) {
+    return sendToBackground('switch_tab', { targetTabUrl: data.target_tab_url });
+  }
+  if (data.dom_actions && data.dom_actions.length > 1) {
+    return sendToBackground('execute_multi_step', { steps: data.dom_actions, tabId: currentTabId });
+  }
+  if (data.dom_actions && data.dom_actions.length === 1) {
+    return sendToBackground('execute_action', { action: data.dom_actions[0], tabId: currentTabId });
+  }
+  return { success: false, error: 'No actions to execute.' };
+}
+
+// ── Agent Response (text-based: RECOMMENDATION, WARNING) ──
 
 function renderAgentResponse(container, data) {
   const card = document.createElement('div');
@@ -597,18 +734,11 @@ async function executeAction(container, btn, data) {
       return;
     }
 
-  // EXTRACT_TASKS: scrape page and send back to agent for task extraction
+  // EXTRACT_TASKS: re-prompt agent with explicit task extraction instruction
+  // (page content is scraped automatically inside process_request via content_universal.js)
   } else if (data.action_type === 'EXTRACT_TASKS') {
-    const goalText = data.headline || data.primary_content || 'Extract tasks from this page';
-    res = await sendToBackground('semantic_scrape', {
-      tabId: currentTabId,
-      url: currentTabUrl,
-      userGoal: goalText,
-      mode: 'fill_form',
-    });
-    // Regardless of semantic scrape result, ask the agent to extract tasks
     const parseRes = await sendToBackground('process_request', {
-      userPrompt: `Extract actionable tasks from this page. Focus on: ${goalText}`,
+      userPrompt: 'Extract all actionable tasks from the current page. For each task include title, description, dueDate (YYYY-MM-DD or null), and priority (HIGH/MEDIUM/LOW). Use EXTRACT_TASKS with a JSON array in primary_content.',
       tabId: currentTabId,
       url: currentTabUrl,
     });
@@ -676,7 +806,8 @@ async function executeAction(container, btn, data) {
 
 let orchestrationListener = null;
 
-function renderOrchestratePlan(data) {
+// autoStart=true: agentic law — show plan briefly then auto-launch
+function renderOrchestratePlan(data, autoStart = true) {
   const area = document.getElementById('results-area');
   area.innerHTML = '';
   area.classList.remove('hidden');
@@ -684,13 +815,11 @@ function renderOrchestratePlan(data) {
   const card = document.createElement('div');
   card.className = 'action-card consent-soft';
 
-  // Headline
   const headline = document.createElement('p');
   headline.className = 'action-headline';
   headline.textContent = data.headline;
   card.appendChild(headline);
 
-  // Show the search plan
   const plan = data.search_plan;
   const planInfo = document.createElement('div');
   planInfo.className = 'orch-plan-info';
@@ -712,7 +841,6 @@ function renderOrchestratePlan(data) {
 
   card.appendChild(planInfo);
 
-  // Rationale
   if (data.rationale) {
     const rationale = document.createElement('p');
     rationale.className = 'action-rationale';
@@ -720,29 +848,32 @@ function renderOrchestratePlan(data) {
     card.appendChild(rationale);
   }
 
-  // Action buttons
-  const btnRow = document.createElement('div');
-  btnRow.className = 'action-btn-row';
+  if (autoStart) {
+    const statusEl = document.createElement('p');
+    statusEl.className = 'action-rationale';
+    statusEl.textContent = 'Launching searches…';
+    card.appendChild(statusEl);
+    area.appendChild(card);
+    setTimeout(() => startOrchestration(data.search_plan, data.primary_content || ''), 800);
+  } else {
+    const btnRow = document.createElement('div');
+    btnRow.className = 'action-btn-row';
 
-  const cancelBtn = document.createElement('button');
-  cancelBtn.className = 'btn consent-btn-cancel';
-  cancelBtn.textContent = 'Cancel';
-  cancelBtn.addEventListener('click', () => {
-    area.innerHTML = '';
-    area.classList.add('hidden');
-  });
-  btnRow.appendChild(cancelBtn);
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn consent-btn-cancel';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', () => { area.innerHTML = ''; area.classList.add('hidden'); });
+    btnRow.appendChild(cancelBtn);
 
-  const searchBtn = document.createElement('button');
-  searchBtn.className = 'btn consent-btn-soft';
-  searchBtn.textContent = 'Search Now';
-  searchBtn.addEventListener('click', () => {
-    startOrchestration(data.search_plan, data.primary_content || '');
-  });
-  btnRow.appendChild(searchBtn);
+    const searchBtn = document.createElement('button');
+    searchBtn.className = 'btn consent-btn-soft';
+    searchBtn.textContent = 'Search Now';
+    searchBtn.addEventListener('click', () => startOrchestration(data.search_plan, data.primary_content || ''));
+    btnRow.appendChild(searchBtn);
 
-  card.appendChild(btnRow);
-  area.appendChild(card);
+    card.appendChild(btnRow);
+    area.appendChild(card);
+  }
 }
 
 async function startOrchestration(searchPlan, userPrompt) {
@@ -1086,7 +1217,7 @@ function showError(msg) {
     '[NO_RESPONSE]': 'Extension communication failed. Try reloading the extension.',
     '[HANDLER_CRASH]': 'Something broke internally. Try again or reload the extension.',
     '[SERVER_ERROR]': 'The server returned an error. Try again.',
-    '[PARSE_ERROR]': 'Got an invalid response from the server.',
+    '[PARSE_ERROR]': 'Could not process that request — try rephrasing it.',
   };
 
   let displayMsg = msg;

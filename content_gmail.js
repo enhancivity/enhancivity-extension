@@ -31,6 +31,16 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     return true;
   }
 
+  // ── Gmail Open First Search Result + Pre-fill Reply ──────
+  // Agent searched Gmail (via URL navigation), now clicks the first
+  // thread and pre-fills the reply box. NEVER clicks Send.
+  if (request.type === 'gmail_open_first_and_reply') {
+    handleOpenFirstAndReply(request.data)
+      .then(sendResponse)
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
   if (request.type !== 'scrape_email') return;
 
   try {
@@ -152,4 +162,41 @@ async function handleGmailReply(data) {
   }
 
   return { success: true };
+}
+
+// ── Open First Search Result + Pre-fill Reply ────────────────
+// Called after background navigated to a Gmail search URL.
+// Clicks the first email thread in the results list, waits for it
+// to open, then pre-fills the reply box with the AI-drafted body.
+// NEVER clicks Send — the user always sends manually.
+
+async function handleOpenFirstAndReply(data) {
+  const { replyBody } = data || {};
+
+  // Gmail search results: threads are listed as table rows with role="link"
+  // or as .zA rows. Try multiple selectors for robustness.
+  const threadSelectors = [
+    'tr.zA',           // standard inbox thread row
+    '[role="link"]',   // accessible role on thread rows
+    '.y6 span',        // sender span inside a thread row
+  ];
+
+  let firstThread = null;
+  for (const sel of threadSelectors) {
+    const el = document.querySelector(sel);
+    if (el) { firstThread = el; break; }
+  }
+
+  if (!firstThread) {
+    return { success: false, error: 'No email threads found in search results.' };
+  }
+
+  // Click the first thread to open it
+  firstThread.click();
+
+  // Wait for the email to open and render
+  await new Promise(r => setTimeout(r, 2000));
+
+  // Now pre-fill the reply using the existing reply handler
+  return await handleGmailReply({ body: replyBody });
 }

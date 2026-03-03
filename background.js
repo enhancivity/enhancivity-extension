@@ -10,26 +10,37 @@
 // ============================================================
 
 // Toggle for deployment: 'https://service.enhancivity.com' for production, 'http://localhost:3001' for local dev
-const API_BASE = 'http://localhost:3001';
+const API_BASE = 'https://service.enhancivity.com';
 const MEMORY_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // --- URL Allowlist for Navigate Actions (v1 safety) ---
 
 const ALLOWED_DOMAINS = [
-  'etsy.com', 'amazon.com', 'ebay.com', 'google.com',
-  'mail.google.com', 'slack.com', 'linkedin.com',
-  'github.com', 'notion.so', 'trello.com', 'asana.com',
-  'indeed.com', 'glassdoor.com', 'monster.com', 'ziprecruiter.com',
-  'youtube.com', 'twitter.com', 'x.com', 'reddit.com',
-  'expedia.com', 'kayak.com', 'skyscanner.net',
-  'enhancivity.com',
-  'platform.openai.com', 'openai.com',
-  'stripe.com', 'dashboard.stripe.com',
-  'vercel.com', 'netlify.com', 'aws.amazon.com',
+  // Shopping
+  'amazon.com', 'ebay.com', 'etsy.com', 'walmart.com', 'target.com', 'bestbuy.com',
+  // Travel
+  'expedia.com', 'kayak.com', 'skyscanner.net', 'booking.com', 'airbnb.com', 'hotels.com',
+  // Jobs
+  'indeed.com', 'linkedin.com', 'glassdoor.com', 'monster.com', 'ziprecruiter.com',
+  // Freelance
+  'fiverr.com', 'upwork.com',
+  // Real estate
+  'zillow.com', 'rightmove.co.uk',
+  // Cars
+  'autotrader.com', 'cargurus.com',
+  // Productivity & communication
+  'mail.google.com', 'slack.com', 'notion.so', 'trello.com', 'asana.com',
   'docs.google.com', 'drive.google.com', 'calendar.google.com',
   'outlook.live.com', 'outlook.office.com',
-  'fiverr.com', 'upwork.com',
-  'wise.com', 'paypal.com',
+  'github.com', 'youtube.com', 'twitter.com', 'x.com', 'reddit.com',
+  // Finance & payments
+  'wise.com', 'paypal.com', 'stripe.com', 'dashboard.stripe.com',
+  // Dev & infra
+  'platform.openai.com', 'openai.com', 'vercel.com', 'netlify.com', 'aws.amazon.com',
+  // Search
+  'google.com', 'bing.com',
+  // Enhancivity
+  'enhancivity.com',
 ];
 
 function isAllowedUrl(url) {
@@ -116,13 +127,47 @@ chrome.runtime.onStartup.addListener(async () => {
 // --- Orchestration Engine: Universal Ghost-Driver ---
 
 const SEARCH_URLS = {
-  amazon:    (q) => `https://www.amazon.com/s?k=${encodeURIComponent(q)}`,
-  ebay:      (q) => `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(q)}`,
-  etsy:      (q) => `https://www.etsy.com/search?q=${encodeURIComponent(q)}`,
-  google:    (q) => `https://www.google.com/search?q=${encodeURIComponent(q)}&tbm=shop`,
-  expedia:   (q) => `https://www.expedia.com/Hotel-Search?destination=${encodeURIComponent(q)}`,
-  kayak:     (q) => `https://www.kayak.com/flights?search=${encodeURIComponent(q)}`,
-  skyscanner:(q) => `https://www.skyscanner.net/transport/flights/?query=${encodeURIComponent(q)}`,
+  // ── Shopping ────────────────────────────────────────────────
+  amazon:      (q) => `https://www.amazon.com/s?k=${encodeURIComponent(q)}`,
+  ebay:        (q) => `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(q)}`,
+  etsy:        (q) => `https://www.etsy.com/search?q=${encodeURIComponent(q)}`,
+  walmart:     (q) => `https://www.walmart.com/search?q=${encodeURIComponent(q)}`,
+  target:      (q) => `https://www.target.com/s?searchTerm=${encodeURIComponent(q)}`,
+  bestbuy:     (q) => `https://www.bestbuy.com/site/searchpage.jsp?st=${encodeURIComponent(q)}`,
+  google:      (q) => `https://www.google.com/search?q=${encodeURIComponent(q)}&tbm=shop`,
+
+  // ── Travel: Flights ─────────────────────────────────────────
+  kayak:       (q) => `https://www.kayak.com/flights/${encodeURIComponent(q)}`,
+  skyscanner:  (q) => `https://www.skyscanner.net/transport/flights/?query=${encodeURIComponent(q)}`,
+  google_flights: (q) => `https://www.google.com/travel/flights?q=${encodeURIComponent(q)}`,
+
+  // ── Travel: Hotels ──────────────────────────────────────────
+  expedia:     (q) => `https://www.expedia.com/Hotel-Search?destination=${encodeURIComponent(q)}`,
+  booking:     (q) => `https://www.booking.com/search.html?ss=${encodeURIComponent(q)}`,
+  airbnb:      (q) => `https://www.airbnb.com/s/${encodeURIComponent(q)}/homes`,
+  hotels:      (q) => `https://www.hotels.com/search.do?q-destination=${encodeURIComponent(q)}`,
+
+  // ── Jobs ─────────────────────────────────────────────────────
+  indeed:      (q) => `https://www.indeed.com/jobs?q=${encodeURIComponent(q)}`,
+  linkedin:    (q) => `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(q)}`,
+  glassdoor:   (q) => `https://www.glassdoor.com/Job/jobs.htm?sc.keyword=${encodeURIComponent(q)}`,
+  ziprecruiter:(q) => `https://www.ziprecruiter.com/jobs-search?search=${encodeURIComponent(q)}`,
+
+  // ── Freelance / Services ─────────────────────────────────────
+  fiverr:      (q) => `https://www.fiverr.com/search/gigs?query=${encodeURIComponent(q)}`,
+  upwork:      (q) => `https://www.upwork.com/search/jobs/?q=${encodeURIComponent(q)}`,
+
+  // ── Real Estate ──────────────────────────────────────────────
+  zillow:      (q) => `https://www.zillow.com/homes/${encodeURIComponent(q)}_rb/`,
+  rightmove:   (q) => `https://www.rightmove.co.uk/property-for-sale/find.html?searchLocation=${encodeURIComponent(q)}`,
+
+  // ── Cars ─────────────────────────────────────────────────────
+  autotrader:  (q) => `https://www.autotrader.com/cars-for-sale/all-cars?zip=10001&query=${encodeURIComponent(q)}`,
+  cargurus:    (q) => `https://www.cargurus.com/Cars/new/nl#listing=${encodeURIComponent(q)}`,
+
+  // ── General Web Search ───────────────────────────────────────
+  google_web:  (q) => `https://www.google.com/search?q=${encodeURIComponent(q)}`,
+  bing:        (q) => `https://www.bing.com/search?q=${encodeURIComponent(q)}`,
 };
 
 // Universal semantic scraper — replaces all site-specific scrapers
@@ -481,8 +526,8 @@ async function stageAction(tabId, userGoal, category, token) {
 
 // --- Central Message Handler ---
 
-chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
-  handleMessage(request)
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  handleMessage(request, sender)
     .then(result => {
       // Ensure we ALWAYS send a valid response object
       const safeResult = (result && typeof result === 'object')
@@ -502,7 +547,7 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   return true; // Keep message channel open for async response
 });
 
-async function handleMessage(request) {
+async function handleMessage(request, sender) {
 
   // ── TAB TRIAGE MAP: Zero-Token spatial awareness ─────────
   if (request.type === 'GET_TAB_TRIAGE_MAP') {
@@ -727,6 +772,20 @@ async function handleMessage(request) {
           pageContext.sender = scraped.sender;
         }
       } catch { /* Content script not ready — proceed without scrape */ }
+      // Fallback: if Gmail scraper returned empty body, use universal scraper
+      if (!pageContext.emailBody && tabId) {
+        try {
+          const results = await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ['content_universal.js'],
+          });
+          const scraped = results?.[0]?.result;
+          if (scraped?.mainContent) {
+            pageContext.emailBody = scraped.mainContent.slice(0, 3000);
+            if (!pageContext.subject && scraped.pageTitle) pageContext.subject = scraped.pageTitle;
+          }
+        } catch { /* universal fallback also failed */ }
+      }
 
     } else if (url && /amazon\.(com|co\.uk|de|fr|ca|com\.au)/.test(url)) {
       pageContext.site = 'amazon';
@@ -777,6 +836,7 @@ async function handleMessage(request) {
       if (res.status === 401 || res.status === 403) errorType = 'AUTH_ERROR';
       else if (res.status === 429) errorType = 'RATE_LIMITED';
       else if (res.status === 413 || (err.error && /token|limit|too long/i.test(err.error))) errorType = 'TOKEN_LIMIT';
+      else if (res.status === 422) errorType = 'PARSE_ERROR';
       else if (res.status >= 500) errorType = 'BACKEND_DOWN';
       return { success: false, errorType, error: err.error || `Server error (HTTP ${res.status})`, httpStatus: res.status };
     }
@@ -1086,21 +1146,151 @@ async function handleMessage(request) {
     }
   }
 
+  // ── GMAIL FIND AND REPLY (agentic: search inbox → open email → pre-fill reply) ──
+  // Non-consequential: agent searches and pre-fills. User clicks Send manually.
+  if (request.type === 'gmail_find_and_reply') {
+    const { tabId, searchQuery, replyBody } = request.data;
+
+    if (!tabId) return { success: false, error: 'No tab ID provided.' };
+
+    // Step 1: Inject content_gmail.js if not already present, then search
+    try {
+      // Use Gmail's search to navigate to the right thread
+      // We encode the query and navigate to Gmail search
+      const searchUrl = `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(searchQuery)}`;
+
+      // Navigate the tab to the Gmail search results
+      await chrome.tabs.update(tabId, { url: searchUrl });
+
+      // Wait for the search results to load
+      await waitForTabLoad(tabId, 10000);
+
+      // Extra wait for Gmail's SPA to render results
+      await new Promise(r => setTimeout(r, 2000));
+
+      // Step 2: Inject content_gmail.js and click the first result + open reply
+      const result = await chrome.tabs.sendMessage(tabId, {
+        type: 'gmail_open_first_and_reply',
+        data: { replyBody },
+      }).catch(() => null);
+
+      if (result?.success) {
+        return { success: true };
+      }
+
+      // Fallback: if content script not ready, inject it first then retry
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['content_gmail.js'] }).catch(() => {});
+      await new Promise(r => setTimeout(r, 500));
+
+      const retryResult = await chrome.tabs.sendMessage(tabId, {
+        type: 'gmail_open_first_and_reply',
+        data: { replyBody },
+      }).catch(() => null);
+
+      return retryResult || { success: false, error: 'Could not open the email thread.' };
+
+    } catch (err) {
+      return { success: false, error: err.message || 'Gmail find-and-reply failed.' };
+    }
+  }
+
   // ── GHOST DRIVE TASK: Delegated from Command Center dashboard ──
+  // When user clicks "Delegate" on the dashboard, we inject/show the floating panel
+  // on the SAME dashboard tab and auto-fill it with the task prompt.
   if (request.type === 'ghost_drive_task') {
-    const { taskId, taskTitle, taskDescription, priority, dueDate } = request.payload || {};
+    const payload = request.payload || {};
+    const { taskId, taskTitle } = payload;
+    console.log('[GhostDrive] Received ghost_drive_task:', { taskId, taskTitle, hasSender: !!sender, senderTabId: sender?.tab?.id });
 
     if (!taskId || !taskTitle) {
+      console.warn('[GhostDrive] Missing taskId or taskTitle in payload');
       return { success: false, error: 'Missing task data for delegation.' };
     }
 
-    // Run the delegation asynchronously and notify the dashboard on completion
-    handleDelegatedTask(taskId, taskTitle, taskDescription, token).catch((err) => {
-      console.error('[GhostDrive] Delegation failed:', err.message);
-      notifyDashboardTabs('TASK_FAILED', { taskId, error: err.message });
-    });
+    try {
+      // Get the tab to inject into — prefer sender tab, fall back to active tab
+      let tabId = sender?.tab?.id;
+      if (!tabId) {
+        console.log('[GhostDrive] No sender tab, querying active tab...');
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        tabId = activeTab?.id;
+      }
+      if (!tabId) throw new Error('No tab available for panel injection');
+      console.log('[GhostDrive] Target tab:', tabId);
 
-    return { success: true, message: 'Task accepted for delegation.' };
+      // Check if panel already exists on the tab
+      let panelExists = false;
+      try {
+        const pong = await chrome.tabs.sendMessage(tabId, { type: 'enh_panel_ping' });
+        panelExists = !!pong?.ok;
+        console.log('[GhostDrive] Panel ping result:', pong);
+      } catch (pingErr) {
+        console.log('[GhostDrive] Panel not found, will inject:', pingErr.message);
+      }
+
+      if (!panelExists) {
+        console.log('[GhostDrive] Injecting panel JS into tab', tabId);
+        await chrome.scripting.executeScript({ target: { tabId }, files: ['content_panel.js'] });
+        // Wait for panel to initialize (init() is async — does storage + network calls)
+        await new Promise(r => setTimeout(r, 600));
+        console.log('[GhostDrive] Panel injected, waited 600ms');
+      }
+
+      // Send auto-fill with retry — panel listener may need a moment
+      let autofillSent = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const result = await chrome.tabs.sendMessage(tabId, {
+            type: 'enh_delegate_autofill',
+            payload,
+          });
+          console.log(`[GhostDrive] Auto-fill sent (attempt ${attempt + 1}):`, result);
+          autofillSent = true;
+          break;
+        } catch (sendErr) {
+          console.warn(`[GhostDrive] Auto-fill attempt ${attempt + 1} failed:`, sendErr.message);
+          if (attempt < 2) await new Promise(r => setTimeout(r, 400));
+        }
+      }
+
+      if (!autofillSent) {
+        console.error('[GhostDrive] All auto-fill attempts failed');
+        return { success: false, error: 'Panel injected but auto-fill failed. Try clicking the extension icon.' };
+      }
+
+      return { success: true, message: 'Task loaded into extension panel.' };
+    } catch (err) {
+      console.error('[GhostDrive] Failed to inject panel for delegation:', err.message);
+      return { success: false, error: 'Could not open extension panel on this page.' };
+    }
+  }
+
+  // ── INJECT PANEL HERE: Bridge requests panel injection on its own tab ──
+  if (request.type === 'inject_panel_here') {
+    const tabId = sender?.tab?.id;
+    console.log('[BG] inject_panel_here requested, sender tab:', tabId);
+    if (!tabId) {
+      // Fallback: find active tab
+      try {
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (activeTab?.id) {
+          await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['content_panel.js'] });
+          console.log('[BG] Panel injected into active tab:', activeTab.id);
+          return { success: true };
+        }
+      } catch (err) {
+        console.error('[BG] Fallback injection failed:', err.message);
+      }
+      return { success: false, error: 'No tab to inject into' };
+    }
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['content_panel.js'] });
+      console.log('[BG] Panel injected into sender tab:', tabId);
+      return { success: true };
+    } catch (err) {
+      console.error('[BG] Panel injection error:', err.message);
+      return { success: false, error: err.message };
+    }
   }
 
   // ── GET CURRENT TAB (for content_panel.js) ─────────────────
@@ -1267,7 +1457,7 @@ async function handleDelegatedTask(taskId, taskTitle, taskDescription, authToken
 // Notify all enhancivity.com tabs (where the dashboard bridge runs)
 async function notifyDashboardTabs(type, payload) {
   try {
-    const tabs = await chrome.tabs.query({ url: ['https://enhancivity.com/*', 'https://*.enhancivity.com/*', 'http://localhost:3001/*'] });
+    const tabs = await chrome.tabs.query({ url: ['https://enhancivity.com/*', 'https://*.enhancivity.com/*', 'http://localhost:3001/*', 'http://localhost:3002/*'] });
     for (const tab of tabs) {
       chrome.tabs.sendMessage(tab.id, { type, payload }).catch(() => {});
     }
@@ -1292,7 +1482,6 @@ chrome.action.onClicked.addListener(async (tab) => {
     const injectOnLoad = (tabId, changeInfo) => {
       if (tabId === newTab.id && changeInfo.status === 'complete') {
         chrome.tabs.onUpdated.removeListener(injectOnLoad);
-        chrome.scripting.insertCSS({ target: { tabId: newTab.id }, files: ['content_panel.css'] }).catch(() => {});
         chrome.scripting.executeScript({ target: { tabId: newTab.id }, files: ['content_panel.js'] }).catch(() => {});
       }
     };
@@ -1301,24 +1490,26 @@ chrome.action.onClicked.addListener(async (tab) => {
   }
 
   try {
-    // Try toggling — if panel is already injected, it will respond
-    await chrome.tabs.sendMessage(tab.id, { type: 'enh_panel_toggle' });
-  } catch {
-    // Panel not injected yet — inject it
-    try {
-      await chrome.scripting.insertCSS({
-        target: { tabId: tab.id },
-        files: ['content_panel.css'],
-      });
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ['content_panel.js'],
-      });
-    } catch (err) {
-      console.warn('[Enhancivity] Panel injection failed:', err.message);
-      // Last-resort fallback: open popup.html in a new tab
-      await chrome.tabs.create({ url: chrome.runtime.getURL('popup/popup.html') });
+    // Try toggling — if panel is already injected, it will respond with {ok: true}
+    const response = await chrome.tabs.sendMessage(tab.id, { type: 'enh_panel_toggle' });
+    if (response?.ok) {
+      // Panel handled the toggle
+      return;
     }
+  } catch {
+    // No listener at all — expected when panel not yet injected
+  }
+
+  // Panel not injected yet (or other scripts swallowed the message) — inject it
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ['content_panel.js'],
+    });
+  } catch (err) {
+    console.warn('[Enhancivity] Panel injection failed:', err.message);
+    // Last-resort fallback: open popup.html in a new tab
+    await chrome.tabs.create({ url: chrome.runtime.getURL('popup/popup.html') });
   }
 });
 
@@ -1329,28 +1520,23 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
     const { enhPanelState } = await chrome.storage.session.get('enhPanelState');
     if (!enhPanelState?.isOpen) return;
 
-    // Get tab info to check if restricted
     const tab = await chrome.tabs.get(tabId);
     if (isRestrictedUrl(tab.url)) return;
 
-    // Check if panel already exists
-    await chrome.tabs.sendMessage(tabId, { type: 'enh_panel_ping' });
-  } catch {
-    // Panel not injected on this tab — inject it
+    // Check if panel already exists — must verify response
+    let panelExists = false;
     try {
-      const tab = await chrome.tabs.get(tabId);
-      if (isRestrictedUrl(tab.url)) return;
+      const pong = await chrome.tabs.sendMessage(tabId, { type: 'enh_panel_ping' });
+      panelExists = !!pong?.ok;
+    } catch { /* no listener at all */ }
 
-      await chrome.scripting.insertCSS({
-        target: { tabId },
-        files: ['content_panel.css'],
-      });
+    if (!panelExists) {
       await chrome.scripting.executeScript({
         target: { tabId },
         files: ['content_panel.js'],
       });
-    } catch {
-      // Non-fatal — tab might not support injection
     }
+  } catch {
+    // Non-fatal — tab might not support injection
   }
 });
