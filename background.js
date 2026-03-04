@@ -257,12 +257,43 @@ async function updateOrchestrationProgress(phase, detail) {
 // --- Semantic Search Tab: inject semantic scraper → parse-intent API ---
 
 async function spawnSearchTab(site, query, category, token) {
+  let url;
+  let skillId = null; // Track for Skill Engine outcome recording
+
   const urlBuilder = SEARCH_URLS[site];
-  if (!urlBuilder) {
-    return { site, results: [], error: `No URL builder for site: ${site}` };
+  if (urlBuilder) {
+    // Known site — use hardcoded builder (fast path)
+    url = urlBuilder(query);
+  } else {
+    // Unknown site — ask Skill Engine for a URL template
+    console.log(`[Ghost-Driver] ${site}: not in SEARCH_URLS, calling Skill Engine...`);
+    try {
+      const resolveRes = await fetch(`${API_BASE}/api/skills/resolve-site`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ domain: site, query, category }),
+      });
+
+      if (!resolveRes.ok) {
+        const err = await resolveRes.json().catch(() => ({}));
+        console.warn(`[Ghost-Driver] ${site}: Skill Engine rejected:`, err.error);
+        return { site, results: [], error: err.error || `Cannot search ${site}: no URL template available` };
+      }
+
+      const resolved = await resolveRes.json();
+      if (!resolved.success || !resolved.skill?.searchUrl) {
+        return { site, results: [], error: `Skill Engine returned no URL for ${site}` };
+      }
+
+      skillId = resolved.skill.id;
+      url = resolved.skill.searchUrl.replace('{query}', encodeURIComponent(query));
+      console.log(`[Ghost-Driver] ${site}: Skill Engine resolved URL (fromCache: ${resolved.fromCache}): ${url}`);
+    } catch (err) {
+      console.warn(`[Ghost-Driver] ${site}: Skill Engine call failed:`, err.message);
+      return { site, results: [], error: `Skill Engine unavailable: ${err.message}` };
+    }
   }
 
-  const url = urlBuilder(query);
   let tab;
 
   try {
@@ -286,6 +317,13 @@ async function spawnSearchTab(site, query, category, token) {
     const semanticMap = injected?.[0]?.result;
     if (!semanticMap || !semanticMap.elements || semanticMap.elements.length === 0) {
       console.warn(`[Ghost-Driver] ${site}: semantic map empty`);
+      if (skillId) {
+        fetch(`${API_BASE}/api/skills/record-outcome`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ skillId, success: false }),
+        }).catch(() => {});
+      }
       return { site, results: [], error: 'Semantic map empty' };
     }
 
@@ -318,10 +356,27 @@ async function spawnSearchTab(site, query, category, token) {
     const trustRationale = parsed.trustRationale || '';
 
     console.log(`[Ghost-Driver] ${site}: extracted ${results.length} products (trust: ${trustScore})`);
+
+    // Record outcome for Skill Engine (only for skill-based searches)
+    if (skillId) {
+      fetch(`${API_BASE}/api/skills/record-outcome`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ skillId, success: results.length > 0 }),
+      }).catch(err => console.warn(`[Ghost-Driver] Failed to record skill outcome:`, err.message));
+    }
+
     return { site, results, trustScore, trustRationale };
 
   } catch (err) {
     console.warn(`[Ghost-Driver] ${site} search failed:`, err.message);
+    if (skillId) {
+      fetch(`${API_BASE}/api/skills/record-outcome`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ skillId, success: false }),
+      }).catch(() => {});
+    }
     return { site, results: [], error: err.message };
   } finally {
     // Always clean up — close the hidden tab
@@ -413,8 +468,20 @@ async function stageAction(tabId, userGoal, category, token) {
   }
 
   if (!semanticMap || !semanticMap.elements?.length) {
-    await hudUpdate(tabId, 'scan', 'error', 'No interactable elements found');
-    return { success: false, error: 'Page has no interactable elements.' };
+    // Read-only page (profile, article, search results) — no form fields to fill.
+    // Scrape visible text and return it as readable content instead of failing hard.
+    await hudUpdate(tabId, 'scan', 'error', 'Read-only page — no form fields');
+    const textResult = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => document.body?.innerText?.slice(0, 3000) || '',
+    }).catch(() => null);
+    const pageText = textResult?.[0]?.result || '';
+    await hudHide(tabId);
+    return {
+      success: false,
+      errorType: 'READ_ONLY_PAGE',
+      error: 'This page has no form fields to fill. ' + (pageText ? `Here is what I can see:\n\n${pageText}` : 'Try searching within this site instead.'),
+    };
   }
   await hudUpdate(tabId, 'scan', 'success', `${semanticMap.elements.length} elements found`);
 
@@ -501,9 +568,10 @@ async function stageAction(tabId, userGoal, category, token) {
     const result = await chrome.tabs.sendMessage(tabId, {
       type: 'execute_dom_action',
       step: action,
-    });
-    results.push(result);
-    if (!result.success) break;
+    }).catch(() => null);
+    const safeResult = (result && typeof result === 'object') ? result : { success: false, error: 'No response from content script' };
+    results.push(safeResult);
+    if (!safeResult.success) break;
   }
 
   const allSuccess = results.every(r => r.success);
@@ -1340,12 +1408,6 @@ async function handleDelegatedTask(taskId, taskTitle, taskDescription, authToken
 
   // 1. Gather memory context
   const memory = await getOrRefreshMemory();
-  const memoryContext = memory
-    ? [
-        memory.tier1 ? `Identity: ${JSON.stringify(memory.tier1).substring(0, 300)}` : '',
-        memory.tier2?.length ? `Goals: ${memory.tier2.map(g => g.name).join(', ')}` : '',
-      ].filter(Boolean).join('\n')
-    : '';
 
   if (hudTabId) await hudUpdate(hudTabId, 'memory', 'success', memory ? 'Memory loaded' : 'No memory available');
 
@@ -1518,7 +1580,8 @@ chrome.action.onClicked.addListener(async (tab) => {
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   try {
     const { enhPanelState } = await chrome.storage.session.get('enhPanelState');
-    if (!enhPanelState?.isOpen) return;
+    // Re-inject if panel was open OR minimized (so data is ready when user clicks icon)
+    if (!enhPanelState?.isOpen && !enhPanelState?.isMinimized) return;
 
     const tab = await chrome.tabs.get(tabId);
     if (isRestrictedUrl(tab.url)) return;

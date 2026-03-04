@@ -50,6 +50,11 @@
 
   // ── Conversation Helpers ───────────────────────────────────────
 
+  // Conversation key is per-tab so multiple tabs never overwrite each other
+  function convKey() {
+    return currentTabId ? `enhConversation_${currentTabId}` : 'enhConversation_global';
+  }
+
   async function saveConversation() {
     try {
       let msgs = conversationMessages;
@@ -58,7 +63,7 @@
         msgs = msgs.slice(2);
       }
       conversationMessages = msgs;
-      await chrome.storage.session.set({ enhConversation: msgs });
+      await chrome.storage.session.set({ [convKey()]: msgs });
     } catch { /* non-critical */ }
   }
 
@@ -171,7 +176,10 @@
         <p class="enh-greeting-text">Ready when you are.</p>
       </div>
 
-      <!-- Loading -->
+      <!-- Results -->
+      <div class="enh-results-area enh-hidden" id="enh-results-area"></div>
+
+      <!-- Loading — sits BELOW results so it's always visible at the bottom of chat -->
       <div class="enh-loading-bar enh-hidden" id="enh-loading-bar">
         <div class="enh-loading-glow"></div>
         <div class="enh-loading-content">
@@ -179,9 +187,6 @@
           <span class="enh-loading-label">Thinking with your memory...</span>
         </div>
       </div>
-
-      <!-- Results -->
-      <div class="enh-results-area enh-hidden" id="enh-results-area"></div>
 
       <!-- Error -->
       <p class="enh-error-message" id="enh-main-error"></p>
@@ -347,18 +352,21 @@
   }
 
   function closePanel() {
+    // Hide immediately — never block the UI on async storage writes
     panel.classList.add('enh-hidden');
-    // Clear conversation context
     clearResults();
     if (greeting) greeting.style.display = '';
     mainError.textContent = '';
     promptInput.value = '';
     submitBtn.disabled = true;
     submitBtn.classList.remove('active');
-    // Clear conversation history
+    // Clear this tab's conversation only — other tabs are unaffected
     conversationMessages = [];
-    saveConversation();
-    saveState();
+    Promise.all([
+      saveConversation(),  // writes empty array to enhConversation_<tabId>
+      chrome.storage.session.remove(convKey()).catch(() => {}), // clean up the key entirely
+      saveState(),
+    ]).catch(() => {});
   }
 
   // Expose toggle for re-injection calls
@@ -1035,11 +1043,20 @@
         statusEl.textContent = 'Done.';
         statusEl.style.color = '#34d399';
       } else {
+        const errorType = res?.errorType || '';
         const errorMsg = res?.error || 'Action failed.';
         if (errorMsg === 'BLOCKED_SENSITIVE' || errorMsg === 'BLOCKED_DANGEROUS_CLICK') {
-          // These are safety blocks — this shouldn't happen for auto actions, but handle gracefully
           statusEl.textContent = 'Stopped: this step requires your manual action.';
           statusEl.style.color = '#f59e0b';
+        } else if (errorType === 'READ_ONLY_PAGE') {
+          // Page had no form fields — show scraped content as a readable response instead
+          statusEl.textContent = 'Read-only page — showing what I found:';
+          statusEl.style.color = '#a5b4fc';
+          const contentEl = document.createElement('p');
+          contentEl.className = 'enh-action-rationale';
+          contentEl.style.cssText = 'margin-top:8px;white-space:pre-wrap;max-height:200px;overflow-y:auto;font-size:12px;';
+          contentEl.textContent = errorMsg.replace('This page has no form fields to fill. Here is what I can see:\n\n', '');
+          card.appendChild(contentEl);
         } else {
           statusEl.textContent = `Couldn't complete: ${errorMsg}`;
           statusEl.style.color = '#f87171';
@@ -1238,7 +1255,8 @@
         }
       }
       if (!composeData.body && data.primary_content) {
-        composeData.body = data.primary_content;
+        const pc = data.primary_content;
+        composeData.body = typeof pc === 'string' ? pc : (pc.body || pc.replyBody || JSON.stringify(pc));
       }
       res = await sendToBackground('gmail_compose', { tabId: currentTabId, data: composeData });
 
@@ -1603,7 +1621,17 @@
   function setLoading(on) {
     loadingBar.classList.toggle('enh-hidden', !on);
     submitBtn.disabled = on;
-    if (!on) setStage('');
+    if (on) {
+      // Double rAF: first frame triggers layout recalc after display:none→flex,
+      // second frame scrolls after the new height is committed to the render tree
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          chatArea.scrollTop = chatArea.scrollHeight;
+        });
+      });
+    } else {
+      setStage('');
+    }
   }
 
   function setStage(stage) {
@@ -1614,7 +1642,8 @@
   }
 
   function clearResults() {
-    resultsArea.innerHTML = '';
+    // replaceChildren() is faster than innerHTML='' for large DOM trees
+    resultsArea.replaceChildren();
     resultsArea.classList.add('enh-hidden');
     mainError.textContent = '';
   }
@@ -1657,9 +1686,13 @@
 
   async function saveState() {
     try {
+      const isHidden = panel.classList.contains('enh-hidden');
       await chrome.storage.session.set({
         enhPanelState: {
-          isOpen: !panel.classList.contains('enh-hidden'),
+          // isOpen: true means "open and visible" — used by onActivated to decide re-injection
+          isOpen: !isHidden,
+          // isMinimized: true means "— was clicked" — restoreState hides panel but keeps data
+          isMinimized: isHidden && conversationMessages.length > 0,
           greetingHidden: greeting?.style.display === 'none',
           position: {
             left: panel.style.left,
@@ -1676,7 +1709,10 @@
 
   async function restoreState() {
     try {
-      const { enhPanelState, enhConversation } = await chrome.storage.session.get(['enhPanelState', 'enhConversation']);
+      const stored = await chrome.storage.session.get(['enhPanelState', convKey()]);
+      const enhPanelState = stored.enhPanelState;
+      const enhConversation = stored[convKey()];
+
       if (enhPanelState) {
         // Restore position
         if (enhPanelState.position) {
@@ -1690,8 +1726,8 @@
             panel.style.bottom = 'auto';
           }
         }
-        // Restore visibility
-        if (enhPanelState.isOpen === false) {
+        // Restore minimized state (— button): panel hidden but NOT cleared
+        if (enhPanelState.isMinimized) {
           panel.classList.add('enh-hidden');
         }
         // Restore greeting hidden state
@@ -1699,7 +1735,7 @@
           greeting.style.display = 'none';
         }
       }
-      // Restore conversation
+      // Restore this tab's conversation only
       if (enhConversation && enhConversation.length > 0) {
         conversationMessages = enhConversation;
         rebuildChatThread();
