@@ -205,6 +205,12 @@ async function handleSubmit() {
     return;
   }
 
+  // EXPLORE: multi-step agentic exploration loop
+  if (res.data?.action_type === 'EXPLORE' && res.data?.explore_plan) {
+    renderExplorePlan(res.data, res.data.consent_level === 'auto');
+    return;
+  }
+
   renderResults(res.data);
 }
 
@@ -873,6 +879,199 @@ function renderOrchestratePlan(data, autoStart = true) {
 
     card.appendChild(btnRow);
     area.appendChild(card);
+  }
+}
+
+// ── EXPLORE: Render plan card + run exploration loop ────────
+
+function renderExplorePlan(data, autoStart = true) {
+  const area = document.getElementById('results-area');
+  area.innerHTML = '';
+  area.classList.remove('hidden');
+
+  const card = document.createElement('div');
+  card.className = 'action-card consent-soft';
+
+  const headline = document.createElement('p');
+  headline.className = 'action-headline';
+  headline.textContent = data.headline || 'Exploring...';
+  card.appendChild(headline);
+
+  const plan = data.explore_plan;
+
+  const goalEl = document.createElement('p');
+  goalEl.className = 'orch-criteria';
+  goalEl.textContent = plan.goal;
+  goalEl.style.fontWeight = '500';
+  card.appendChild(goalEl);
+
+  const strategyEl = document.createElement('p');
+  strategyEl.className = 'orch-criteria';
+  strategyEl.style.opacity = '0.7';
+  strategyEl.style.fontSize = '11px';
+  strategyEl.textContent = `Strategy: ${plan.strategy}`;
+  card.appendChild(strategyEl);
+
+  const budgetBadges = document.createElement('div');
+  budgetBadges.className = 'orch-site-badges';
+
+  const stepBadge = document.createElement('span');
+  stepBadge.className = 'orch-site-badge';
+  stepBadge.textContent = `${plan.maxSteps} steps`;
+  budgetBadges.appendChild(stepBadge);
+
+  const creditBadge = document.createElement('span');
+  creditBadge.className = 'orch-site-badge';
+  creditBadge.textContent = `~${plan.creditBudget} EU`;
+  budgetBadges.appendChild(creditBadge);
+
+  card.appendChild(budgetBadges);
+
+  if (data.rationale) {
+    const rationale = document.createElement('p');
+    rationale.className = 'action-rationale';
+    rationale.textContent = data.rationale;
+    card.appendChild(rationale);
+  }
+
+  if (autoStart) {
+    const statusEl = document.createElement('p');
+    statusEl.className = 'action-rationale';
+    statusEl.textContent = 'Starting exploration...';
+    card.appendChild(statusEl);
+    area.appendChild(card);
+    setTimeout(() => startExploration(plan), 800);
+  } else {
+    const btnRow = document.createElement('div');
+    btnRow.className = 'action-btn-row';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn consent-btn-cancel';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', () => { area.innerHTML = ''; area.classList.add('hidden'); });
+    btnRow.appendChild(cancelBtn);
+
+    const exploreBtn = document.createElement('button');
+    exploreBtn.className = 'btn consent-btn-soft';
+    exploreBtn.textContent = 'Explore Now';
+    exploreBtn.addEventListener('click', () => startExploration(plan));
+    btnRow.appendChild(exploreBtn);
+
+    card.appendChild(btnRow);
+    area.appendChild(card);
+  }
+}
+
+let explorationListener = null;
+
+async function startExploration(explorePlan) {
+  const area = document.getElementById('results-area');
+  area.innerHTML = '';
+
+  const hud = document.createElement('div');
+  hud.className = 'orch-hud';
+
+  const header = document.createElement('div');
+  header.className = 'orch-header';
+
+  const badge = document.createElement('span');
+  badge.className = 'orch-badge-label';
+  badge.textContent = 'Exploring';
+  header.appendChild(badge);
+
+  const statusEl = document.createElement('span');
+  statusEl.className = 'orch-status';
+  statusEl.textContent = 'Starting...';
+  header.appendChild(statusEl);
+
+  hud.appendChild(header);
+
+  // Step log
+  const stepLog = document.createElement('div');
+  stepLog.style.cssText = 'max-height: 180px; overflow-y: auto; padding: 6px 0;';
+  hud.appendChild(stepLog);
+
+  area.appendChild(hud);
+
+  // Listen for progress
+  if (explorationListener) {
+    chrome.storage.onChanged.removeListener(explorationListener);
+  }
+
+  explorationListener = (changes) => {
+    if (!changes.explorationProgress) return;
+    const progress = changes.explorationProgress.newValue;
+    if (!progress) return;
+
+    statusEl.textContent = `Step ${progress.step}/${progress.total}: ${progress.description || ''}`;
+
+    if (progress.step >= 0 && progress.description) {
+      const stepEntry = document.createElement('div');
+      stepEntry.style.cssText = 'display: flex; align-items: center; gap: 6px; padding: 2px 0; font-size: 11px; color: rgba(255,255,255,0.7);';
+
+      const icon = document.createElement('span');
+      icon.style.cssText = 'font-size: 10px; width: 14px; text-align: center;';
+      if (progress.status === 'running') icon.textContent = '...';
+      else if (progress.status === 'complete') icon.textContent = '\u2713';
+      else if (progress.status === 'partial') icon.textContent = '\u25CB';
+      else icon.textContent = '\u2022';
+
+      const text = document.createElement('span');
+      text.textContent = progress.description;
+
+      stepEntry.appendChild(icon);
+      stepEntry.appendChild(text);
+
+      const existing = stepLog.querySelector(`[data-step="${progress.step}"]`);
+      if (existing) existing.replaceWith(stepEntry);
+      else stepLog.appendChild(stepEntry);
+      stepEntry.setAttribute('data-step', progress.step);
+      stepLog.scrollTop = stepLog.scrollHeight;
+    }
+  };
+
+  chrome.storage.onChanged.addListener(explorationListener);
+
+  // Get active tab
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tabId = tabs[0]?.id;
+
+  const res = await chrome.runtime.sendMessage({
+    type: 'explore_start',
+    data: { explorePlan, tabId },
+  });
+
+  chrome.storage.onChanged.removeListener(explorationListener);
+  explorationListener = null;
+
+  // Render result
+  area.innerHTML = '';
+
+  if (res?.success || res?.goalResult) {
+    const card = document.createElement('div');
+    card.className = 'action-card';
+
+    const headlineEl = document.createElement('p');
+    headlineEl.className = 'action-headline';
+    headlineEl.textContent = res.success ? 'Exploration Complete' : 'Partial Results';
+    card.appendChild(headlineEl);
+
+    const resultEl = document.createElement('div');
+    resultEl.className = 'action-rationale';
+    resultEl.style.whiteSpace = 'pre-wrap';
+    resultEl.textContent = res.goalResult || 'Exploration finished.';
+    card.appendChild(resultEl);
+
+    if (res.stepsUsed) {
+      const metaEl = document.createElement('p');
+      metaEl.style.cssText = 'font-size: 10px; opacity: 0.5; margin-top: 8px;';
+      metaEl.textContent = `${res.stepsUsed} steps \u00B7 ${(res.creditsUsed || 0).toFixed(1)} EU`;
+      card.appendChild(metaEl);
+    }
+
+    area.appendChild(card);
+  } else {
+    area.innerHTML = `<div class="action-card"><p class="error-message">${res?.error || 'Exploration failed.'}</p></div>`;
   }
 }
 

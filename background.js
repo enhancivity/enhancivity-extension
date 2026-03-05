@@ -52,6 +52,35 @@ function isAllowedUrl(url) {
   }
 }
 
+// --- Domain Blocklist for EXPLORE (relaxed navigation) ---
+
+const EXPLORE_BLOCKED_DOMAINS = [
+  // Banking / Financial
+  'chase.com', 'wellsfargo.com', 'bankofamerica.com', 'citi.com',
+  'capitalone.com', 'usbank.com', 'schwab.com', 'fidelity.com',
+  'vanguard.com', 'tdameritrade.com', 'ally.com', 'discover.com',
+  // Healthcare
+  'myhealth.va.gov', 'mychart.com',
+  // Auth pages
+  'accounts.google.com', 'login.microsoftonline.com', 'auth0.com',
+  // Payment processors
+  'paypal.com', 'venmo.com', 'zelle.com',
+];
+
+function isAllowedForExplore(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    // Block .gov and .mil domains
+    if (host.endsWith('.gov') || host.endsWith('.mil')) return false;
+    // Block known sensitive domains
+    if (EXPLORE_BLOCKED_DOMAINS.some(d => host === d || host.endsWith('.' + d))) return false;
+    // Everything else is allowed for exploration
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // --- Site Type Detection (for universal scraper) ---
 
 function detectSiteType(url) {
@@ -442,6 +471,418 @@ async function runOrchestration(userPrompt, searchPlan, token) {
   }
 }
 
+// --- EXPLORE: Multi-step agentic exploration loop ---
+
+async function updateExplorationProgress(step, total, description, status) {
+  await chrome.storage.local.set({
+    explorationProgress: { step, total, description, status, timestamp: Date.now() },
+  });
+}
+
+async function takePageSnapshot(tabId) {
+  try {
+    // Inject the explore content script (handles double-injection guard internally)
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content_explore.js'],
+    });
+
+    // Request a snapshot
+    const result = await chrome.tabs.sendMessage(tabId, {
+      type: 'explore_action',
+      actionType: 'take_snapshot',
+    });
+
+    if (result?.success && result.snapshot) {
+      return result.snapshot;
+    }
+
+    // Fallback: just get basic page info
+    const tab = await chrome.tabs.get(tabId);
+    return {
+      url: tab.url || 'unknown',
+      title: tab.title || 'unknown',
+      mainContent: '(Could not extract page content)',
+      semanticElements: [],
+    };
+  } catch (err) {
+    console.warn('[Explore] Snapshot failed:', err.message);
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      return {
+        url: tab.url || 'unknown',
+        title: tab.title || 'unknown',
+        mainContent: '(Snapshot failed: ' + err.message + ')',
+        semanticElements: [],
+      };
+    } catch {
+      return { url: 'unknown', title: 'unknown', mainContent: '', semanticElements: [] };
+    }
+  }
+}
+
+// Re-inject content_universal.js and return page text for post-action verification
+async function scrapePageState(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content_universal.js'],
+    });
+    const scraped = results?.[0]?.result;
+    if (scraped) {
+      return {
+        pageTitle: scraped.pageTitle || '',
+        mainContent: scraped.mainContent || '',
+        meta: scraped.meta || {},
+      };
+    }
+  } catch {
+    // Non-fatal — some pages block injection (chrome://, pdf, etc.)
+  }
+  return null;
+}
+
+async function executeExploreAction(tabId, action) {
+  try {
+    if (action.type === 'navigate') {
+      // Navigate to URL
+      const url = action.target || action.value;
+      if (!url) return { success: false, error: 'No URL provided for navigate' };
+      if (!isAllowedForExplore(url)) {
+        return { success: false, error: `BLOCKED: Domain not allowed for exploration: ${url}` };
+      }
+
+      const tab = await chrome.tabs.update(tabId, { url });
+      await waitForTabLoad(tabId);
+
+      // Re-inject explore script after navigation
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          files: ['content_explore.js'],
+        });
+      } catch {}
+
+      return {
+        success: true,
+        observation: `Navigated to ${tab.url || url}`,
+        newUrl: tab.url || url,
+      };
+    }
+
+    // For all other actions, send to content script
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content_explore.js'],
+    });
+
+    const result = await chrome.tabs.sendMessage(tabId, {
+      type: 'explore_action',
+      actionType: action.type,
+      target: action.target,
+      value: action.value,
+    });
+
+    return result || { success: false, error: 'No response from content script' };
+
+  } catch (err) {
+    return { success: false, error: err.message || 'Action execution failed' };
+  }
+}
+
+async function runExplorationLoop(explorePlan, tabId, token, resumeState = null) {
+  const { goal, strategy, maxSteps, creditBudget, startAction } = explorePlan;
+
+  const stepLog = resumeState?.stepLog || [];
+  let currentStrategy = resumeState?.currentStrategy || strategy;
+  let creditsUsed = resumeState?.creditsUsed || 0;
+  let currentTabId = resumeState?.tabId || tabId;
+  let consecutiveFailures = resumeState?.consecutiveFailures || 0;
+  const startStep = resumeState?.nextStep || 1;
+
+  // Service worker keepalive during exploration
+  const keepAlive = setInterval(() => {
+    chrome.runtime.getPlatformInfo(() => {});
+  }, 20000);
+
+  // Total exploration timeout (120 seconds)
+  const explorationTimeout = setTimeout(() => {
+    clearInterval(keepAlive);
+  }, 120000);
+
+  try {
+    // Show HUD on the page
+    const hudSteps = [];
+    for (let i = 0; i <= Math.min(maxSteps, 12); i++) {
+      hudSteps.push({ id: `explore-${i}`, label: i === 0 ? 'Start' : `Step ${i}` });
+    }
+    await hudShow(currentTabId, `Exploring: ${goal.slice(0, 60)}`, hudSteps);
+
+    // Inject explore content script
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: currentTabId },
+        files: ['content_explore.js'],
+      });
+    } catch (err) {
+      console.warn('[Explore] Could not inject explore script:', err.message);
+    }
+
+    // Execute start action (skip if resuming — already done before pause)
+    if (!resumeState) {
+      await hudUpdate(currentTabId, 'explore-0', 'processing', startAction.description);
+      await updateExplorationProgress(0, maxSteps, startAction.description, 'running');
+
+      const startResult = await executeExploreAction(currentTabId, startAction);
+      stepLog.push({
+        step: 0,
+        action: startAction,
+        result: { success: startResult.success },
+        observation: startResult.observation || startResult.error || '',
+      });
+
+      await hudUpdate(currentTabId, 'explore-0', startResult.success ? 'success' : 'error',
+        startAction.description);
+
+      if (!startResult.success) consecutiveFailures++;
+
+      // Brief pause after start action
+      await new Promise(r => setTimeout(r, 800));
+    } else {
+      console.log(`[Explore] Resuming from step ${startStep}, ${stepLog.length} steps already done`);
+    }
+
+    // Main exploration loop
+    for (let step = startStep; step <= maxSteps; step++) {
+      // Frustration failsafe: 3 consecutive failures → stop
+      if (consecutiveFailures >= 3) {
+        await hudUpdate(currentTabId, `explore-${step}`, 'error', 'Too many failures — stopping');
+        break;
+      }
+
+      // Credit budget check
+      if (creditsUsed >= creditBudget) {
+        await hudUpdate(currentTabId, `explore-${step}`, 'error', 'Credit budget exhausted');
+        break;
+      }
+
+      // OBSERVE: take snapshot of current page
+      await hudUpdate(currentTabId, `explore-${step}`, 'processing', 'Observing page...');
+      await updateExplorationProgress(step, maxSteps, 'Observing page...', 'running');
+
+      const snapshot = await takePageSnapshot(currentTabId);
+
+      // PROACTIVE LOGIN CHECK — save an explore-step API call + 0.3 EU
+      if (snapshot.isLoginPage) {
+        const stateKey = `exploreResume_${Date.now()}`;
+        await chrome.storage.session.set({
+          [stateKey]: {
+            stepLog, currentStrategy, creditsUsed,
+            consecutiveFailures, nextStep: step,
+            explorePlan, tabId: currentTabId,
+          },
+        });
+
+        await updateExplorationProgress(step, maxSteps,
+          'Login required \u2014 please sign in to continue', 'login_required');
+
+        clearInterval(keepAlive);
+        clearTimeout(explorationTimeout);
+
+        return {
+          success: false, paused: true,
+          pauseReason: 'This page requires you to log in before I can continue.',
+          resumeStateKey: stateKey,
+          creditsUsed, stepLog,
+        };
+      }
+
+      // THINK: call backend for next action
+      await updateExplorationProgress(step, maxSteps, 'Deciding next action...', 'running');
+
+      let decision;
+      try {
+        const thinkRes = await fetch(`${API_BASE}/api/agent/explore-step`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            goal,
+            strategy: currentStrategy,
+            stepNumber: step,
+            maxSteps,
+            previousActions: stepLog,
+            currentPageState: snapshot,
+          }),
+        });
+
+        if (!thinkRes.ok) {
+          const err = await thinkRes.json().catch(() => ({}));
+          if (err.errorType === 'INSUFFICIENT_CREDITS') {
+            await hudUpdate(currentTabId, `explore-${step}`, 'error', 'Insufficient credits');
+            break;
+          }
+          throw new Error(err.error || `explore-step failed (${thinkRes.status})`);
+        }
+
+        decision = await thinkRes.json();
+        creditsUsed += 0.3;
+      } catch (err) {
+        console.error('[Explore] Think step failed:', err.message);
+        consecutiveFailures++;
+        stepLog.push({
+          step,
+          action: { type: 'think', description: 'AI decision' },
+          result: { success: false },
+          observation: `Think failed: ${err.message}`,
+        });
+        await hudUpdate(currentTabId, `explore-${step}`, 'error', `AI error: ${err.message}`);
+        continue;
+      }
+
+      // Check if goal is complete
+      if (decision.isGoalComplete) {
+        await hudUpdate(currentTabId, `explore-${step}`, 'success', 'Goal achieved!');
+        await updateExplorationProgress(step, maxSteps, 'Goal achieved!', 'complete');
+
+        // Hide remaining HUD steps
+        for (let i = step + 1; i <= maxSteps; i++) {
+          // Don't update steps that don't exist in HUD
+        }
+
+        clearInterval(keepAlive);
+        clearTimeout(explorationTimeout);
+
+        return {
+          success: true,
+          goalResult: decision.goalResult || 'Exploration complete.',
+          stepsUsed: step,
+          creditsUsed,
+          stepLog,
+        };
+      }
+
+      // Check if consent is needed
+      if (decision.needsConsent) {
+        const reason = (decision.consentReason || '').toLowerCase();
+        const isLoginRequired = reason.includes('login') || reason.includes('sign in') || reason.includes('log in');
+
+        if (isLoginRequired) {
+          // Pause the loop and let the user log in manually
+          const stateKey = `exploreResume_${Date.now()}`;
+          await chrome.storage.session.set({
+            [stateKey]: {
+              stepLog, currentStrategy, creditsUsed,
+              consecutiveFailures, nextStep: step,
+              explorePlan, tabId: currentTabId,
+            },
+          });
+
+          await updateExplorationProgress(step, maxSteps,
+            decision.consentReason || 'Login required', 'login_required');
+
+          clearInterval(keepAlive);
+          clearTimeout(explorationTimeout);
+
+          return {
+            success: false, paused: true,
+            pauseReason: decision.consentReason || 'This page requires you to log in.',
+            resumeStateKey: stateKey,
+            creditsUsed, stepLog,
+          };
+        }
+
+        // Non-login consent (e.g., payment) — skip and continue
+        await updateExplorationProgress(step, maxSteps,
+          `Consent needed: ${decision.consentReason || 'Action requires approval'}`, 'consent');
+        stepLog.push({
+          step,
+          action: decision.nextAction,
+          reasoning: decision.reasoning,
+          result: { success: false },
+          observation: `Skipped — requires consent: ${decision.consentReason}`,
+        });
+        await hudUpdate(currentTabId, `explore-${step}`, 'error',
+          `Needs consent: ${decision.consentReason || 'Requires approval'}`);
+        continue;
+      }
+
+      // Update strategy if revised
+      if (decision.revisedStrategy) {
+        currentStrategy = decision.revisedStrategy;
+      }
+
+      // ACT: execute the decided action
+      const actionDesc = decision.nextAction?.description || decision.nextAction?.type || 'Action';
+      await hudUpdate(currentTabId, `explore-${step}`, 'processing', actionDesc);
+      await updateExplorationProgress(step, maxSteps, actionDesc, 'running');
+
+      const actionResult = await executeExploreAction(currentTabId, decision.nextAction);
+
+      // If navigation happened, update tab context
+      if (decision.nextAction.type === 'navigate' && actionResult.success) {
+        // Tab may have changed URL — re-inject script
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: currentTabId },
+            files: ['content_explore.js'],
+          });
+        } catch {}
+      }
+
+      stepLog.push({
+        step,
+        action: decision.nextAction,
+        reasoning: decision.reasoning,
+        result: { success: actionResult.success },
+        observation: actionResult.observation || actionResult.error || '',
+      });
+
+      if (actionResult.success) {
+        consecutiveFailures = 0;
+        await hudUpdate(currentTabId, `explore-${step}`, 'success', actionDesc);
+      } else {
+        consecutiveFailures++;
+        await hudUpdate(currentTabId, `explore-${step}`, 'error',
+          `Failed: ${actionResult.error || 'unknown error'}`);
+      }
+
+      // Brief pause between steps for page rendering
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    // Max steps reached or stopped
+    clearInterval(keepAlive);
+    clearTimeout(explorationTimeout);
+
+    // Build partial result from observations
+    const observations = stepLog
+      .filter(s => s.observation && s.result?.success)
+      .map(s => s.observation)
+      .join('\n');
+
+    await updateExplorationProgress(maxSteps, maxSteps,
+      consecutiveFailures >= 3 ? 'Stopped after repeated failures' : 'Max steps reached',
+      'partial');
+
+    return {
+      success: false,
+      goalResult: observations
+        ? `I explored ${stepLog.length} steps but couldn't fully complete the goal. Here's what I found:\n\n${observations}`
+        : 'I tried to explore but couldn\'t gather enough information. Try rephrasing your request.',
+      stepsUsed: stepLog.length,
+      creditsUsed,
+      stepLog,
+      partial: true,
+    };
+
+  } catch (err) {
+    clearInterval(keepAlive);
+    clearTimeout(explorationTimeout);
+    console.error('[Explore] Loop error:', err);
+    return { success: false, error: err.message || 'Exploration loop failed.', stepLog };
+  }
+}
+
 // --- Ghost-Driver: stageAction (AI-driven form filling) ---
 
 async function stageAction(tabId, userGoal, category, token) {
@@ -579,9 +1020,12 @@ async function stageAction(tabId, userGoal, category, token) {
     allSuccess ? `${results.length} action${results.length > 1 ? 's' : ''} completed` : 'Some actions failed'
   );
 
-  // Auto-hide HUD after 3 seconds on success
+  // Post-action verification: re-scrape page to detect success/error state
+  let pageStateAfter = null;
   if (allSuccess) {
-    setTimeout(() => hudHide(tabId), 3000);
+    await new Promise(r => setTimeout(r, 1500)); // Wait for SPA/AJAX to settle
+    pageStateAfter = await scrapePageState(tabId);
+    setTimeout(() => hudHide(tabId), 1500); // Auto-hide HUD (adjusted for the 1.5s wait)
   }
 
   return {
@@ -589,6 +1033,7 @@ async function stageAction(tabId, userGoal, category, token) {
     results,
     actionsPlanned: actions.length,
     actionsExecuted: results.length,
+    pageStateAfter,
   };
 }
 
@@ -901,7 +1346,8 @@ async function handleMessage(request, sender) {
       const err = await res.json().catch(() => ({}));
       // Categorize by HTTP status for more specific UI feedback
       let errorType = 'SERVER_ERROR';
-      if (res.status === 401 || res.status === 403) errorType = 'AUTH_ERROR';
+      if (res.status === 402 || err.errorType === 'INSUFFICIENT_CREDITS') errorType = 'INSUFFICIENT_CREDITS';
+      else if (res.status === 401 || res.status === 403) errorType = 'AUTH_ERROR';
       else if (res.status === 429) errorType = 'RATE_LIMITED';
       else if (res.status === 413 || (err.error && /token|limit|too long/i.test(err.error))) errorType = 'TOKEN_LIMIT';
       else if (res.status === 422) errorType = 'PARSE_ERROR';
@@ -967,10 +1413,12 @@ async function handleMessage(request, sender) {
         return { success: false, error: `Navigation to ${action.value} is not allowed.` };
       }
       const tab = await chrome.tabs.create({ url: action.value, active: true });
-      return { success: true, tabId: tab.id };
+      await waitForTabLoad(tab.id, 10000);
+      const pageStateAfter = await scrapePageState(tab.id);
+      return { success: true, tabId: tab.id, pageStateAfter };
     }
 
-    // semantic_fill: Ghost-Driver AI form filling
+    // semantic_fill: Ghost-Driver AI form filling (stageAction already returns pageStateAfter)
     if (action.action === 'semantic_fill') {
       return await stageAction(tabId, action.value || '', action.category || 'forms', token);
     }
@@ -989,6 +1437,13 @@ async function handleMessage(request, sender) {
       type: 'execute_dom_action',
       step: action,
     });
+
+    // Post-action verification for DOM actions
+    if (result?.success) {
+      await new Promise(r => setTimeout(r, 1500));
+      const pageStateAfter = await scrapePageState(tabId);
+      return { ...result, pageStateAfter };
+    }
     return result;
   }
 
@@ -1033,6 +1488,40 @@ async function handleMessage(request, sender) {
     }
 
     return await runOrchestration(userPrompt, searchPlan, token);
+  }
+
+  // ── EXPLORE: Multi-step agentic exploration loop ────────────
+  if (request.type === 'explore_start') {
+    const { explorePlan, tabId } = request.data;
+    if (!explorePlan || !explorePlan.goal) {
+      return { success: false, error: 'Invalid explore plan: no goal specified.' };
+    }
+    return await runExplorationLoop(explorePlan, tabId, token);
+  }
+
+  // ── EXPLORE RESUME: Continue a paused exploration after login ──
+  if (request.type === 'explore_resume') {
+    const { resumeStateKey } = request.data;
+    if (!resumeStateKey) {
+      return { success: false, error: 'No resume state key provided.' };
+    }
+
+    const stored = await chrome.storage.session.get([resumeStateKey]);
+    const resumeState = stored[resumeStateKey];
+
+    if (!resumeState) {
+      return { success: false, error: 'Resume state not found or expired. Please start a new exploration.' };
+    }
+
+    // Clean up saved state (will re-save if another pause occurs)
+    await chrome.storage.session.remove([resumeStateKey]);
+
+    return await runExplorationLoop(
+      resumeState.explorePlan,
+      resumeState.tabId,
+      token,
+      resumeState,
+    );
   }
 
   // ── SEMANTIC SCRAPE: On-demand semantic analysis of any tab ──

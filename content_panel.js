@@ -46,6 +46,7 @@
   let currentTabUrl = window.location.href;
   let currentSite = detectSite(currentTabUrl);
   let orchestrationListener = null;
+  let explorationListener = null;
   let conversationMessages = []; // { role: 'user'|'assistant', content: string, data?: object, timestamp: number }
 
   // ── Conversation Helpers ───────────────────────────────────────
@@ -546,6 +547,12 @@
       return;
     }
 
+    // EXPLORE: multi-step agentic exploration loop
+    if (res.data?.action_type === 'EXPLORE' && res.data?.explore_plan) {
+      renderExplorePlan(res.data, /* autoStart= */ res.data.consent_level === 'auto');
+      return;
+    }
+
     // FIND_AND_REPLY: auto-execute (searches inbox + pre-fills reply)
     if (res.data?.action_type === 'FIND_AND_REPLY') {
       await handleFindAndReply(res.data);
@@ -1040,8 +1047,17 @@
     // Execute immediately — no user approval needed
     executeAutoAction(data).then(res => {
       if (res?.success) {
-        statusEl.textContent = 'Done.';
-        statusEl.style.color = '#34d399';
+        const verification = interpretPageState(res.pageStateAfter);
+        if (verification?.type === 'success') {
+          statusEl.textContent = `Done \u2014 ${verification.snippet}`;
+          statusEl.style.color = '#34d399';
+        } else if (verification?.type === 'error') {
+          statusEl.textContent = `Action ran, but page shows: ${verification.snippet}`;
+          statusEl.style.color = '#fbbf24';
+        } else {
+          statusEl.textContent = 'Done.';
+          statusEl.style.color = '#34d399';
+        }
       } else {
         const errorType = res?.errorType || '';
         const errorMsg = res?.error || 'Action failed.';
@@ -1076,6 +1092,49 @@
       return sendToBackground('execute_action', { action: data.dom_actions[0], tabId: currentTabId });
     }
     return { success: false, error: 'No actions to execute.' };
+  }
+
+  // ── Post-Action Verification ──────────────────────────────────
+
+  const SUCCESS_INDICATORS = [
+    'added to cart', 'successfully', 'confirmed', 'thank you',
+    'order placed', 'submitted', 'saved', 'updated', 'complete',
+    'welcome back', 'signed in', 'logged in',
+  ];
+
+  const ERROR_INDICATORS = [
+    'error', 'failed', 'out of stock', 'unavailable', 'invalid',
+    'try again', 'something went wrong', 'not found',
+    'incorrect', 'expired', 'denied',
+  ];
+
+  function interpretPageState(pageStateAfter) {
+    if (!pageStateAfter?.mainContent) return null;
+    const content = pageStateAfter.mainContent.toLowerCase().slice(0, 2000);
+
+    for (const phrase of SUCCESS_INDICATORS) {
+      if (content.includes(phrase)) {
+        const idx = content.indexOf(phrase);
+        const snippet = pageStateAfter.mainContent.slice(
+          Math.max(0, idx - 20),
+          Math.min(pageStateAfter.mainContent.length, idx + 60)
+        ).trim();
+        return { type: 'success', snippet };
+      }
+    }
+
+    for (const phrase of ERROR_INDICATORS) {
+      if (content.includes(phrase)) {
+        const idx = content.indexOf(phrase);
+        const snippet = pageStateAfter.mainContent.slice(
+          Math.max(0, idx - 20),
+          Math.min(pageStateAfter.mainContent.length, idx + 60)
+        ).trim();
+        return { type: 'error', snippet };
+      }
+    }
+
+    return null;
   }
 
   // ── Agent Response ───────────────────────────────────────────
@@ -1277,7 +1336,16 @@
     }
 
     if (res?.success) {
-      container.innerHTML = '<p class="enh-success-message">Done! Action completed successfully.</p>';
+      const verification = interpretPageState(res.pageStateAfter);
+      let doneText = 'Done! Action completed successfully.';
+      let doneStyle = '';
+      if (verification?.type === 'success') {
+        doneText = `Done \u2014 ${verification.snippet}`;
+      } else if (verification?.type === 'error') {
+        doneText = `Action ran, but page shows: "${verification.snippet}"`;
+        doneStyle = ' style="color: #fbbf24;"';
+      }
+      container.innerHTML = `<p class="enh-success-message"${doneStyle}>${doneText}</p>`;
     } else {
       const errorMsg = res?.error || 'Action failed. Please try again.';
       if (errorMsg === 'BLOCKED_SENSITIVE') {
@@ -1376,6 +1444,393 @@
       wrapper.appendChild(card);
       resultsArea.appendChild(wrapper);
     }
+  }
+
+  // ── EXPLORE: Render plan card + run exploration loop ────────
+
+  function renderExplorePlan(data, autoStart = true) {
+    resultsArea.classList.remove('enh-hidden');
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'enh-msg enh-msg-assistant';
+
+    const card = document.createElement('div');
+    card.className = 'enh-action-card enh-consent-soft';
+
+    const headline = document.createElement('p');
+    headline.className = 'enh-action-headline';
+    headline.textContent = data.headline || 'Exploring...';
+    card.appendChild(headline);
+
+    const plan = data.explore_plan;
+
+    const planInfo = document.createElement('div');
+    planInfo.className = 'enh-orch-plan-info';
+
+    const goalEl = document.createElement('p');
+    goalEl.className = 'enh-orch-criteria';
+    goalEl.textContent = plan.goal;
+    goalEl.style.fontWeight = '500';
+    planInfo.appendChild(goalEl);
+
+    const strategyEl = document.createElement('p');
+    strategyEl.className = 'enh-orch-criteria';
+    strategyEl.style.opacity = '0.7';
+    strategyEl.style.fontSize = '11px';
+    strategyEl.textContent = `Strategy: ${plan.strategy}`;
+    planInfo.appendChild(strategyEl);
+
+    const budgetBadges = document.createElement('div');
+    budgetBadges.className = 'enh-orch-site-badges';
+
+    const stepBadge = document.createElement('span');
+    stepBadge.className = 'enh-orch-site-badge';
+    stepBadge.textContent = `${plan.maxSteps} steps`;
+    budgetBadges.appendChild(stepBadge);
+
+    const creditBadge = document.createElement('span');
+    creditBadge.className = 'enh-orch-site-badge';
+    creditBadge.textContent = `~${plan.creditBudget} EU`;
+    budgetBadges.appendChild(creditBadge);
+
+    planInfo.appendChild(budgetBadges);
+    card.appendChild(planInfo);
+
+    if (data.rationale) {
+      const rationale = document.createElement('p');
+      rationale.className = 'enh-action-rationale';
+      rationale.textContent = data.rationale;
+      card.appendChild(rationale);
+    }
+
+    if (autoStart) {
+      const statusEl = document.createElement('p');
+      statusEl.className = 'enh-action-rationale';
+      statusEl.textContent = 'Starting exploration...';
+      card.appendChild(statusEl);
+
+      wrapper.appendChild(card);
+      resultsArea.appendChild(wrapper);
+
+      setTimeout(() => {
+        startExploration(plan);
+      }, 800);
+    } else {
+      const btnRow = document.createElement('div');
+      btnRow.className = 'enh-action-btn-row';
+
+      const cancelBtn = document.createElement('button');
+      cancelBtn.className = 'enh-btn enh-consent-btn-cancel';
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.addEventListener('click', () => {
+        resultsArea.innerHTML = '';
+        resultsArea.classList.add('enh-hidden');
+      });
+      btnRow.appendChild(cancelBtn);
+
+      const exploreBtn = document.createElement('button');
+      exploreBtn.className = 'enh-btn enh-consent-btn-soft';
+      exploreBtn.textContent = 'Explore Now';
+      exploreBtn.addEventListener('click', () => {
+        startExploration(plan);
+      });
+      btnRow.appendChild(exploreBtn);
+
+      card.appendChild(btnRow);
+      wrapper.appendChild(card);
+      resultsArea.appendChild(wrapper);
+    }
+  }
+
+  async function startExploration(explorePlan) {
+    resultsArea.innerHTML = '';
+
+    const hud = document.createElement('div');
+    hud.className = 'enh-orch-hud';
+
+    const header = document.createElement('div');
+    header.className = 'enh-orch-header';
+
+    const badge = document.createElement('span');
+    badge.className = 'enh-orch-badge-label';
+    badge.textContent = 'Exploring';
+    header.appendChild(badge);
+
+    const statusEl = document.createElement('span');
+    statusEl.className = 'enh-orch-status';
+    statusEl.textContent = 'Starting...';
+    header.appendChild(statusEl);
+
+    hud.appendChild(header);
+
+    // Step log area
+    const stepLog = document.createElement('div');
+    stepLog.className = 'enh-explore-step-log';
+    stepLog.style.cssText = 'max-height: 200px; overflow-y: auto; padding: 6px 0;';
+    hud.appendChild(stepLog);
+
+    resultsArea.appendChild(hud);
+
+    // Listen for exploration progress
+    if (explorationListener) {
+      chrome.storage.onChanged.removeListener(explorationListener);
+    }
+
+    explorationListener = (changes) => {
+      if (!changes.explorationProgress) return;
+      const progress = changes.explorationProgress.newValue;
+      if (!progress) return;
+
+      statusEl.textContent = `Step ${progress.step}/${progress.total}: ${progress.description || ''}`;
+
+      // Add step entry to log
+      if (progress.step >= 0 && progress.description) {
+        const stepEntry = document.createElement('div');
+        stepEntry.style.cssText = 'display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 11px; color: rgba(255,255,255,0.7);';
+
+        const icon = document.createElement('span');
+        icon.style.cssText = 'font-size: 10px; width: 14px; text-align: center;';
+        if (progress.status === 'running') icon.textContent = '...';
+        else if (progress.status === 'complete') icon.textContent = '\u2713';
+        else if (progress.status === 'partial') icon.textContent = '\u25CB';
+        else if (progress.status === 'consent') icon.textContent = '\u26A0';
+        else if (progress.status === 'login_required') icon.textContent = '\uD83D\uDD12';
+        else icon.textContent = '\u2022';
+
+        const text = document.createElement('span');
+        text.textContent = progress.description;
+
+        stepEntry.appendChild(icon);
+        stepEntry.appendChild(text);
+
+        // Update last entry if same step, otherwise add new
+        const existing = stepLog.querySelector(`[data-step="${progress.step}"]`);
+        if (existing) {
+          existing.replaceWith(stepEntry);
+        } else {
+          stepLog.appendChild(stepEntry);
+        }
+        stepEntry.setAttribute('data-step', progress.step);
+        stepLog.scrollTop = stepLog.scrollHeight;
+      }
+    };
+
+    chrome.storage.onChanged.addListener(explorationListener);
+
+    // Get current tab
+    let tabId;
+    try {
+      const tabRes = await sendToBackground('GET_CURRENT_TAB', {});
+      tabId = tabRes?.tabId;
+    } catch {
+      tabId = null;
+    }
+
+    // Start exploration via background
+    const res = await sendToBackground('explore_start', { explorePlan, tabId }, 130000); // 130s timeout (120s loop + 10s buffer)
+
+    // Clean up listener
+    chrome.storage.onChanged.removeListener(explorationListener);
+    explorationListener = null;
+
+    // If paused for login, show login-required UI and wait for user action
+    if (res?.paused) {
+      renderLoginRequired(res.pauseReason, res.resumeStateKey);
+      return;
+    }
+
+    // Render final result
+    resultsArea.innerHTML = '';
+
+    if (res?.success || res?.goalResult) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'enh-msg enh-msg-assistant';
+
+      const card = document.createElement('div');
+      card.className = 'enh-action-card';
+
+      const headlineEl = document.createElement('p');
+      headlineEl.className = 'enh-action-headline';
+      headlineEl.textContent = res.success ? 'Exploration Complete' : 'Partial Results';
+      card.appendChild(headlineEl);
+
+      const resultEl = document.createElement('div');
+      resultEl.className = 'enh-action-rationale';
+      resultEl.style.whiteSpace = 'pre-wrap';
+      resultEl.textContent = res.goalResult || 'Exploration finished.';
+      card.appendChild(resultEl);
+
+      if (res.stepsUsed) {
+        const metaEl = document.createElement('p');
+        metaEl.style.cssText = 'font-size: 10px; opacity: 0.5; margin-top: 8px;';
+        metaEl.textContent = `${res.stepsUsed} steps \u00B7 ${(res.creditsUsed || 0).toFixed(1)} EU`;
+        card.appendChild(metaEl);
+      }
+
+      wrapper.appendChild(card);
+      resultsArea.appendChild(wrapper);
+    } else {
+      const errorCard = document.createElement('div');
+      errorCard.className = 'enh-action-card';
+      errorCard.innerHTML = `<p class="enh-error-message">${res?.error || 'Exploration failed. Please try again.'}</p>`;
+      resultsArea.appendChild(errorCard);
+    }
+
+    resultsArea.classList.remove('enh-hidden');
+    chatArea.scrollTop = chatArea.scrollHeight;
+  }
+
+  // ── Login Required: Pause exploration and wait for user login ──
+
+  function renderLoginRequired(pauseReason, resumeStateKey) {
+    resultsArea.classList.remove('enh-hidden');
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'enh-msg enh-msg-assistant';
+
+    const card = document.createElement('div');
+    card.className = 'enh-action-card enh-consent-soft';
+    card.style.cssText = 'border-color: rgba(245, 158, 11, 0.25); background: rgba(24, 18, 8, 0.85);';
+
+    // Headline row
+    const headlineRow = document.createElement('div');
+    headlineRow.style.cssText = 'display: flex; align-items: center; gap: 8px;';
+
+    const icon = document.createElement('span');
+    icon.style.cssText = 'font-size: 16px;';
+    icon.textContent = '\uD83D\uDD12'; // lock
+    headlineRow.appendChild(icon);
+
+    const headline = document.createElement('p');
+    headline.className = 'enh-action-headline';
+    headline.style.cssText = 'margin: 0; color: #fbbf24;';
+    headline.textContent = 'Login Required';
+    headlineRow.appendChild(headline);
+    card.appendChild(headlineRow);
+
+    const reason = document.createElement('p');
+    reason.className = 'enh-action-rationale';
+    reason.style.cssText = 'color: rgba(255,255,255,0.65); font-size: 12px;';
+    reason.textContent = pauseReason || 'The page I reached requires you to log in before I can continue.';
+    card.appendChild(reason);
+
+    const instructions = document.createElement('p');
+    instructions.style.cssText = 'font-size: 11px; color: rgba(255,255,255,0.4); margin: 0;';
+    instructions.textContent = 'Please sign in to the page, then click the button below.';
+    card.appendChild(instructions);
+
+    const resumeBtn = document.createElement('button');
+    resumeBtn.className = 'enh-btn enh-btn-primary enh-btn-sm';
+    resumeBtn.style.cssText = 'margin-top: 8px; background: #f59e0b; width: 100%;';
+    resumeBtn.textContent = "I've logged in \u2014 Resume";
+
+    resumeBtn.addEventListener('click', async () => {
+      resumeBtn.textContent = 'Resuming...';
+      resumeBtn.disabled = true;
+
+      // Remove the login card
+      wrapper.remove();
+
+      // Show resumed badge
+      const resumedBadge = document.createElement('div');
+      resumedBadge.style.cssText = 'font-size: 10px; color: rgba(255,255,255,0.4); padding: 4px 0; text-align: center;';
+      resumedBadge.textContent = '\u2014 Resuming exploration \u2014';
+      resultsArea.appendChild(resumedBadge);
+
+      // Re-attach progress listener
+      if (explorationListener) {
+        chrome.storage.onChanged.removeListener(explorationListener);
+      }
+
+      let stepLogEl = resultsArea.querySelector('.enh-explore-step-log');
+      if (!stepLogEl) {
+        stepLogEl = document.createElement('div');
+        stepLogEl.className = 'enh-explore-step-log';
+        stepLogEl.style.cssText = 'max-height: 200px; overflow-y: auto; padding: 6px 0;';
+        resultsArea.appendChild(stepLogEl);
+      }
+
+      const resumeStatusEl = document.createElement('span');
+      resumeStatusEl.style.cssText = 'font-size: 11px; color: rgba(255,255,255,0.5); padding: 4px 0; display: block;';
+      resumeStatusEl.textContent = 'Connecting...';
+      resultsArea.appendChild(resumeStatusEl);
+
+      explorationListener = (changes) => {
+        if (!changes.explorationProgress) return;
+        const progress = changes.explorationProgress.newValue;
+        if (!progress) return;
+        resumeStatusEl.textContent = `Step ${progress.step}/${progress.total}: ${progress.description || ''}`;
+        if (progress.step >= 0 && progress.description) {
+          const stepEntry = document.createElement('div');
+          stepEntry.style.cssText = 'display:flex;align-items:center;gap:6px;padding:3px 0;font-size:11px;color:rgba(255,255,255,0.7);';
+          const stepIcon = document.createElement('span');
+          stepIcon.style.cssText = 'font-size:10px;width:14px;text-align:center;';
+          if (progress.status === 'running') stepIcon.textContent = '...';
+          else if (progress.status === 'complete') stepIcon.textContent = '\u2713';
+          else if (progress.status === 'login_required') stepIcon.textContent = '\uD83D\uDD12';
+          else stepIcon.textContent = '\u2022';
+          const stepText = document.createElement('span');
+          stepText.textContent = progress.description;
+          stepEntry.appendChild(stepIcon);
+          stepEntry.appendChild(stepText);
+          const existing = stepLogEl.querySelector(`[data-step="${progress.step}"]`);
+          if (existing) existing.replaceWith(stepEntry);
+          else stepLogEl.appendChild(stepEntry);
+          stepEntry.setAttribute('data-step', progress.step);
+          stepLogEl.scrollTop = stepLogEl.scrollHeight;
+        }
+      };
+      chrome.storage.onChanged.addListener(explorationListener);
+
+      const res = await sendToBackground('explore_resume', { resumeStateKey }, 130000);
+
+      chrome.storage.onChanged.removeListener(explorationListener);
+      explorationListener = null;
+
+      // Another login page — recursive pause
+      if (res?.paused) {
+        renderLoginRequired(res.pauseReason, res.resumeStateKey);
+        return;
+      }
+
+      // Render final result
+      resultsArea.innerHTML = '';
+      if (res?.success || res?.goalResult) {
+        const rWrapper = document.createElement('div');
+        rWrapper.className = 'enh-msg enh-msg-assistant';
+        const rCard = document.createElement('div');
+        rCard.className = 'enh-action-card';
+        const h = document.createElement('p');
+        h.className = 'enh-action-headline';
+        h.textContent = res.success ? 'Exploration Complete' : 'Partial Results';
+        rCard.appendChild(h);
+        const r = document.createElement('div');
+        r.className = 'enh-action-rationale';
+        r.style.whiteSpace = 'pre-wrap';
+        r.textContent = res.goalResult || 'Exploration finished.';
+        rCard.appendChild(r);
+        if (res.stepsUsed) {
+          const m = document.createElement('p');
+          m.style.cssText = 'font-size:10px;opacity:0.5;margin-top:8px;';
+          m.textContent = `${res.stepsUsed} steps \u00B7 ${(res.creditsUsed || 0).toFixed(1)} EU`;
+          rCard.appendChild(m);
+        }
+        rWrapper.appendChild(rCard);
+        resultsArea.appendChild(rWrapper);
+      } else {
+        const errCard = document.createElement('div');
+        errCard.className = 'enh-action-card';
+        errCard.innerHTML = `<p class="enh-error-message">${res?.error || 'Exploration failed after resume.'}</p>`;
+        resultsArea.appendChild(errCard);
+      }
+      resultsArea.classList.remove('enh-hidden');
+      chatArea.scrollTop = chatArea.scrollHeight;
+    });
+
+    card.appendChild(resumeBtn);
+    wrapper.appendChild(card);
+    resultsArea.appendChild(wrapper);
+    chatArea.scrollTop = chatArea.scrollHeight;
   }
 
   async function startOrchestration(searchPlan, userPrompt) {
@@ -1660,6 +2115,7 @@
       '[RATE_LIMITED]': 'Too many requests — wait a moment and try again.',
       '[TOKEN_LIMIT]': 'Request too large — try a shorter prompt or clear conversation.',
       '[PARSE_ERROR]': 'Could not process that request — try rephrasing it.',
+      '[INSUFFICIENT_CREDITS]': 'Low Energy — you need more Energy Units to continue. Top up at enhancivity.com/dashboard/upgrade',
     };
 
     let displayMsg = msg;
@@ -1834,6 +2290,36 @@
     if (greeting) greeting.style.display = 'none';
     promptInput.focus();
     saveState();
+  });
+
+  // ── Briefing Action via window.postMessage (from dashboard_bridge.js) ──
+  // When a user clicks a dynamic action button on a Briefing card, the bridge
+  // sends the actionIntent here. We auto-fill AND auto-submit since the intent
+  // is AI-generated and ready to execute (no user editing needed).
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    if (event.data?.type !== 'ENHANCIVITY_BRIEFING_ACTION') return;
+    if (event.data?.source !== 'enhancivity-bridge') return;
+
+    const { actionIntent, buttonText, briefingId } = event.data.payload || {};
+    if (!actionIntent) return;
+
+    console.log('[Panel] Briefing action received:', buttonText, '| Intent:', actionIntent);
+
+    // Show panel if hidden
+    if (panel.classList.contains('enh-hidden')) {
+      panel.classList.remove('enh-hidden');
+    }
+
+    // Set the prompt to the actionIntent
+    promptInput.value = actionIntent;
+    submitBtn.disabled = false;
+    submitBtn.classList.add('active');
+
+    if (greeting) greeting.style.display = 'none';
+
+    // Auto-submit — the actionIntent is an AI-crafted instruction ready for execution
+    handleSubmit();
   });
 
   // ── Inline auth form (panel login) ──────────────────────────

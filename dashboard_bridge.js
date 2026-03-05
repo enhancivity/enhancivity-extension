@@ -89,6 +89,39 @@
         payload,
       }, '*');
     }
+
+    // ── BRIEFING_ACTION: Briefing dynamic action button ──
+    // 1. Ensure the floating panel is injected on this page
+    // 2. Send the actionIntent as an auto-fill prompt to the panel
+    if (event.data.type === 'BRIEFING_ACTION') {
+      const payload = event.data.payload;
+      console.log('[Bridge] Handling BRIEFING_ACTION:', payload?.buttonText, '| Intent:', payload?.actionIntent);
+
+      let panelReady = false;
+      try {
+        panelReady = await ensurePanelInjected();
+      } catch (err) {
+        if (err.message?.includes('Extension context invalidated')) {
+          console.warn('[Bridge] Extension was reloaded — page needs refresh');
+          alert('Enhancivity extension was updated. Please refresh this page (Ctrl+R) and try again.');
+          return;
+        }
+        console.error('[Bridge] Panel injection error:', err.message);
+      }
+
+      if (!panelReady) {
+        console.error('[Bridge] Could not inject panel — briefing action aborted');
+        return;
+      }
+
+      // Send briefing action to panel via window.postMessage
+      console.log('[Bridge] Sending briefing action to panel via window.postMessage');
+      window.postMessage({
+        type: 'ENHANCIVITY_BRIEFING_ACTION',
+        source: BRIDGE_SOURCE,
+        payload,
+      }, '*');
+    }
   });
 
   // ─── Extension → Dashboard ──────────────────────────────
