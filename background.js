@@ -52,6 +52,37 @@ function isAllowedUrl(url) {
   }
 }
 
+// --- BYOK: Retrieve user's own API key + provider + model preferences from local storage ---
+async function getByokKey() {
+  const { userApiKey } = await chrome.storage.local.get(['userApiKey']);
+  return userApiKey || null;
+}
+
+async function getByokConfig() {
+  const { userApiKey, userApiKeyProvider, userIntent, userSelectedModel, userCustomModel } = await chrome.storage.local.get([
+    'userApiKey', 'userApiKeyProvider', 'userIntent', 'userSelectedModel', 'userCustomModel'
+  ]);
+  return {
+    userApiKey: userApiKey || null,
+    userApiKeyProvider: userApiKeyProvider || null,
+    userIntent: userIntent || 'balanced',
+    userSelectedModel: userSelectedModel || null,
+    userCustomModel: userCustomModel || null,
+  };
+}
+
+// Spread helper: adds BYOK fields to API payloads only if a key is set
+function byokPayload(config) {
+  if (!config.userApiKey) return {};
+  return {
+    userApiKey: config.userApiKey,
+    userApiKeyProvider: config.userApiKeyProvider,
+    userIntent: config.userIntent,
+    ...(config.userSelectedModel && { userSelectedModel: config.userSelectedModel }),
+    ...(config.userCustomModel && { userCustomModel: config.userCustomModel }),
+  };
+}
+
 // --- Domain Blocklist for EXPLORE (relaxed navigation) ---
 
 const EXPLORE_BLOCKED_DOMAINS = [
@@ -359,6 +390,7 @@ async function spawnSearchTab(site, query, category, token) {
     console.log(`[Ghost-Driver] ${site}: mapped ${semanticMap.mappedCount} elements`);
 
     // Phase 2: Send semantic map to parse-intent for AI interpretation
+    const ghostByokConfig = await getByokConfig();
     const parseRes = await fetch(`${API_BASE}/api/agent/parse-intent`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -368,6 +400,7 @@ async function spawnSearchTab(site, query, category, token) {
         pageUrl: url,
         category: category || 'shopping',
         mode: 'extract_products',
+        ...byokPayload(ghostByokConfig),
       }),
     });
 
@@ -442,6 +475,7 @@ async function runOrchestration(userPrompt, searchPlan, token) {
     await updateOrchestrationProgress('comparing', `AI is comparing ${totalProducts} products...`);
 
     // Send to backend for trust-weighted comparison
+    const compareByokConfig = await getByokConfig();
     const compareRes = await fetch(`${API_BASE}/api/agent/compare`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -450,6 +484,7 @@ async function runOrchestration(userPrompt, searchPlan, token) {
         criteria: searchPlan.criteria,
         category: searchPlan.category,
         userPrompt,
+        ...byokPayload(compareByokConfig),
       }),
     });
 
@@ -702,6 +737,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
 
       let decision;
       try {
+        const exploreByokConfig = await getByokConfig();
         const thinkRes = await fetch(`${API_BASE}/api/agent/explore-step`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -712,6 +748,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
             maxSteps,
             previousActions: stepLog,
             currentPageState: snapshot,
+            ...byokPayload(exploreByokConfig),
           }),
         });
 
@@ -928,6 +965,7 @@ async function stageAction(tabId, userGoal, category, token) {
 
   // Step 2: Send to parse-intent in fill_form mode
   await hudUpdate(tabId, 'analyze', 'processing');
+  const fillByokConfig = await getByokConfig();
   const parseRes = await fetch(`${API_BASE}/api/agent/parse-intent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -937,6 +975,7 @@ async function stageAction(tabId, userGoal, category, token) {
       pageUrl: semanticMap.pageUrl,
       category: category || 'forms',
       mode: 'fill_form',
+      ...byokPayload(fillByokConfig),
     }),
   });
 
@@ -1061,6 +1100,20 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 async function handleMessage(request, sender) {
+
+  // ── MODEL REGISTRY: Fetch from backend for settings UI ───
+  if (request.type === 'fetch_model_registry') {
+    try {
+      const res = await fetch(`${API_BASE}/api/models`);
+      if (res.ok) {
+        const data = await res.json();
+        return { success: true, models: data.models || [] };
+      }
+      return { success: false, error: 'Failed to fetch model registry.' };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
 
   // ── TAB TRIAGE MAP: Zero-Token spatial awareness ─────────
   if (request.type === 'GET_TAB_TRIAGE_MAP') {
@@ -1330,13 +1383,14 @@ async function handleMessage(request, sender) {
       } catch { /* Some pages block injection — proceed without */ }
     }
 
-    // Send enriched payload to backend agent endpoint
+    // Send enriched payload to backend agent endpoint (dual-provider BYOK)
+    const byokConfig = await getByokConfig();
     let res;
     try {
       res = await fetch(`${API_BASE}/api/agent/process`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ userPrompt, pageContext: { ...pageContext, siteHint: siteHint || null }, userMemory, conversationHistory: conversationHistory || [] })
+        body: JSON.stringify({ userPrompt, pageContext: { ...pageContext, siteHint: siteHint || null }, userMemory, conversationHistory: conversationHistory || [], ...byokPayload(byokConfig) })
       });
     } catch (fetchErr) {
       return { success: false, errorType: 'NETWORK_ERROR', error: `Cannot reach server: ${fetchErr.message}` };
@@ -1490,6 +1544,13 @@ async function handleMessage(request, sender) {
     return await runOrchestration(userPrompt, searchPlan, token);
   }
 
+  // ── OPEN SETTINGS: Open popup in a new tab at #settings ────
+  if (request.type === 'open_settings') {
+    const popupUrl = chrome.runtime.getURL('popup/popup.html#settings');
+    await chrome.tabs.create({ url: popupUrl });
+    return { success: true };
+  }
+
   // ── EXPLORE: Multi-step agentic exploration loop ────────────
   if (request.type === 'explore_start') {
     const { explorePlan, tabId } = request.data;
@@ -1538,6 +1599,7 @@ async function handleMessage(request, sender) {
         return { success: false, error: 'Could not build semantic map from this page.' };
       }
 
+      const scrapeByokConfig = await getByokConfig();
       const parseRes = await fetch(`${API_BASE}/api/agent/parse-intent`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -1547,6 +1609,7 @@ async function handleMessage(request, sender) {
           pageUrl: semanticMap.pageUrl,
           category: category || 'general',
           mode: mode || 'extract_products',
+          ...byokPayload(scrapeByokConfig),
         }),
       });
 
@@ -1601,6 +1664,7 @@ async function handleMessage(request, sender) {
 
       const semanticMap = injected?.[0]?.result;
       if (semanticMap && semanticMap.elements?.length) {
+        const cartByokConfig = await getByokConfig();
         const parseRes = await fetch(`${API_BASE}/api/agent/parse-intent`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -1610,6 +1674,7 @@ async function handleMessage(request, sender) {
             pageUrl: url,
             category: 'shopping',
             mode: 'find_element',
+            ...byokPayload(cartByokConfig),
           }),
         });
 
@@ -1902,6 +1967,7 @@ async function handleDelegatedTask(taskId, taskTitle, taskDescription, authToken
 
   // 2. Ask AI agent for an execution plan
   if (hudTabId) await hudUpdate(hudTabId, 'plan', 'processing');
+  const delegateByokConfig = await getByokConfig();
   const agentRes = await fetch(`${API_BASE}/api/agent/process`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${activeToken}` },
@@ -1910,6 +1976,7 @@ async function handleDelegatedTask(taskId, taskTitle, taskDescription, authToken
       pageUrl: '',
       pageContent: '',
       siteType: 'delegation',
+      ...byokPayload(delegateByokConfig),
     }),
   });
 

@@ -102,6 +102,18 @@ async function initMainView() {
     setupAuthHandlers();
   });
 
+  // Settings gear
+  document.getElementById('settings-btn').addEventListener('click', () => {
+    showView('settings-view');
+    initSettingsView();
+  });
+
+  // BYOK badge: show if key exists
+  const { userApiKey } = await chrome.storage.local.get(['userApiKey']);
+  if (userApiKey) {
+    document.getElementById('byok-badge').classList.remove('hidden');
+  }
+
   // Input & send button interaction
   const submitBtn   = document.getElementById('submit-btn');
   const promptInput = document.getElementById('prompt-input');
@@ -298,6 +310,38 @@ async function handleFetchTasks(data) {
   document.getElementById('chat-area').scrollTop = document.getElementById('chat-area').scrollHeight;
 }
 
+// ── Billing Blocked ───────────────────────────────────────────
+
+function renderBillingBlocked(area, data) {
+  const card = document.createElement('div');
+  card.className = 'action-card';
+  card.style.borderColor = 'rgba(239, 68, 68, 0.3)';
+
+  if (data.headline) {
+    const headline = document.createElement('p');
+    headline.className = 'action-headline';
+    headline.textContent = data.headline;
+    card.appendChild(headline);
+  }
+
+  const msg = document.createElement('p');
+  msg.className = 'action-rationale';
+  msg.style.color = '#fca5a5';
+  msg.textContent = data._billing.message || `This action costs ${data._billing.requiredEU} EU but you have ${data._billing.balance.toFixed(1)} EU.`;
+  card.appendChild(msg);
+
+  const btn = document.createElement('button');
+  btn.className = 'action-btn approve';
+  btn.style.background = 'linear-gradient(135deg, #FDBBF5, #897DF0)';
+  btn.textContent = 'Top Up Energy Units';
+  btn.onclick = () => {
+    chrome.tabs.create({ url: 'https://enhancivity.com/dashboard/upgrade' });
+  };
+  card.appendChild(btn);
+
+  area.appendChild(card);
+}
+
 // ── Results Rendering ─────────────────────────────────────────
 
 function renderResults(data) {
@@ -306,6 +350,12 @@ function renderResults(data) {
   area.classList.remove('hidden');
 
   if (!data) { area.innerHTML = '<p class="no-results">No results returned.</p>'; return; }
+
+  // Billing blocked — show top-up prompt instead of action
+  if (data._billing?.blocked) {
+    renderBillingBlocked(area, data);
+    return;
+  }
 
   if (data.type === 'tasks') {
     renderTaskList(area, data.items || []);
@@ -1406,6 +1456,266 @@ function clearResults() {
   area.innerHTML = '';
   area.classList.add('hidden');
   document.getElementById('main-error').textContent = '';
+}
+
+// ── Settings View (BYOK + Model Selection) ────────────────────
+
+// Model registry cache (fetched from backend on settings init)
+let modelRegistry = [];
+
+async function fetchModelRegistry() {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'fetch_model_registry' });
+    if (response && response.success && response.models) {
+      modelRegistry = response.models;
+    }
+  } catch {
+    console.warn('[Settings] Could not fetch model registry — using defaults.');
+  }
+}
+
+// Provider-specific validation endpoints
+const PROVIDER_VALIDATION = {
+  openai: {
+    url: 'https://api.openai.com/v1/models',
+    method: 'GET',
+    authHeader: (key) => ({ Authorization: `Bearer ${key}` }),
+    keyPrefix: 'sk-',
+    placeholder: 'sk-...',
+    errorMsg: 'Key rejected by OpenAI. Check that it is valid and has credits.',
+  },
+  anthropic: {
+    url: 'https://api.anthropic.com/v1/messages',
+    method: 'POST',
+    authHeader: (key) => ({ 'x-api-key': key, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json', 'anthropic-dangerous-direct-browser-access': 'true' }),
+    body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 1, messages: [{ role: 'user', content: 'Hi' }] }),
+    keyPrefix: 'sk-ant-',
+    placeholder: 'sk-ant-api...',
+    errorMsg: 'Key rejected by Anthropic. Check that it is valid.',
+  },
+};
+
+// Resolve model label for current intent + provider
+function getModelLabelForIntent(provider, intent) {
+  if (!provider) return '';
+  const match = modelRegistry.find(m => m.provider === provider && m.intent === intent);
+  if (match) return match.label;
+  // Fallback defaults
+  const defaults = {
+    openai: { fast: 'GPT-4o Mini', balanced: 'GPT-4o', reasoning: 'o3 Mini' },
+    anthropic: { fast: 'Claude Haiku 4.5', balanced: 'Claude Sonnet 4.6', reasoning: 'Claude Opus 4.6' },
+  };
+  return (defaults[provider] || defaults.openai)[intent] || '';
+}
+
+async function initSettingsView() {
+  const backBtn         = document.getElementById('settings-back-btn');
+  const providerSelect  = document.getElementById('byok-provider-select');
+  const keyInput        = document.getElementById('api-key-input');
+  const keyLabel        = document.getElementById('api-key-label');
+  const statusEl        = document.getElementById('api-key-status');
+  const saveBtn         = document.getElementById('save-api-key-btn');
+  const clearBtn        = document.getElementById('clear-api-key-btn');
+  const trialInfo       = document.getElementById('byok-trial-info');
+  const intentBtns      = document.querySelectorAll('.intent-btn');
+  const intentModelLabel = document.getElementById('intent-model-label');
+  const advancedToggle  = document.getElementById('advanced-model-toggle');
+  const advancedPanel   = document.getElementById('advanced-model-panel');
+  const modelSelect     = document.getElementById('model-select');
+  const customModelInput = document.getElementById('custom-model-input');
+
+  // Fetch model registry
+  await fetchModelRegistry();
+
+  // Load saved state
+  const stored = await chrome.storage.local.get(['userApiKey', 'userApiKeyProvider', 'userIntent', 'userSelectedModel', 'userCustomModel']);
+  const savedProvider = stored.userApiKeyProvider || '';
+  const savedIntent = stored.userIntent || 'balanced';
+  const savedSelectedModel = stored.userSelectedModel || '';
+  const savedCustomModel = stored.userCustomModel || '';
+
+  // ── Provider select ─────────────────────────────────────────
+  if (savedProvider) {
+    providerSelect.value = savedProvider;
+    enableKeyInput(savedProvider);
+  }
+
+  // Show masked existing key if present
+  if (stored.userApiKey) {
+    const last4 = stored.userApiKey.slice(-4);
+    keyInput.value = '';
+    keyInput.placeholder = `•••••••${last4}`;
+  }
+
+  statusEl.classList.add('hidden');
+  trialInfo.classList.add('hidden');
+
+  function showStatus(msg, type) {
+    statusEl.textContent = msg;
+    statusEl.className = `api-key-status ${type}`;
+    statusEl.classList.remove('hidden');
+  }
+
+  function enableKeyInput(provider) {
+    const config = PROVIDER_VALIDATION[provider];
+    if (!config) return;
+    keyInput.disabled = false;
+    keyInput.placeholder = config.placeholder;
+    saveBtn.disabled = false;
+    keyLabel.textContent = `${provider === 'openai' ? 'OpenAI' : 'Anthropic'} API Key`;
+    populateModelDropdown(provider);
+    updateIntentLabel();
+  }
+
+  // Provider change
+  providerSelect.onchange = () => {
+    const provider = providerSelect.value;
+    if (!provider) return;
+    keyInput.value = '';
+    statusEl.classList.add('hidden');
+    enableKeyInput(provider);
+    chrome.storage.local.set({ userApiKeyProvider: provider });
+  };
+
+  // ── Intent slider ───────────────────────────────────────────
+  function updateIntentLabel() {
+    const provider = providerSelect.value || 'openai';
+    const activeBtn = document.querySelector('.intent-btn.active');
+    const intent = activeBtn?.dataset.intent || 'balanced';
+    const label = getModelLabelForIntent(provider, intent);
+    intentModelLabel.textContent = label ? `Using: ${label}` : '';
+  }
+
+  intentBtns.forEach(btn => {
+    // Restore saved intent
+    if (btn.dataset.intent === savedIntent) {
+      intentBtns.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+    }
+    btn.onclick = () => {
+      intentBtns.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      chrome.storage.local.set({ userIntent: btn.dataset.intent });
+      updateIntentLabel();
+    };
+  });
+  updateIntentLabel();
+
+  // ── Advanced model panel ────────────────────────────────────
+  advancedToggle.onclick = () => {
+    advancedPanel.classList.toggle('hidden');
+  };
+
+  function populateModelDropdown(provider) {
+    // Clear existing options (keep the first "auto" option)
+    while (modelSelect.options.length > 1) modelSelect.remove(1);
+    const providerModels = modelRegistry.filter(m => m.provider === provider);
+    providerModels.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = `${m.label} (${m.intent})`;
+      modelSelect.appendChild(opt);
+    });
+    // Restore saved selection
+    if (savedSelectedModel) modelSelect.value = savedSelectedModel;
+  }
+
+  modelSelect.onchange = () => {
+    chrome.storage.local.set({ userSelectedModel: modelSelect.value });
+  };
+
+  // Restore custom model
+  customModelInput.value = savedCustomModel;
+  customModelInput.oninput = () => {
+    chrome.storage.local.set({ userCustomModel: customModelInput.value.trim() });
+  };
+
+  // Populate dropdown if provider already selected
+  if (savedProvider) populateModelDropdown(savedProvider);
+
+  // ── Back → main view ───────────────────────────────────────
+  backBtn.onclick = () => initMainView();
+
+  // ── Save key (dual-provider validation) ────────────────────
+  saveBtn.onclick = async () => {
+    const provider = providerSelect.value;
+    if (!provider) { showStatus('Please select a provider first.', 'error'); return; }
+
+    const key = keyInput.value.trim();
+    if (!key) { showStatus('Please enter your API key.', 'error'); return; }
+    if (key.length < 20) {
+      showStatus('API key is too short (minimum 20 characters).', 'error');
+      return;
+    }
+
+    // Prefix mismatch check — catch wrong provider before hitting the API
+    if (provider === 'anthropic' && key.startsWith('sk-') && !key.startsWith('sk-ant-')) {
+      showStatus('This looks like an OpenAI key. Select OpenAI as your provider, or paste your Anthropic key (starts with sk-ant-).', 'error');
+      return;
+    }
+    if (provider === 'openai' && key.startsWith('sk-ant-')) {
+      showStatus('This looks like an Anthropic key. Select Anthropic as your provider, or paste your OpenAI key.', 'error');
+      return;
+    }
+
+    const config = PROVIDER_VALIDATION[provider];
+
+    showStatus(`Validating key with ${provider === 'openai' ? 'OpenAI' : 'Anthropic'}...`, 'info');
+    saveBtn.disabled = true;
+
+    try {
+      const fetchOpts = {
+        method: config.method,
+        headers: config.authHeader(key),
+      };
+      if (config.body) fetchOpts.body = config.body;
+
+      const res = await fetch(config.url, fetchOpts);
+      if (!res.ok) {
+        showStatus(config.errorMsg, 'error');
+        saveBtn.disabled = false;
+        return;
+      }
+    } catch {
+      showStatus(`Could not reach ${provider === 'openai' ? 'OpenAI' : 'Anthropic'} to validate. Check your internet.`, 'error');
+      saveBtn.disabled = false;
+      return;
+    }
+
+    await chrome.storage.local.set({ userApiKey: key, userApiKeyProvider: provider });
+    keyInput.value = '';
+    keyInput.placeholder = `•••••••${key.slice(-4)}`;
+    showStatus(`Key saved! You are now a BYOK user (${provider === 'openai' ? 'OpenAI' : 'Anthropic'}) with 10x cheaper pricing.`, 'success');
+    document.getElementById('byok-badge').classList.remove('hidden');
+    saveBtn.disabled = false;
+  };
+
+  // ── Clear key ──────────────────────────────────────────────
+  clearBtn.onclick = async () => {
+    await chrome.storage.local.remove(['userApiKey', 'userApiKeyProvider', 'userSelectedModel', 'userCustomModel']);
+    keyInput.value = '';
+    keyInput.disabled = true;
+    keyInput.placeholder = 'Select a provider first...';
+    providerSelect.value = '';
+    saveBtn.disabled = true;
+    customModelInput.value = '';
+    modelSelect.selectedIndex = 0;
+    showStatus('Key removed. Standard pricing applies.', 'info');
+    document.getElementById('byok-badge').classList.add('hidden');
+    trialInfo.classList.add('hidden');
+    intentModelLabel.textContent = '';
+  };
+}
+
+// Handle deep-link from panel (popup.html#settings)
+if (window.location.hash === '#settings') {
+  document.addEventListener('DOMContentLoaded', async () => {
+    const { token } = await chrome.storage.local.get(['token']);
+    if (token) {
+      showView('settings-view');
+      initSettingsView();
+    }
+  });
 }
 
 function showError(msg) {

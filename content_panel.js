@@ -136,8 +136,16 @@
           <span class="enh-memory-pulse"></span>
           <span class="enh-memory-text">MEMORY</span>
         </div>
+        <div class="enh-byok-badge enh-hidden" id="enh-byok-badge">
+          <span class="enh-byok-text">BYOK</span>
+        </div>
       </div>
       <div class="enh-header-right">
+        <button class="enh-icon-btn" id="enh-settings-btn" title="Settings">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
         <button class="enh-icon-btn enh-signout-btn" id="enh-signout-btn" title="Sign Out">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
@@ -243,6 +251,8 @@
   const promptInput  = $('#enh-prompt-input');
   const submitBtn    = $('#enh-submit-btn');
   const memoryInd    = $('#enh-memory-indicator');
+  const settingsBtn  = $('#enh-settings-btn');
+  const byokBadge    = $('#enh-byok-badge');
   const authFallback = $('#enh-auth-fallback');
 
   // ── Init ─────────────────────────────────────────────────────
@@ -274,6 +284,10 @@
     // Memory indicator
     const { userMemory } = await chrome.storage.local.get(['userMemory']);
     if (userMemory) memoryInd.classList.remove('enh-hidden');
+
+    // BYOK badge
+    const { userApiKey } = await chrome.storage.local.get(['userApiKey']);
+    if (userApiKey) byokBadge.classList.remove('enh-hidden');
 
     // Restore state if available
     await restoreState();
@@ -382,6 +396,9 @@
     chatArea.classList.add('enh-hidden');
     $('#enh-context-strip')?.classList.add('enh-hidden');
     $('.enh-input-area')?.classList.add('enh-hidden');
+  });
+  settingsBtn?.addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'open_settings' });
   });
 
   // ── Communication ────────────────────────────────────────────
@@ -736,12 +753,48 @@
 
   // ── Results Rendering ────────────────────────────────────────
 
+  function renderBillingBlocked(container, data) {
+    const card = document.createElement('div');
+    card.className = 'enh-action-card';
+    card.style.borderColor = 'rgba(239, 68, 68, 0.3)';
+
+    if (data.headline) {
+      const headline = document.createElement('p');
+      headline.className = 'enh-action-headline';
+      headline.textContent = data.headline;
+      card.appendChild(headline);
+    }
+
+    const msg = document.createElement('p');
+    msg.className = 'enh-action-rationale';
+    msg.style.color = '#fca5a5';
+    msg.textContent = data._billing.message || `This action costs ${data._billing.requiredEU} EU but you have ${data._billing.balance.toFixed(1)} EU.`;
+    card.appendChild(msg);
+
+    const btn = document.createElement('button');
+    btn.className = 'enh-action-btn enh-approve';
+    btn.style.background = 'linear-gradient(135deg, #FDBBF5, #897DF0)';
+    btn.textContent = 'Top Up Energy Units';
+    btn.onclick = () => {
+      window.open('https://enhancivity.com/dashboard/upgrade', '_blank');
+    };
+    card.appendChild(btn);
+
+    container.appendChild(card);
+  }
+
   function renderResultsInto(container, data) {
     if (!data) {
       const p = document.createElement('p');
       p.className = 'enh-no-results';
       p.textContent = 'No results returned.';
       container.appendChild(p);
+      return;
+    }
+
+    // Billing blocked — show top-up prompt instead of action
+    if (data._billing?.blocked) {
+      renderBillingBlocked(container, data);
       return;
     }
 
