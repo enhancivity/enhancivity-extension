@@ -7,11 +7,19 @@
 (() => {
   'use strict';
 
-  // Double-injection guard
+  // Double-injection guard — but allow re-init if DOM was removed (SPA navigation)
   if (window.__enhPanelLoaded) {
-    // Already loaded — toggle visibility
-    window.__enhPanelToggle?.();
-    return;
+    const hostStillInDom = document.getElementById('enh-panel-host');
+    if (hostStillInDom) {
+      // Panel still exists — just toggle visibility
+      window.__enhPanelToggle?.();
+      return;
+    }
+    // Panel DOM was removed (SPA page swap) — remove old message listener, re-initialize
+    if (window.__enhPanelMessageListener) {
+      chrome.runtime.onMessage.removeListener(window.__enhPanelMessageListener);
+    }
+    window.__enhPanelLoaded = false;
   }
   window.__enhPanelLoaded = true;
 
@@ -204,13 +212,13 @@
     <!-- Input Area -->
     <div class="enh-input-area">
       <div class="enh-input-pill">
-        <input
-          type="text"
+        <textarea
           class="enh-prompt-field"
           id="enh-prompt-input"
           placeholder="Command Enhancivity..."
           autocomplete="off"
-        >
+          rows="1"
+        ></textarea>
         <button class="enh-send-btn" id="enh-submit-btn" title="Send" disabled>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <line x1="12" y1="19" x2="12" y2="5"/>
@@ -222,13 +230,21 @@
 
     <!-- Auth fallback (shown if no token) -->
     <div class="enh-auth-fallback enh-hidden" id="enh-auth-fallback">
-      <p class="enh-auth-fallback-text">Sign in to Enhancivity</p>
+      <p class="enh-auth-fallback-text" id="enh-auth-title">Sign in to Enhancivity</p>
       <form id="enh-auth-form">
+        <input type="text" id="enh-auth-name" class="enh-auth-input enh-hidden" placeholder="Full name" autocomplete="name" />
         <input type="email" id="enh-auth-email" class="enh-auth-input" placeholder="Email" autocomplete="email" required />
         <input type="password" id="enh-auth-password" class="enh-auth-input" placeholder="Password" autocomplete="current-password" required />
+        <input type="password" id="enh-auth-new-password" class="enh-auth-input enh-hidden" placeholder="New password (min 6 characters)" autocomplete="new-password" />
         <button type="submit" class="enh-btn enh-btn-primary" id="enh-auth-submit">Sign In</button>
       </form>
       <p class="enh-auth-error enh-hidden" id="enh-auth-error"></p>
+      <p class="enh-auth-success enh-hidden" id="enh-auth-success"></p>
+      <div class="enh-auth-links">
+        <span class="enh-auth-link" id="enh-auth-toggle-signup">Create account</span>
+        <span class="enh-auth-link-sep" id="enh-auth-link-sep">|</span>
+        <span class="enh-auth-link" id="enh-auth-toggle-forgot">Forgot password?</span>
+      </div>
     </div>
   `;
 
@@ -291,6 +307,9 @@
 
     // Restore state if available
     await restoreState();
+
+    // Ensure panel state is persisted (so navigation re-injection knows panel is open)
+    await saveState();
 
     promptInput.focus();
   }
@@ -456,8 +475,8 @@
 
   document.addEventListener('keydown', (e) => {
     if (!isEnhInputFocused()) return;
-    // Handle Enter for submit
-    if (e.key === 'Enter') {
+    // Enter = submit, Shift+Enter = new line
+    if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       e.stopImmediatePropagation();
       handleSubmit();
@@ -481,6 +500,9 @@
     const hasText = promptInput.value.trim().length > 0;
     submitBtn.disabled = !hasText;
     submitBtn.classList.toggle('active', hasText);
+    // Auto-resize textarea (up to max-height set in CSS)
+    promptInput.style.height = 'auto';
+    promptInput.style.height = promptInput.scrollHeight + 'px';
   });
 
   submitBtn.addEventListener('click', () => handleSubmit());
@@ -505,6 +527,7 @@
     saveConversation();
 
     promptInput.value = '';
+    promptInput.style.height = 'auto';
     submitBtn.disabled = true;
     submitBtn.classList.remove('active');
 
@@ -1596,7 +1619,9 @@
   }
 
   async function startExploration(explorePlan) {
-    resultsArea.innerHTML = '';
+    // Wrap exploration HUD in an assistant bubble (preserves conversation above)
+    const exploreWrapper = document.createElement('div');
+    exploreWrapper.className = 'enh-msg enh-msg-assistant';
 
     const hud = document.createElement('div');
     hud.className = 'enh-orch-hud';
@@ -1622,7 +1647,10 @@
     stepLog.style.cssText = 'max-height: 200px; overflow-y: auto; padding: 6px 0;';
     hud.appendChild(stepLog);
 
-    resultsArea.appendChild(hud);
+    exploreWrapper.appendChild(hud);
+    resultsArea.appendChild(exploreWrapper);
+    resultsArea.classList.remove('enh-hidden');
+    chatArea.scrollTop = chatArea.scrollHeight;
 
     // Listen for exploration progress
     if (explorationListener) {
@@ -1674,7 +1702,7 @@
     let tabId;
     try {
       const tabRes = await sendToBackground('GET_CURRENT_TAB', {});
-      tabId = tabRes?.tabId;
+      tabId = tabRes?.tab?.id || null;
     } catch {
       tabId = null;
     }
@@ -1688,17 +1716,195 @@
 
     // If paused for login, show login-required UI and wait for user action
     if (res?.paused) {
+      conversationMessages.push({
+        role: 'assistant',
+        content: `[Exploration Paused] ${res.pauseReason || 'Login required to continue.'}`,
+        timestamp: Date.now(),
+      });
+      saveConversation();
       renderLoginRequired(res.pauseReason, res.resumeStateKey);
       return;
     }
 
-    // Render final result
-    resultsArea.innerHTML = '';
+    // Render final result inside the explore wrapper (replaces the HUD, keeps conversation above)
+    exploreWrapper.innerHTML = '';
 
     if (res?.success || res?.goalResult) {
-      const wrapper = document.createElement('div');
-      wrapper.className = 'enh-msg enh-msg-assistant';
+      const card = document.createElement('div');
+      card.className = 'enh-action-card';
 
+      const headlineEl = document.createElement('p');
+      headlineEl.className = 'enh-action-headline';
+      headlineEl.textContent = res.success ? 'Exploration Complete' : 'Partial Results';
+      card.appendChild(headlineEl);
+
+      const resultEl = document.createElement('div');
+      resultEl.className = 'enh-action-rationale';
+      resultEl.style.whiteSpace = 'pre-wrap';
+      resultEl.textContent = res.goalResult || 'Exploration finished.';
+      card.appendChild(resultEl);
+
+      if (res.stepsUsed) {
+        const metaEl = document.createElement('p');
+        metaEl.style.cssText = 'font-size: 10px; opacity: 0.5; margin-top: 8px;';
+        metaEl.textContent = `${res.stepsUsed} steps \u00B7 ${(res.creditsUsed || 0).toFixed(1)} EU`;
+        card.appendChild(metaEl);
+      }
+
+      exploreWrapper.appendChild(card);
+
+      // Push exploration result to conversation for follow-up context
+      const explorationResult = res.goalResult || 'Exploration completed.';
+      conversationMessages.push({
+        role: 'assistant',
+        content: `[Exploration Result] ${explorationResult}`,
+        data: { action_type: 'EXPLORE_RESULT', goalResult: explorationResult, stepsUsed: res.stepsUsed, creditsUsed: res.creditsUsed },
+        timestamp: Date.now(),
+      });
+      saveConversation();
+    } else {
+      const errorCard = document.createElement('div');
+      errorCard.className = 'enh-action-card';
+      errorCard.innerHTML = `<p class="enh-error-message">${res?.error || 'Exploration failed. Please try again.'}</p>`;
+      exploreWrapper.appendChild(errorCard);
+
+      // Push error to conversation so follow-ups have context
+      conversationMessages.push({
+        role: 'assistant',
+        content: `[Exploration Failed] ${res?.error || 'Exploration failed.'}`,
+        timestamp: Date.now(),
+      });
+      saveConversation();
+    }
+
+    resultsArea.classList.remove('enh-hidden');
+    chatArea.scrollTop = chatArea.scrollHeight;
+    promptInput.focus();
+  }
+
+  // ── Exploration Recovery (re-injected panel on new page) ──────
+
+  function attachExplorationHUD(activeState) {
+    // Re-create the live exploration HUD so the user sees progress on the new page
+    const exploreWrapper = document.createElement('div');
+    exploreWrapper.className = 'enh-msg enh-msg-assistant';
+    exploreWrapper.id = 'enh-explore-recovery-wrapper';
+
+    const hud = document.createElement('div');
+    hud.className = 'enh-orch-hud';
+
+    const header = document.createElement('div');
+    header.className = 'enh-orch-header';
+
+    const badge = document.createElement('span');
+    badge.className = 'enh-orch-badge-label';
+    badge.textContent = 'Exploring';
+    header.appendChild(badge);
+
+    const statusEl = document.createElement('span');
+    statusEl.className = 'enh-orch-status';
+    statusEl.textContent = activeState.goal ? `Goal: ${activeState.goal}` : 'In progress...';
+    header.appendChild(statusEl);
+
+    hud.appendChild(header);
+
+    const stepLog = document.createElement('div');
+    stepLog.className = 'enh-explore-step-log';
+    stepLog.style.cssText = 'max-height: 200px; overflow-y: auto; padding: 6px 0;';
+    hud.appendChild(stepLog);
+
+    exploreWrapper.appendChild(hud);
+    resultsArea.appendChild(exploreWrapper);
+    resultsArea.classList.remove('enh-hidden');
+    if (greeting) greeting.style.display = 'none';
+    chatArea.scrollTop = chatArea.scrollHeight;
+
+    // Show panel if minimized
+    panel.classList.remove('enh-hidden');
+
+    // Listen for progress updates from background.js
+    if (explorationListener) {
+      chrome.storage.onChanged.removeListener(explorationListener);
+    }
+
+    explorationListener = (changes) => {
+      if (changes.explorationProgress) {
+        const progress = changes.explorationProgress.newValue;
+        if (!progress) return;
+
+        statusEl.textContent = `Step ${progress.step}/${progress.total}: ${progress.description || ''}`;
+
+        if (progress.step >= 0 && progress.description) {
+          const stepEntry = document.createElement('div');
+          stepEntry.style.cssText = 'display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 11px; color: rgba(255,255,255,0.7);';
+
+          const icon = document.createElement('span');
+          icon.style.cssText = 'font-size: 10px; width: 14px; text-align: center;';
+          if (progress.status === 'running') icon.textContent = '...';
+          else if (progress.status === 'complete') icon.textContent = '\u2713';
+          else if (progress.status === 'partial') icon.textContent = '\u25CB';
+          else if (progress.status === 'consent') icon.textContent = '\u26A0';
+          else if (progress.status === 'login_required') icon.textContent = '\uD83D\uDD12';
+          else icon.textContent = '\u2022';
+
+          const text = document.createElement('span');
+          text.textContent = progress.description;
+
+          stepEntry.appendChild(icon);
+          stepEntry.appendChild(text);
+
+          const existing = stepLog.querySelector(`[data-step="${progress.step}"]`);
+          if (existing) {
+            existing.replaceWith(stepEntry);
+          } else {
+            stepLog.appendChild(stepEntry);
+          }
+          stepEntry.setAttribute('data-step', progress.step);
+          stepLog.scrollTop = stepLog.scrollHeight;
+        }
+      }
+
+      // Detect when exploration finishes (explorationActive removed)
+      if (changes.explorationActive && !changes.explorationActive.newValue) {
+        // Exploration ended — check for result
+        chrome.storage.session.get(['explorationResult']).then((data) => {
+          if (data.explorationResult) {
+            showExplorationResult(data.explorationResult);
+            chrome.storage.session.remove('explorationResult').catch(() => {});
+          }
+          // Clean up listener
+          if (explorationListener) {
+            chrome.storage.onChanged.removeListener(explorationListener);
+            explorationListener = null;
+          }
+        });
+      }
+    };
+
+    chrome.storage.onChanged.addListener(explorationListener);
+  }
+
+  function showExplorationResult(res) {
+    // Remove recovery HUD if present
+    const recoveryWrapper = resultsArea.querySelector('#enh-explore-recovery-wrapper');
+    if (recoveryWrapper) recoveryWrapper.remove();
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'enh-msg enh-msg-assistant';
+
+    if (res.paused) {
+      // Login pause — show login required UI
+      conversationMessages.push({
+        role: 'assistant',
+        content: `[Exploration Paused] ${res.pauseReason || 'Login required to continue.'}`,
+        timestamp: Date.now(),
+      });
+      saveConversation();
+      renderLoginRequired(res.pauseReason, res.resumeStateKey);
+      return;
+    }
+
+    if (res.success || res.goalResult) {
       const card = document.createElement('div');
       card.className = 'enh-action-card';
 
@@ -1721,16 +1927,32 @@
       }
 
       wrapper.appendChild(card);
-      resultsArea.appendChild(wrapper);
+
+      conversationMessages.push({
+        role: 'assistant',
+        content: `[Exploration Result] ${res.goalResult || 'Exploration completed.'}`,
+        data: { action_type: 'EXPLORE_RESULT', goalResult: res.goalResult, stepsUsed: res.stepsUsed, creditsUsed: res.creditsUsed },
+        timestamp: Date.now(),
+      });
+      saveConversation();
     } else {
       const errorCard = document.createElement('div');
       errorCard.className = 'enh-action-card';
-      errorCard.innerHTML = `<p class="enh-error-message">${res?.error || 'Exploration failed. Please try again.'}</p>`;
-      resultsArea.appendChild(errorCard);
+      errorCard.innerHTML = `<p class="enh-error-message">${res.error || 'Exploration failed. Please try again.'}</p>`;
+      wrapper.appendChild(errorCard);
+
+      conversationMessages.push({
+        role: 'assistant',
+        content: `[Exploration Failed] ${res.error || 'Exploration failed.'}`,
+        timestamp: Date.now(),
+      });
+      saveConversation();
     }
 
+    resultsArea.appendChild(wrapper);
     resultsArea.classList.remove('enh-hidden');
     chatArea.scrollTop = chatArea.scrollHeight;
+    promptInput.focus();
   }
 
   // ── Login Required: Pause exploration and wait for user login ──
@@ -1769,15 +1991,64 @@
 
     const instructions = document.createElement('p');
     instructions.style.cssText = 'font-size: 11px; color: rgba(255,255,255,0.4); margin: 0;';
-    instructions.textContent = 'Please sign in to the page, then click the button below.';
+    instructions.textContent = 'Sign in on this page. The agent will detect when you\u2019re done and resume automatically.';
     card.appendChild(instructions);
+
+    // Auto-resume indicator
+    const autoResumeHint = document.createElement('div');
+    autoResumeHint.style.cssText = 'display: flex; align-items: center; gap: 6px; margin-top: 8px; padding: 6px 8px; background: rgba(245, 158, 11, 0.08); border-radius: 6px;';
+    const pulseEl = document.createElement('span');
+    pulseEl.style.cssText = 'width: 6px; height: 6px; border-radius: 50%; background: #f59e0b; animation: enh-pulse-amber 1.5s ease-in-out infinite;';
+    const hintText = document.createElement('span');
+    hintText.style.cssText = 'font-size: 10px; color: rgba(245, 158, 11, 0.7);';
+    hintText.textContent = 'Watching for login completion\u2026 will auto-resume';
+    autoResumeHint.appendChild(pulseEl);
+    autoResumeHint.appendChild(hintText);
+    card.appendChild(autoResumeHint);
+
+    // Inject pulse animation if not already present
+    if (!document.getElementById('enh-amber-pulse-style')) {
+      const style = document.createElement('style');
+      style.id = 'enh-amber-pulse-style';
+      style.textContent = '@keyframes enh-pulse-amber { 0%,100% { opacity:1; } 50% { opacity:0.3; } }';
+      document.head.appendChild(style);
+    }
 
     const resumeBtn = document.createElement('button');
     resumeBtn.className = 'enh-btn enh-btn-primary enh-btn-sm';
-    resumeBtn.style.cssText = 'margin-top: 8px; background: #f59e0b; width: 100%;';
-    resumeBtn.textContent = "I've logged in \u2014 Resume";
+    resumeBtn.style.cssText = 'margin-top: 8px; background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.3); color: #fbbf24; width: 100%;';
+    resumeBtn.textContent = "Or click here to resume manually";
+
+    // Auto-resume detection: the background's watchForLoginCompletion
+    // updates explorationProgress when login is detected. Listen for it
+    // and switch the UI from "waiting for login" to "running" automatically.
+    const autoResumeListener = (changes) => {
+      if (!changes.explorationProgress) return;
+      const progress = changes.explorationProgress.newValue;
+      if (!progress || progress.status === 'login_required') return;
+
+      // Login detected — auto-resume is happening in the background
+      chrome.storage.onChanged.removeListener(autoResumeListener);
+      hintText.textContent = 'Login detected! Resuming\u2026';
+      pulseEl.style.background = '#22c55e';
+      resumeBtn.textContent = 'Auto-resuming\u2026';
+      resumeBtn.disabled = true;
+
+      // The background watcher handles the full resume loop.
+      // Replace the login card with a progress tracker.
+      setTimeout(() => {
+        wrapper.remove();
+        const resumedBadge = document.createElement('div');
+        resumedBadge.style.cssText = 'font-size: 10px; color: rgba(99, 102, 241, 0.6); padding: 4px 0; text-align: center;';
+        resumedBadge.textContent = '\u2014 Auto-resumed after login \u2014';
+        resultsArea.appendChild(resumedBadge);
+      }, 1500);
+    };
+    chrome.storage.onChanged.addListener(autoResumeListener);
 
     resumeBtn.addEventListener('click', async () => {
+      // Manual resume — remove auto-resume listener
+      chrome.storage.onChanged.removeListener(autoResumeListener);
       resumeBtn.textContent = 'Resuming...';
       resumeBtn.disabled = true;
 
@@ -1870,14 +2141,32 @@
         }
         rWrapper.appendChild(rCard);
         resultsArea.appendChild(rWrapper);
+
+        // Push resumed exploration result to conversation
+        const explorationResult = res.goalResult || 'Exploration completed.';
+        conversationMessages.push({
+          role: 'assistant',
+          content: `[Exploration Result] ${explorationResult}`,
+          data: { action_type: 'EXPLORE_RESULT', goalResult: explorationResult, stepsUsed: res.stepsUsed, creditsUsed: res.creditsUsed },
+          timestamp: Date.now(),
+        });
+        saveConversation();
       } else {
         const errCard = document.createElement('div');
         errCard.className = 'enh-action-card';
         errCard.innerHTML = `<p class="enh-error-message">${res?.error || 'Exploration failed after resume.'}</p>`;
         resultsArea.appendChild(errCard);
+
+        conversationMessages.push({
+          role: 'assistant',
+          content: `[Exploration Failed] ${res?.error || 'Exploration failed after resume.'}`,
+          timestamp: Date.now(),
+        });
+        saveConversation();
       }
       resultsArea.classList.remove('enh-hidden');
       chatArea.scrollTop = chatArea.scrollHeight;
+      promptInput.focus();
     });
 
     card.appendChild(resumeBtn);
@@ -1887,7 +2176,9 @@
   }
 
   async function startOrchestration(searchPlan, userPrompt) {
-    resultsArea.innerHTML = '';
+    // Wrap orchestration HUD in an assistant bubble (preserves conversation above)
+    const orchWrapper = document.createElement('div');
+    orchWrapper.className = 'enh-msg enh-msg-assistant';
 
     const hud = document.createElement('div');
     hud.className = 'enh-orch-hud';
@@ -1920,7 +2211,10 @@
     }
 
     hud.appendChild(sitesRow);
-    resultsArea.appendChild(hud);
+    orchWrapper.appendChild(hud);
+    resultsArea.appendChild(orchWrapper);
+    resultsArea.classList.remove('enh-hidden');
+    chatArea.scrollTop = chatArea.scrollHeight;
 
     // Listen for progress
     if (orchestrationListener) {
@@ -1963,11 +2257,29 @@
     orchestrationListener = null;
 
     if (!res?.success) {
-      resultsArea.innerHTML = `<div class="enh-action-card"><p class="enh-error-message">${res?.error || 'Search failed. Please try again.'}</p></div>`;
+      orchWrapper.innerHTML = `<div class="enh-action-card"><p class="enh-error-message">${res?.error || 'Search failed. Please try again.'}</p></div>`;
+      conversationMessages.push({
+        role: 'assistant',
+        content: `[Search Failed] ${res?.error || 'Search failed.'}`,
+        timestamp: Date.now(),
+      });
+      saveConversation();
       return;
     }
 
-    renderComparison(resultsArea, res.data);
+    // Replace HUD with comparison results inside the wrapper
+    orchWrapper.innerHTML = '';
+    renderComparison(orchWrapper, res.data);
+
+    // Push orchestration result to conversation for follow-up context
+    conversationMessages.push({
+      role: 'assistant',
+      content: `[Search Result] ${res.data?.summary || 'Search completed.'}`,
+      data: res.data,
+      timestamp: Date.now(),
+    });
+    saveConversation();
+    promptInput.focus();
   }
 
   function renderComparison(container, data) {
@@ -2249,6 +2561,20 @@
         conversationMessages = enhConversation;
         rebuildChatThread();
       }
+
+      // ── Exploration Recovery ──────────────────────────────────
+      // If we were re-injected during an active exploration, re-attach the progress HUD
+      const exploreState = await chrome.storage.session.get(['explorationActive', 'explorationResult']);
+
+      if (exploreState.explorationResult && !exploreState.explorationActive) {
+        // Exploration finished while panel was being re-injected — show final result
+        const res = exploreState.explorationResult;
+        showExplorationResult(res);
+        await chrome.storage.session.remove('explorationResult');
+      } else if (exploreState.explorationActive) {
+        // Exploration is still running — show live HUD
+        attachExplorationHUD(exploreState.explorationActive);
+      }
     } catch {
       // non-critical
     }
@@ -2256,14 +2582,17 @@
 
   // ── Message Listener (from background.js) ────────────────────
 
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Store listener reference on window so SPA re-init can remove it
+  window.__enhPanelMessageListener = (message, sender, sendResponse) => {
     if (message.type === 'enh_panel_toggle') {
       togglePanel();
       sendResponse({ ok: true });
       return true;
     }
     if (message.type === 'enh_panel_ping') {
-      sendResponse({ ok: true });
+      // Only report "ok" if the panel DOM is actually in the page
+      const hostAlive = !!document.getElementById('enh-panel-host');
+      sendResponse({ ok: hostAlive });
       return true;
     }
     if (message.type === 'TASK_COMPLETE') {
@@ -2307,7 +2636,8 @@
       sendResponse({ ok: true });
       return true;
     }
-  });
+  };
+  chrome.runtime.onMessage.addListener(window.__enhPanelMessageListener);
 
   // ── Delegate Auto-Fill via window.postMessage (from dashboard_bridge.js) ──
   // Bridge and panel are both content scripts on the same page, so window.postMessage works.
@@ -2375,36 +2705,149 @@
     handleSubmit();
   });
 
-  // ── Inline auth form (panel login) ──────────────────────────
+  // ── Inline auth form (panel login / signup / reset) ─────────
 
   const authForm    = $('#enh-auth-form');
   const authSubmit  = $('#enh-auth-submit');
   const authError   = $('#enh-auth-error');
+  const authSuccess = $('#enh-auth-success');
+  let authMode = 'signin'; // 'signin' | 'signup' | 'resetpw'
+
+  function setAuthMode(mode) {
+    authMode = mode;
+    const nameField    = $('#enh-auth-name');
+    const pwField      = $('#enh-auth-password');
+    const newPwField   = $('#enh-auth-new-password');
+    const title        = $('#enh-auth-title');
+    const toggleSignup = $('#enh-auth-toggle-signup');
+    const toggleForgot = $('#enh-auth-toggle-forgot');
+    const linkSep      = $('#enh-auth-link-sep');
+
+    authError?.classList.add('enh-hidden');
+    authSuccess?.classList.add('enh-hidden');
+
+    if (mode === 'signin') {
+      title.textContent = 'Sign in to Enhancivity';
+      nameField.classList.add('enh-hidden');
+      pwField.classList.remove('enh-hidden');
+      pwField.placeholder = 'Password';
+      newPwField.classList.add('enh-hidden');
+      authSubmit.textContent = 'Sign In';
+      toggleSignup.textContent = 'Create account';
+      toggleForgot?.classList.remove('enh-hidden');
+      linkSep?.classList.remove('enh-hidden');
+    } else if (mode === 'signup') {
+      title.textContent = 'Create your account';
+      nameField.classList.remove('enh-hidden');
+      pwField.classList.remove('enh-hidden');
+      pwField.placeholder = 'Password (min 6 characters)';
+      newPwField.classList.add('enh-hidden');
+      authSubmit.textContent = 'Sign Up';
+      toggleSignup.textContent = 'Already have an account? Sign in';
+      toggleForgot?.classList.add('enh-hidden');
+      linkSep?.classList.add('enh-hidden');
+    } else if (mode === 'resetpw') {
+      title.textContent = 'Reset your password';
+      nameField.classList.add('enh-hidden');
+      pwField.classList.add('enh-hidden');
+      newPwField.classList.remove('enh-hidden');
+      authSubmit.textContent = 'Reset Password';
+      toggleSignup.textContent = 'Back to sign in';
+      toggleForgot?.classList.add('enh-hidden');
+      linkSep?.classList.add('enh-hidden');
+    }
+    authSubmit.disabled = false;
+  }
+
+  $('#enh-auth-toggle-signup')?.addEventListener('click', () => {
+    setAuthMode(authMode === 'signin' ? 'signup' : 'signin');
+  });
+  $('#enh-auth-toggle-forgot')?.addEventListener('click', () => {
+    setAuthMode('resetpw');
+  });
 
   if (authForm) {
     authForm.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const email    = $('#enh-auth-email').value.trim();
-      const password = $('#enh-auth-password').value;
-      if (!email || !password) return;
-
-      authSubmit.textContent = 'Signing in...';
+      const email = $('#enh-auth-email').value.trim();
       authSubmit.disabled = true;
       authError.classList.add('enh-hidden');
+      authSuccess?.classList.add('enh-hidden');
 
-      const res = await sendToBackground('extension_login', { email, password });
+      if (authMode === 'signin') {
+        const password = $('#enh-auth-password').value;
+        if (!email || !password) { authSubmit.disabled = false; return; }
+        authSubmit.textContent = 'Signing in...';
 
-      if (res?.success) {
-        // Hide auth, show main UI
-        authFallback.classList.add('enh-hidden');
-        chatArea.classList.remove('enh-hidden');
-        $('#enh-context-strip')?.classList.remove('enh-hidden');
-        $('.enh-input-area')?.classList.remove('enh-hidden');
-        await init();
-      } else {
-        authError.textContent = res?.message || 'Login failed. Check your email and password.';
-        authError.classList.remove('enh-hidden');
-        authSubmit.textContent = 'Sign In';
+        const res = await sendToBackground('extension_login', { email, password });
+        if (res?.success) {
+          authFallback.classList.add('enh-hidden');
+          chatArea.classList.remove('enh-hidden');
+          $('#enh-context-strip')?.classList.remove('enh-hidden');
+          $('.enh-input-area')?.classList.remove('enh-hidden');
+          await init();
+        } else {
+          authError.textContent = res?.message || 'Login failed. Check your email and password.';
+          authError.classList.remove('enh-hidden');
+          authSubmit.textContent = 'Sign In';
+          authSubmit.disabled = false;
+        }
+
+      } else if (authMode === 'signup') {
+        const name = $('#enh-auth-name').value.trim();
+        const password = $('#enh-auth-password').value;
+        if (!name || !email || !password) { authSubmit.disabled = false; return; }
+        if (name.length < 2) {
+          authError.textContent = 'Name must be at least 2 characters.';
+          authError.classList.remove('enh-hidden');
+          authSubmit.disabled = false;
+          return;
+        }
+        if (password.length < 6) {
+          authError.textContent = 'Password must be at least 6 characters.';
+          authError.classList.remove('enh-hidden');
+          authSubmit.disabled = false;
+          return;
+        }
+        authSubmit.textContent = 'Creating account...';
+
+        const res = await sendToBackground('extension_signup', { name, email, password });
+        if (res?.success) {
+          authFallback.classList.add('enh-hidden');
+          chatArea.classList.remove('enh-hidden');
+          $('#enh-context-strip')?.classList.remove('enh-hidden');
+          $('.enh-input-area')?.classList.remove('enh-hidden');
+          await init();
+        } else {
+          authError.textContent = res?.message || 'Sign up failed.';
+          authError.classList.remove('enh-hidden');
+          authSubmit.textContent = 'Sign Up';
+          authSubmit.disabled = false;
+        }
+
+      } else if (authMode === 'resetpw') {
+        const newPassword = $('#enh-auth-new-password').value;
+        if (!email || !newPassword) { authSubmit.disabled = false; return; }
+        if (newPassword.length < 6) {
+          authError.textContent = 'Password must be at least 6 characters.';
+          authError.classList.remove('enh-hidden');
+          authSubmit.disabled = false;
+          return;
+        }
+        authSubmit.textContent = 'Resetting...';
+
+        const res = await sendToBackground('extension_reset_password', { email, newPassword });
+        if (res?.success) {
+          if (authSuccess) {
+            authSuccess.textContent = res.message || 'Password reset. You can now sign in.';
+            authSuccess.classList.remove('enh-hidden');
+          }
+          setTimeout(() => setAuthMode('signin'), 2000);
+        } else {
+          authError.textContent = res?.message || 'Password reset failed.';
+          authError.classList.remove('enh-hidden');
+        }
+        authSubmit.textContent = 'Reset Password';
         authSubmit.disabled = false;
       }
     });

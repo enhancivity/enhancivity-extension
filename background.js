@@ -13,6 +13,9 @@
 const API_BASE = 'https://service.enhancivity.com';
 const MEMORY_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
+// Allow content scripts to access chrome.storage.session (required for conversation persistence + exploration recovery)
+chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' });
+
 // --- URL Allowlist for Navigate Actions (v1 safety) ---
 
 const ALLOWED_DOMAINS = [
@@ -92,10 +95,12 @@ const EXPLORE_BLOCKED_DOMAINS = [
   'vanguard.com', 'tdameritrade.com', 'ally.com', 'discover.com',
   // Healthcare
   'myhealth.va.gov', 'mychart.com',
-  // Auth pages
-  'accounts.google.com', 'login.microsoftonline.com', 'auth0.com',
   // Payment processors
   'paypal.com', 'venmo.com', 'zelle.com',
+  // Note: OAuth providers (accounts.google.com, login.microsoftonline.com)
+  // are NOT blocked — users need them for Google/Microsoft login on third-party
+  // sites. The content_explore.js safety guards prevent AI from interacting
+  // with password fields and sensitive inputs.
 ];
 
 function isAllowedForExplore(url) {
@@ -110,6 +115,317 @@ function isAllowedForExplore(url) {
   } catch {
     return false;
   }
+}
+
+// ─── Authentication Bridge ──────────────────────────────────
+// 3-Layer system for handling login-required sites during EXPLORE:
+//   Layer 1: Session Detection — check cookies + existing tabs
+//   Layer 2: Smart Login Bypass — navigate to authenticated app URL
+//   Layer 3: Session Persistence — remember authenticated sites
+
+// Known app URLs that bypass landing/login pages when user has cookies.
+// Used as HINTS — the generic bypass logic works for any site, but these
+// give a faster path for popular apps. Key = base domain (no www).
+const SESSION_BYPASS_HINTS = {
+  'figma.com':       '/files/recents-and-sharing',
+  'canva.com':       '/folder/all-designs',
+  'facebook.com':    '/',
+  'trello.com':      '/u/me/boards',
+  'notion.so':       '/',
+  'github.com':      '/dashboard',
+  'twitter.com':     '/home',
+  'x.com':           '/home',
+  'linkedin.com':    '/feed/',
+  'instagram.com':   '/',
+  'docs.google.com': '/document/u/0/',
+  'drive.google.com':'/drive/my-drive',
+  'sheets.google.com':'/spreadsheets/u/0/',
+  'slides.google.com':'/presentation/u/0/',
+};
+
+// Common auth cookie name patterns that indicate an active session
+const AUTH_COOKIE_PATTERNS = [
+  'session', 'token', 'auth', 'logged_in', 'sid', 'csrf',
+  '__Host-next-auth', '__Secure-next-auth', '_gh_sess',
+  'connect.sid', 'JSESSIONID', 'PHPSESSID', 'li_at',
+  'c_user', 'xs',  // Facebook
+  'figma.authn', '__cf_bm',
+];
+
+/**
+ * Layer 1: Probe whether the user has an existing session for a domain.
+ * Checks: (1) other open tabs on that domain, (2) auth cookies.
+ * @param {string} domain — e.g. "www.figma.com"
+ * @returns {{ hasSession: boolean, method: string, detail?: string }}
+ */
+async function probeExistingSession(domain) {
+  // Strip www. for matching flexibility
+  const baseDomain = domain.replace(/^www\./, '');
+
+  // Check 1: Is the user already on this site in another tab (and NOT on a login page)?
+  try {
+    const tabs = await chrome.tabs.query({});
+    const domainTabs = tabs.filter(t => {
+      try {
+        const host = new URL(t.url).hostname;
+        return host === domain || host === `www.${baseDomain}` || host.endsWith(`.${baseDomain}`);
+      } catch { return false; }
+    });
+
+    if (domainTabs.length > 0) {
+      // User has this site open — cookies are shared, session likely active
+      return { hasSession: true, method: 'existing_tab', detail: `Found ${domainTabs.length} open tab(s) on ${baseDomain}` };
+    }
+  } catch (e) {
+    console.warn('[AuthBridge] Tab query failed:', e.message);
+  }
+
+  // Check 2: Look for auth cookies on this domain
+  try {
+    const cookies = await chrome.cookies.getAll({ domain: baseDomain });
+    const authCookies = cookies.filter(c =>
+      AUTH_COOKIE_PATTERNS.some(p => c.name.toLowerCase().includes(p.toLowerCase()))
+    );
+
+    if (authCookies.length > 0) {
+      return { hasSession: true, method: 'cookies', detail: `Found ${authCookies.length} auth cookie(s) for ${baseDomain}` };
+    }
+  } catch (e) {
+    console.warn('[AuthBridge] Cookie query failed:', e.message);
+  }
+
+  // Check 3: Check our session persistence cache
+  try {
+    const { authenticatedSites = {} } = await chrome.storage.local.get('authenticatedSites');
+    const record = authenticatedSites[baseDomain] || authenticatedSites[domain];
+    if (record) {
+      const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
+      if (Date.now() - record.lastVerified < SEVEN_DAYS) {
+        return { hasSession: true, method: 'cached', detail: `${baseDomain} was authenticated ${Math.round((Date.now() - record.lastVerified) / 3600000)}h ago` };
+      }
+    }
+  } catch (e) {
+    console.warn('[AuthBridge] Cache check failed:', e.message);
+  }
+
+  return { hasSession: false, method: 'none' };
+}
+
+/**
+ * Layer 2: Try to bypass a login/landing page by navigating to an
+ * authenticated app URL. Works for ANY site:
+ *   1. Check SESSION_BYPASS_HINTS for known fast paths
+ *   2. If no hint, try the site root (/) — many sites auto-redirect
+ *      authenticated users past the login page
+ *   3. Check if the current URL has a redirect param (e.g., ?next=/dashboard)
+ *      and try navigating to that destination directly
+ *
+ * @param {number} tabId
+ * @param {string} currentUrl
+ * @returns {{ bypassed: boolean, newUrl?: string }}
+ */
+async function trySessionBypass(tabId, currentUrl) {
+  try {
+    const parsed = new URL(currentUrl);
+    const domain = parsed.hostname.toLowerCase();
+    const baseDomain = domain.replace(/^www\./, '');
+
+    // Build a list of URLs to try, in priority order
+    const candidates = [];
+
+    // 0. Check if we previously learned a working bypass for this domain
+    try {
+      const { learnedBypasses = {} } = await chrome.storage.local.get('learnedBypasses');
+      const learned = learnedBypasses[baseDomain];
+      if (learned?.path) {
+        candidates.push(`${parsed.protocol}//${domain}${learned.path}`);
+      }
+    } catch {}
+
+    // 1. Known hint for this domain
+    const hintPath = SESSION_BYPASS_HINTS[baseDomain] || SESSION_BYPASS_HINTS[domain];
+    if (hintPath) {
+      candidates.push(`${parsed.protocol}//${domain}${hintPath}`);
+    }
+
+    // 2. Extract redirect target from URL params (e.g., ?next=/dashboard, ?redirect_uri=..., ?return_to=...)
+    const redirectParams = ['next', 'redirect', 'redirect_uri', 'return_to', 'returnTo', 'continue', 'destination', 'from', 'ref'];
+    for (const param of redirectParams) {
+      const val = parsed.searchParams.get(param);
+      if (val) {
+        try {
+          // Could be a full URL or a relative path
+          const redirectUrl = val.startsWith('http') ? val : `${parsed.protocol}//${domain}${val.startsWith('/') ? '' : '/'}${val}`;
+          if (isAllowedForExplore(redirectUrl)) {
+            candidates.push(redirectUrl);
+          }
+        } catch {}
+      }
+    }
+
+    // 3. Try site root as last resort (skip if we're already at root)
+    if (parsed.pathname !== '/' && parsed.pathname !== '') {
+      candidates.push(`${parsed.protocol}//${domain}/`);
+    }
+
+    // Deduplicate candidates
+    const uniqueCandidates = [...new Set(candidates)];
+
+    // Try each candidate — first one that lands on a non-login page wins
+    for (const candidateUrl of uniqueCandidates) {
+      console.log(`[AuthBridge] Trying bypass: ${domain} → ${candidateUrl}`);
+      await chrome.tabs.update(tabId, { url: candidateUrl });
+      await waitForTabLoad(tabId, 12000, 800);
+
+      // Re-inject explore script for snapshot
+      try {
+        await chrome.scripting.executeScript({ target: { tabId }, files: ['content_explore.js'] });
+      } catch {}
+      await new Promise(r => setTimeout(r, 400));
+
+      const newSnapshot = await takePageSnapshot(tabId);
+
+      if (!newSnapshot.isLoginPage) {
+        console.log(`[AuthBridge] Bypass SUCCESS for ${domain} via ${candidateUrl}`);
+        await markSiteAuthenticated(baseDomain);
+
+        // Learn: save this working bypass path for future use
+        await learnBypassPath(baseDomain, new URL(candidateUrl).pathname);
+
+        return { bypassed: true, newUrl: candidateUrl };
+      }
+    }
+
+    console.log(`[AuthBridge] All bypass attempts FAILED for ${domain} — login truly required`);
+    // Navigate back to original URL so user can log in there
+    await chrome.tabs.update(tabId, { url: currentUrl });
+    await waitForTabLoad(tabId, 10000, 500);
+    return { bypassed: false };
+
+  } catch (err) {
+    console.warn('[AuthBridge] Session bypass error:', err.message);
+    return { bypassed: false };
+  }
+}
+
+/**
+ * Learn and save a bypass path that worked for a domain.
+ * Next time we encounter this domain's login page, we try the learned path first.
+ */
+async function learnBypassPath(baseDomain, path) {
+  try {
+    const { learnedBypasses = {} } = await chrome.storage.local.get('learnedBypasses');
+    learnedBypasses[baseDomain] = { path, learnedAt: Date.now() };
+    await chrome.storage.local.set({ learnedBypasses });
+    console.log(`[AuthBridge] Learned bypass for ${baseDomain}: ${path}`);
+  } catch {}
+}
+
+/**
+ * Layer 3a: Mark a site as authenticated in persistent cache.
+ */
+async function markSiteAuthenticated(domain) {
+  const baseDomain = domain.replace(/^www\./, '');
+  const { authenticatedSites = {} } = await chrome.storage.local.get('authenticatedSites');
+  authenticatedSites[baseDomain] = {
+    lastVerified: Date.now(),
+    method: 'session_bypass',
+  };
+  await chrome.storage.local.set({ authenticatedSites });
+  console.log(`[AuthBridge] Marked ${baseDomain} as authenticated`);
+}
+
+/**
+ * Layer 3b: Remove a site from the authenticated cache (session expired).
+ */
+async function removeSiteFromAuthenticated(domain) {
+  const baseDomain = domain.replace(/^www\./, '');
+  const { authenticatedSites = {} } = await chrome.storage.local.get('authenticatedSites');
+  delete authenticatedSites[baseDomain];
+  await chrome.storage.local.set({ authenticatedSites });
+  console.log(`[AuthBridge] Removed ${baseDomain} from authenticated cache`);
+}
+
+/**
+ * Auto-resume watcher: When EXPLORE pauses for login, this watches the
+ * tab for navigation (user finished logging in) and auto-resumes the
+ * exploration loop without requiring the user to click "Resume".
+ *
+ * @param {number} tabId — the tab where login is happening
+ * @param {string} resumeStateKey — key to retrieve saved exploration state
+ * @param {string} token — Enhancivity auth token for API calls
+ */
+function watchForLoginCompletion(tabId, resumeStateKey, token) {
+  let watcherCleanedUp = false;
+
+  const loginWatcher = async (details) => {
+    if (details.tabId !== tabId || details.frameId !== 0) return;
+    if (watcherCleanedUp) return;
+
+    // Wait for SPA rendering after navigation
+    await new Promise(r => setTimeout(r, 2000));
+
+    try {
+      // Re-inject explore script for snapshot
+      await chrome.scripting.executeScript({ target: { tabId }, files: ['content_explore.js'] }).catch(() => {});
+      await new Promise(r => setTimeout(r, 300));
+
+      const snapshot = await takePageSnapshot(tabId);
+
+      if (!snapshot.isLoginPage) {
+        // User logged in successfully — auto-resume
+        watcherCleanedUp = true;
+        chrome.webNavigation.onCompleted.removeListener(loginWatcher);
+
+        const stored = await chrome.storage.session.get([resumeStateKey]);
+        const resumeState = stored[resumeStateKey];
+        if (!resumeState) {
+          console.warn('[AuthBridge] Auto-resume: state not found, may have been manually resumed');
+          return;
+        }
+
+        await chrome.storage.session.remove([resumeStateKey]);
+
+        const domain = new URL(snapshot.url).hostname;
+        await markSiteAuthenticated(domain);
+
+        console.log(`[AuthBridge] Auto-resume triggered for ${domain}`);
+        await updateExplorationProgress(
+          resumeState.nextStep, resumeState.explorePlan.maxSteps,
+          `Signed in to ${domain} — resuming...`, 'running'
+        );
+
+        // Re-inject panel so user can see progress
+        try {
+          await chrome.scripting.executeScript({ target: { tabId }, files: ['content_panel.js'] });
+        } catch {}
+
+        // Resume the exploration loop
+        const result = await runExplorationLoop(
+          resumeState.explorePlan,
+          tabId,
+          token,
+          resumeState,
+        );
+
+        // Store result for panel to pick up
+        await finishExploration(result);
+      }
+    } catch (err) {
+      console.warn('[AuthBridge] Auto-resume check error:', err.message);
+    }
+  };
+
+  chrome.webNavigation.onCompleted.addListener(loginWatcher);
+
+  // Cleanup after 5 minutes (user abandoned login)
+  setTimeout(() => {
+    if (!watcherCleanedUp) {
+      watcherCleanedUp = true;
+      chrome.webNavigation.onCompleted.removeListener(loginWatcher);
+      console.log('[AuthBridge] Login watcher timed out after 5 minutes');
+    }
+  }, 5 * 60 * 1000);
 }
 
 // --- Site Type Detection (for universal scraper) ---
@@ -289,7 +605,7 @@ async function hudHide(tabId) {
   return chrome.tabs.sendMessage(tabId, { type: 'hud_hide' }).catch(() => null);
 }
 
-function waitForTabLoad(tabId, timeout = 15000) {
+function waitForTabLoad(tabId, timeout = 15000, extraDelay = 2000) {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       chrome.tabs.onUpdated.removeListener(listener);
@@ -301,7 +617,7 @@ function waitForTabLoad(tabId, timeout = 15000) {
         clearTimeout(timer);
         chrome.tabs.onUpdated.removeListener(listener);
         // Extra delay for JS rendering (SPAs, lazy-loaded product cards)
-        setTimeout(resolve, 2000);
+        setTimeout(resolve, extraDelay);
       }
     }
     chrome.tabs.onUpdated.addListener(listener);
@@ -577,7 +893,7 @@ async function scrapePageState(tabId) {
   return null;
 }
 
-async function executeExploreAction(tabId, action) {
+async function executeExploreAction(tabId, action, token) {
   try {
     if (action.type === 'navigate') {
       // Navigate to URL
@@ -588,15 +904,38 @@ async function executeExploreAction(tabId, action) {
       }
 
       const tab = await chrome.tabs.update(tabId, { url });
-      await waitForTabLoad(tabId);
+      await waitForTabLoad(tabId, 15000, 500); // 500ms after load for SPA rendering
 
-      // Re-inject explore script after navigation
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          files: ['content_explore.js'],
-        });
-      } catch {}
+      // Re-inject scripts with retry (Reddit/SPAs may need a moment)
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ['content_explore.js'],
+          });
+          console.log('[Explore] Injected content_explore.js on', tab.url || url);
+          break;
+        } catch (injectErr) {
+          console.warn(`[Explore] content_explore.js inject attempt ${attempt + 1} failed:`, injectErr.message);
+          if (attempt === 0) await new Promise(r => setTimeout(r, 500));
+        }
+      }
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ['content_panel.js'],
+          });
+          console.log('[Explore] Injected content_panel.js on', tab.url || url);
+          break;
+        } catch (injectErr) {
+          console.warn(`[Explore] content_panel.js inject attempt ${attempt + 1} failed:`, injectErr.message);
+          if (attempt === 0) await new Promise(r => setTimeout(r, 500));
+        }
+      }
+
+      // Brief delay to ensure content script listeners are registered
+      await new Promise(r => setTimeout(r, 200));
 
       return {
         success: true,
@@ -605,11 +944,27 @@ async function executeExploreAction(tabId, action) {
       };
     }
 
+    // fill_field: delegate to Ghost-Driver's semantic form filler
+    if (action.type === 'fill_field') {
+      const goal = action.value || action.description || '';
+      if (!goal) return { success: false, error: 'No fill description provided' };
+      const result = await stageAction(tabId, goal, 'forms', token);
+      return {
+        success: result?.success || false,
+        observation: result?.success
+          ? 'Form fields filled successfully'
+          : (result?.error || 'Form filling failed'),
+      };
+    }
+
     // For all other actions, send to content script
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ['content_explore.js'],
     });
+
+    // Brief delay to ensure message listener is registered
+    await new Promise(r => setTimeout(r, 200));
 
     const result = await chrome.tabs.sendMessage(tabId, {
       type: 'explore_action',
@@ -625,6 +980,14 @@ async function executeExploreAction(tabId, action) {
   }
 }
 
+// Helper: mark exploration as finished and store result for panel recovery
+async function finishExploration(result) {
+  // Set result first, THEN remove active flag — so listener sees result when it checks
+  await chrome.storage.session.set({ explorationResult: { ...result, finishedAt: Date.now() } });
+  await chrome.storage.session.remove('explorationActive');
+  return result;
+}
+
 async function runExplorationLoop(explorePlan, tabId, token, resumeState = null) {
   const { goal, strategy, maxSteps, creditBudget, startAction } = explorePlan;
 
@@ -635,6 +998,20 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
   let consecutiveFailures = resumeState?.consecutiveFailures || 0;
   const startStep = resumeState?.nextStep || 1;
 
+  // Mark exploration as in-progress (so re-injected panel can detect it)
+  await chrome.storage.session.set({
+    explorationActive: { goal, maxSteps, tabId: currentTabId, startedAt: Date.now() },
+  });
+
+  // Auto-inject panel when the explore tab navigates (backup for executeExploreAction injection)
+  const navListener = (details) => {
+    if (details.tabId !== currentTabId || details.frameId !== 0) return;
+    console.log('[Explore] webNavigation.onCompleted — re-injecting panel on', details.url);
+    chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: ['content_panel.js'] }).catch(() => {});
+    chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: ['content_explore.js'] }).catch(() => {});
+  };
+  chrome.webNavigation.onCompleted.addListener(navListener);
+
   // Service worker keepalive during exploration
   const keepAlive = setInterval(() => {
     chrome.runtime.getPlatformInfo(() => {});
@@ -642,8 +1019,15 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
 
   // Total exploration timeout (120 seconds)
   const explorationTimeout = setTimeout(() => {
-    clearInterval(keepAlive);
+    cleanupLoop();
   }, 120000);
+
+  // Cleanup helper — called at every exit
+  function cleanupLoop() {
+    clearInterval(keepAlive);
+    clearTimeout(explorationTimeout);
+    chrome.webNavigation.onCompleted.removeListener(navListener);
+  }
 
   try {
     // Show HUD on the page
@@ -668,7 +1052,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
       await hudUpdate(currentTabId, 'explore-0', 'processing', startAction.description);
       await updateExplorationProgress(0, maxSteps, startAction.description, 'running');
 
-      const startResult = await executeExploreAction(currentTabId, startAction);
+      const startResult = await executeExploreAction(currentTabId, startAction, token);
       stepLog.push({
         step: 0,
         action: startAction,
@@ -707,8 +1091,40 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
 
       const snapshot = await takePageSnapshot(currentTabId);
 
-      // PROACTIVE LOGIN CHECK — save an explore-step API call + 0.3 EU
+      // ── AUTH BRIDGE: Smart login handling ──────────────────────
+      // Instead of immediately pausing, try to use existing sessions.
       if (snapshot.isLoginPage) {
+        const loginDomain = (() => { try { return new URL(snapshot.url).hostname; } catch { return 'unknown'; } })();
+        console.log(`[AuthBridge] Login page detected on ${loginDomain}`);
+        await updateExplorationProgress(step, maxSteps, `Checking session for ${loginDomain}...`, 'running');
+
+        // Layer 1: Probe for existing session (other tabs, cookies, cache)
+        const sessionProbe = await probeExistingSession(loginDomain);
+
+        if (sessionProbe.hasSession) {
+          console.log(`[AuthBridge] Session hint found: ${sessionProbe.method} — ${sessionProbe.detail}`);
+          await updateExplorationProgress(step, maxSteps, `Found session (${sessionProbe.method}) — trying bypass...`, 'running');
+
+          // Layer 2: Try to bypass the login page
+          const bypass = await trySessionBypass(currentTabId, snapshot.url);
+
+          if (bypass.bypassed) {
+            // Success — user is authenticated, continue exploration
+            console.log(`[AuthBridge] Bypassed login for ${loginDomain}`);
+            await updateExplorationProgress(step, maxSteps, `Signed in to ${loginDomain} (existing session)`, 'running');
+            stepLog.push({
+              step,
+              action: { type: 'auth_bypass', description: `Bypassed login on ${loginDomain}` },
+              result: { success: true },
+              observation: `Used existing session to authenticate on ${loginDomain} via ${sessionProbe.method}`,
+            });
+            consecutiveFailures = 0;
+            continue; // Next step — re-snapshot the now-authenticated page
+          }
+        }
+
+        // No session found or bypass failed — must pause for manual login
+        console.log(`[AuthBridge] No usable session for ${loginDomain} — pausing for user login`);
         const stateKey = `exploreResume_${Date.now()}`;
         await chrome.storage.session.set({
           [stateKey]: {
@@ -719,17 +1135,19 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
         });
 
         await updateExplorationProgress(step, maxSteps,
-          'Login required \u2014 please sign in to continue', 'login_required');
+          'Login required \u2014 sign in and the agent will resume', 'login_required');
 
-        clearInterval(keepAlive);
-        clearTimeout(explorationTimeout);
+        // Start auto-resume watcher — will resume exploration when user finishes logging in
+        watchForLoginCompletion(currentTabId, stateKey, token);
 
-        return {
+        cleanupLoop();
+
+        return finishExploration({
           success: false, paused: true,
-          pauseReason: 'This page requires you to log in before I can continue.',
+          pauseReason: `This page requires you to sign in to ${loginDomain}. Log in on this page — the agent will detect when you're done and resume automatically.`,
           resumeStateKey: stateKey,
           creditsUsed, stepLog,
-        };
+        });
       }
 
       // THINK: call backend for next action
@@ -737,6 +1155,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
 
       let decision;
       try {
+        console.log(`[Explore] Step ${step}: snapshot url=${snapshot.url}, elements=${snapshot.semanticElements?.length || 0}, content=${(snapshot.mainContent || '').length} chars`);
         const exploreByokConfig = await getByokConfig();
         const thinkRes = await fetch(`${API_BASE}/api/agent/explore-step`, {
           method: 'POST',
@@ -763,6 +1182,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
 
         decision = await thinkRes.json();
         creditsUsed += 0.3;
+        console.log(`[Explore] Step ${step}: AI decided action=${decision.nextAction?.type}, desc="${decision.nextAction?.description}", goalComplete=${decision.isGoalComplete}`);
       } catch (err) {
         console.error('[Explore] Think step failed:', err.message);
         consecutiveFailures++;
@@ -773,6 +1193,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
           observation: `Think failed: ${err.message}`,
         });
         await hudUpdate(currentTabId, `explore-${step}`, 'error', `AI error: ${err.message}`);
+        await updateExplorationProgress(step, maxSteps, `Error: ${err.message}`, 'running');
         continue;
       }
 
@@ -781,21 +1202,15 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
         await hudUpdate(currentTabId, `explore-${step}`, 'success', 'Goal achieved!');
         await updateExplorationProgress(step, maxSteps, 'Goal achieved!', 'complete');
 
-        // Hide remaining HUD steps
-        for (let i = step + 1; i <= maxSteps; i++) {
-          // Don't update steps that don't exist in HUD
-        }
+        cleanupLoop();
 
-        clearInterval(keepAlive);
-        clearTimeout(explorationTimeout);
-
-        return {
+        return finishExploration({
           success: true,
           goalResult: decision.goalResult || 'Exploration complete.',
           stepsUsed: step,
           creditsUsed,
           stepLog,
-        };
+        });
       }
 
       // Check if consent is needed
@@ -804,7 +1219,26 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
         const isLoginRequired = reason.includes('login') || reason.includes('sign in') || reason.includes('log in');
 
         if (isLoginRequired) {
-          // Pause the loop and let the user log in manually
+          // Auth Bridge: try session probe + bypass before pausing
+          const loginDomain = (() => { try { return new URL(snapshot.url).hostname; } catch { return 'unknown'; } })();
+          const sessionProbe = await probeExistingSession(loginDomain);
+
+          if (sessionProbe.hasSession) {
+            const bypass = await trySessionBypass(currentTabId, snapshot.url);
+            if (bypass.bypassed) {
+              // Bypassed — continue exploration instead of pausing
+              stepLog.push({
+                step,
+                action: { type: 'auth_bypass', description: `Bypassed login on ${loginDomain}` },
+                result: { success: true },
+                observation: `Used existing session on ${loginDomain}`,
+              });
+              consecutiveFailures = 0;
+              continue;
+            }
+          }
+
+          // No bypass possible — pause with auto-resume watcher
           const stateKey = `exploreResume_${Date.now()}`;
           await chrome.storage.session.set({
             [stateKey]: {
@@ -817,15 +1251,15 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
           await updateExplorationProgress(step, maxSteps,
             decision.consentReason || 'Login required', 'login_required');
 
-          clearInterval(keepAlive);
-          clearTimeout(explorationTimeout);
+          watchForLoginCompletion(currentTabId, stateKey, token);
+          cleanupLoop();
 
-          return {
+          return finishExploration({
             success: false, paused: true,
-            pauseReason: decision.consentReason || 'This page requires you to log in.',
+            pauseReason: `Sign in to ${loginDomain} on this page — the agent will resume automatically when you're done.`,
             resumeStateKey: stateKey,
             creditsUsed, stepLog,
-          };
+          });
         }
 
         // Non-login consent (e.g., payment) — skip and continue
@@ -849,19 +1283,38 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
       }
 
       // ACT: execute the decided action
-      const actionDesc = decision.nextAction?.description || decision.nextAction?.type || 'Action';
+      if (!decision.nextAction) {
+        // AI returned no action and goal is not complete — treat as a failure
+        consecutiveFailures++;
+        stepLog.push({
+          step,
+          action: { type: 'none', description: 'AI returned no action' },
+          result: { success: false },
+          observation: 'AI did not provide a nextAction. Goal may need rephrasing.',
+        });
+        await hudUpdate(currentTabId, `explore-${step}`, 'error', 'No action from AI');
+        await updateExplorationProgress(step, maxSteps, 'AI returned no action', 'running');
+        continue;
+      }
+
+      const actionDesc = decision.nextAction.description || decision.nextAction.type || 'Action';
       await hudUpdate(currentTabId, `explore-${step}`, 'processing', actionDesc);
       await updateExplorationProgress(step, maxSteps, actionDesc, 'running');
 
-      const actionResult = await executeExploreAction(currentTabId, decision.nextAction);
+      const actionResult = await executeExploreAction(currentTabId, decision.nextAction, token);
 
-      // If navigation happened, update tab context
-      if (decision.nextAction.type === 'navigate' && actionResult.success) {
-        // Tab may have changed URL — re-inject script
+      // If navigation happened, re-inject both scripts (in case executeExploreAction's injection failed)
+      if (decision.nextAction?.type === 'navigate' && actionResult.success) {
         try {
           await chrome.scripting.executeScript({
             target: { tabId: currentTabId },
             files: ['content_explore.js'],
+          });
+        } catch {}
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: currentTabId },
+            files: ['content_panel.js'],
           });
         } catch {}
       }
@@ -877,10 +1330,12 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
       if (actionResult.success) {
         consecutiveFailures = 0;
         await hudUpdate(currentTabId, `explore-${step}`, 'success', actionDesc);
+        await updateExplorationProgress(step, maxSteps, `Done: ${actionDesc}`, 'running');
       } else {
         consecutiveFailures++;
         await hudUpdate(currentTabId, `explore-${step}`, 'error',
           `Failed: ${actionResult.error || 'unknown error'}`);
+        await updateExplorationProgress(step, maxSteps, `Failed: ${actionResult.error || actionDesc}`, 'running');
       }
 
       // Brief pause between steps for page rendering
@@ -888,8 +1343,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
     }
 
     // Max steps reached or stopped
-    clearInterval(keepAlive);
-    clearTimeout(explorationTimeout);
+    cleanupLoop();
 
     // Build partial result from observations
     const observations = stepLog
@@ -901,7 +1355,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
       consecutiveFailures >= 3 ? 'Stopped after repeated failures' : 'Max steps reached',
       'partial');
 
-    return {
+    return finishExploration({
       success: false,
       goalResult: observations
         ? `I explored ${stepLog.length} steps but couldn't fully complete the goal. Here's what I found:\n\n${observations}`
@@ -910,13 +1364,12 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
       creditsUsed,
       stepLog,
       partial: true,
-    };
+    });
 
   } catch (err) {
-    clearInterval(keepAlive);
-    clearTimeout(explorationTimeout);
+    cleanupLoop();
     console.error('[Explore] Loop error:', err);
-    return { success: false, error: err.message || 'Exploration loop failed.', stepLog };
+    return finishExploration({ success: false, error: err.message || 'Exploration loop failed.', stepLog });
   }
 }
 
@@ -1238,6 +1691,38 @@ async function handleMessage(request, sender) {
     return { success: false, message: data.error || 'Login failed' };
   }
 
+  // ── SIGNUP: Email + Password ───────────────────────────────
+  if (request.type === 'extension_signup') {
+    const { name, email, password } = request.data;
+    const res = await fetch(`${API_BASE}/api/auth/extension/signup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, email, password })
+    });
+    const data = await res.json();
+    if (data.success) {
+      await chrome.storage.local.set({ token: data.token });
+      await refreshMemory(data.token).catch(() => {});
+      return { success: true };
+    }
+    return { success: false, message: data.error || 'Sign up failed' };
+  }
+
+  // ── RESET PASSWORD ─────────────────────────────────────────
+  if (request.type === 'extension_reset_password') {
+    const { email, newPassword } = request.data;
+    const res = await fetch(`${API_BASE}/api/auth/extension/reset-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, newPassword })
+    });
+    const data = await res.json();
+    if (data.success) {
+      return { success: true, message: data.message };
+    }
+    return { success: false, message: data.error || 'Password reset failed' };
+  }
+
   // ── LOGIN: Google OAuth ──────────────────────────────────
   if (request.type === 'google_login') {
     const clientId = '409104365095-beonfvn8d6cdtnmgcjqk42bav4uk5amc.apps.googleusercontent.com';
@@ -1443,9 +1928,14 @@ async function handleMessage(request, sender) {
     }
 
     if (!match) {
-      // Fallback: open the URL in a new tab
+      // Fallback: navigate the current active tab instead of opening a new one
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (activeTab) {
+        await chrome.tabs.update(activeTab.id, { url: targetTabUrl });
+        return { success: true, tabId: activeTab.id, switched: true, message: 'Navigated in current tab.' };
+      }
       const newTab = await chrome.tabs.create({ url: targetTabUrl, active: true });
-      return { success: true, tabId: newTab.id, opened: true, message: 'Tab not found — opened in new tab.' };
+      return { success: true, tabId: newTab.id, opened: true, message: 'Opened in new tab.' };
     }
 
     // Activate the existing tab
@@ -1466,10 +1956,21 @@ async function handleMessage(request, sender) {
       if (!isAllowedUrl(action.value)) {
         return { success: false, error: `Navigation to ${action.value} is not allowed.` };
       }
-      const tab = await chrome.tabs.create({ url: action.value, active: true });
-      await waitForTabLoad(tab.id, 10000);
-      const pageStateAfter = await scrapePageState(tab.id);
-      return { success: true, tabId: tab.id, pageStateAfter };
+      // Navigate in the current tab instead of opening a new one
+      let navTabId = tabId;
+      if (!navTabId) {
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        navTabId = activeTab?.id;
+      }
+      if (navTabId) {
+        await chrome.tabs.update(navTabId, { url: action.value, active: true });
+      } else {
+        const newTab = await chrome.tabs.create({ url: action.value, active: true });
+        navTabId = newTab.id;
+      }
+      await waitForTabLoad(navTabId, 10000);
+      const pageStateAfter = await scrapePageState(navTabId);
+      return { success: true, tabId: navTabId, pageStateAfter };
     }
 
     // semantic_fill: Ghost-Driver AI form filling (stageAction already returns pageStateAfter)
@@ -1553,9 +2054,20 @@ async function handleMessage(request, sender) {
 
   // ── EXPLORE: Multi-step agentic exploration loop ────────────
   if (request.type === 'explore_start') {
-    const { explorePlan, tabId } = request.data;
+    const { explorePlan } = request.data;
     if (!explorePlan || !explorePlan.goal) {
       return { success: false, error: 'Invalid explore plan: no goal specified.' };
+    }
+    // Use tabId from request, or fall back to sender tab (content script's tab), or active tab
+    let tabId = request.data.tabId || sender?.tab?.id;
+    if (!tabId) {
+      try {
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        tabId = activeTab?.id;
+      } catch {}
+    }
+    if (!tabId) {
+      return { success: false, error: 'Could not determine which tab to explore.' };
     }
     return await runExplorationLoop(explorePlan, tabId, token);
   }
@@ -1993,14 +2505,22 @@ async function handleDelegatedTask(taskId, taskTitle, taskDescription, authToken
   if (hudTabId) await hudUpdate(hudTabId, 'execute', 'processing');
 
   if (actionType === 'NAVIGATE' && agentData.action?.url) {
-    // Simple navigation task — HUD moves to the new tab
-    const tab = await chrome.tabs.create({ url: agentData.action.url, active: false });
-    await waitForTabLoad(tab.id, 15000);
+    // Navigate in the current active tab instead of opening a new one
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    let navTabId;
+    if (activeTab) {
+      await chrome.tabs.update(activeTab.id, { url: agentData.action.url, active: true });
+      navTabId = activeTab.id;
+    } else {
+      const newTab = await chrome.tabs.create({ url: agentData.action.url, active: true });
+      navTabId = newTab.id;
+    }
+    await waitForTabLoad(navTabId, 15000);
 
     // If there's form filling to do, use stageAction (which has its own HUD)
     if (taskDescription && taskDescription.length > 10) {
       if (hudTabId) await hudUpdate(hudTabId, 'execute', 'success', 'Navigated, filling form...');
-      const fillResult = await stageAction(tab.id, `${taskTitle}. ${taskDescription}`, 'delegation', activeToken);
+      const fillResult = await stageAction(navTabId, `${taskTitle}. ${taskDescription}`, 'delegation', activeToken);
       if (fillResult.success) {
         if (hudTabId) setTimeout(() => hudHide(hudTabId), 2000);
         notifyDashboardTabs('TASK_COMPLETE', {
@@ -2094,13 +2614,13 @@ function isRestrictedUrl(url) {
 }
 
 chrome.action.onClicked.addListener(async (tab) => {
-  // If the tab is restricted (chrome://, about:, etc.), open a new tab and inject panel there
+  // If the tab is restricted (chrome://, about:, etc.), navigate the SAME tab to Google and inject panel
   if (isRestrictedUrl(tab.url)) {
-    const newTab = await chrome.tabs.create({ url: 'https://www.google.com', active: true });
+    await chrome.tabs.update(tab.id, { url: 'https://www.google.com' });
     const injectOnLoad = (tabId, changeInfo) => {
-      if (tabId === newTab.id && changeInfo.status === 'complete') {
+      if (tabId === tab.id && changeInfo.status === 'complete') {
         chrome.tabs.onUpdated.removeListener(injectOnLoad);
-        chrome.scripting.executeScript({ target: { tabId: newTab.id }, files: ['content_panel.js'] }).catch(() => {});
+        chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content_panel.js'] }).catch(() => {});
       }
     };
     chrome.tabs.onUpdated.addListener(injectOnLoad);
@@ -2129,6 +2649,52 @@ chrome.action.onClicked.addListener(async (tab) => {
     // Last-resort fallback: open popup.html in a new tab
     await chrome.tabs.create({ url: chrome.runtime.getURL('popup/popup.html') });
   }
+});
+
+// ── Re-inject panel after same-tab navigation (if panel was open) ──
+
+async function reInjectPanelIfNeeded(tabId, url, trigger) {
+  if (isRestrictedUrl(url)) return;
+  try {
+    const { enhPanelState } = await chrome.storage.session.get('enhPanelState');
+    if (!enhPanelState?.isOpen && !enhPanelState?.isMinimized) return;
+
+    // Check if panel DOM actually exists on the page
+    let panelExists = false;
+    try {
+      const pong = await chrome.tabs.sendMessage(tabId, { type: 'enh_panel_ping' });
+      panelExists = !!pong?.ok;
+    } catch { /* content script not present at all */ }
+
+    console.log(`[Panel Re-inject] trigger=${trigger} tabId=${tabId} panelExists=${panelExists} url=${url?.substring(0, 80)}`);
+
+    if (!panelExists) {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ['content_panel.js'],
+      });
+      console.log(`[Panel Re-inject] Injected content_panel.js into tab ${tabId}`);
+    }
+  } catch (err) {
+    console.log(`[Panel Re-inject] Failed for tab ${tabId}:`, err?.message);
+  }
+}
+
+// Full page loads (standard navigation)
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.status !== 'complete') return;
+  console.log('[NAV-DEBUG] onUpdated fired', tabId, tab.url?.substring(0, 60));
+  const { enhPanelState } = await chrome.storage.session.get('enhPanelState');
+  console.log('[NAV-DEBUG] enhPanelState =', JSON.stringify(enhPanelState));
+  await reInjectPanelIfNeeded(tabId, tab.url, 'onUpdated');
+});
+
+// SPA-style navigation (GitHub Turbo, pushState, replaceState)
+chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
+  if (details.frameId !== 0) return;   // Only main frame
+  // Small delay — let the SPA finish rendering before injecting
+  await new Promise(r => setTimeout(r, 500));
+  await reInjectPanelIfNeeded(details.tabId, details.url, 'historyState');
 });
 
 // ── Re-inject panel when user switches tabs (if panel was open) ──

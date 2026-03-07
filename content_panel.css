@@ -57,7 +57,7 @@
 }
 
 .enh-brand {
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 700;
   color: #ededef;
   letter-spacing: -0.3px;
@@ -86,7 +86,7 @@
 }
 
 .enh-memory-text {
-  font-size: 9px;
+  font-size: 11px;
   font-weight: 600;
   color: #34d399;
   letter-spacing: 0.8px;
@@ -103,7 +103,7 @@
 }
 
 .enh-byok-text {
-  font-size: 9px;
+  font-size: 11px;
   font-weight: 600;
   color: #818cf8;
   letter-spacing: 0.8px;
@@ -119,7 +119,7 @@
 .enh-icon-btn {
   background: none;
   border: none;
-  color: #4a4a54;
+  color: #8b8b9a;
   cursor: pointer;
   padding: 5px;
   display: flex;
@@ -130,7 +130,7 @@
   width: 26px;
   height: 26px;
 }
-.enh-icon-btn:hover { color: #9b9ba6; background: rgba(255, 255, 255, 0.04); }
+.enh-icon-btn:hover { color: #c0c0cc; background: rgba(255, 255, 255, 0.06); }
 .enh-icon-btn.enh-close-btn:hover { color: #f87171; background: rgba(248, 113, 113, 0.1); }
 
 /* ── Context Strip ────────────────────────────────────────── */
@@ -141,7 +141,7 @@
 }
 
 .enh-context-badge {
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   padding: 3px 10px;
   border-radius: 20px;
@@ -180,7 +180,7 @@
 .enh-greeting-icon { color: #3a3a42; }
 
 .enh-greeting-text {
-  font-size: 14px;
+  font-size: 16px;
   color: #4a4a54;
   text-align: center;
   margin: 0;
@@ -227,7 +227,7 @@
 }
 
 .enh-loading-label {
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 500;
   color: #6b6b76;
   letter-spacing: 0.3px;
@@ -246,7 +246,7 @@
 }
 
 .enh-results-header {
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   color: #6b6b76;
   text-transform: uppercase;
@@ -255,7 +255,7 @@
 }
 
 .enh-no-results {
-  font-size: 13px;
+  font-size: 15px;
   color: #4a4a54;
   text-align: center;
   padding: 24px 0;
@@ -273,11 +273,12 @@
 
 .enh-input-pill {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   background: rgba(24, 24, 30, 0.8);
   border: 1px solid rgba(255, 255, 255, 0.06);
-  border-radius: 24px;
-  padding: 4px 4px 4px 16px;
+  border-radius: 20px;
+  padding: 6px 6px 6px 16px;
+  gap: 8px;
   transition: border-color 0.25s, box-shadow 0.25s;
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
@@ -293,12 +294,18 @@
   border: none;
   outline: none;
   color: #ededef;
-  font-size: 14px;
+  font-size: 16px;
   font-family: inherit;
   font-weight: 400;
-  padding: 8px 0;
+  padding: 6px 0;
   min-width: 0;
+  resize: none;
+  overflow-y: auto;
+  max-height: 72px; /* ~3 lines at 16px + line-height */
+  line-height: 1.5;
+  scrollbar-width: none;
 }
+.enh-prompt-field::-webkit-scrollbar { display: none; }
 .enh-prompt-field::placeholder { color: #4a4a54; }
 
 .enh-send-btn {
@@ -335,7 +342,7 @@
   justify-content: center;
   width: 100%;
   padding: 10px 20px;
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 600;
   font-family: inherit;
   border: none;
@@ -358,7 +365,7 @@
 .enh-btn-primary:active { transform: translateY(0); }
 .enh-btn-primary:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
 
-.enh-btn-sm { padding: 6px 12px; font-size: 12px; }
+.enh-btn-sm { padding: 6px 12px; font-size: 14px; }
 .enh-btn-ghost {
   background: transparent;
   color: #6b6b76;
@@ -369,7 +376,7 @@
 /* ── Error / Success ──────────────────────────────────────── */
 .enh-error-message {
   color: #f87171;
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 500;
   text-align: center;
   line-height: 1.4;
@@ -378,7 +385,7 @@
 
 .enh-success-message {
   color: #34d399;
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 500;
   text-align: center;
   padding: 16px;
@@ -405,7 +412,7 @@
 }
 
 .enh-action-headline {
-  font-size: 16px;
+  font-size: 19px;
   font-weight: 600;
   color: #ededef;
   line-height: 1.35;
@@ -413,14 +420,14 @@
 }
 
 .enh-action-summary {
-  font-size: 13px;
+  font-size: 15px;
   color: #9b9ba6;
   line-height: 1.5;
   font-weight: 400;
 }
 
 .enh-action-content {
-  font-size: 13px;
+  font-size: 15px;
   color: #c4c4cc;
   line-height: 1.6;
   white-space: pre-wrap;
@@ -428,7 +435,7 @@
 }
 
 .enh-action-preview {
-  font-size: 13px;
+  font-size: 15px;
   color: #c4c4cc;
   line-height: 1.5;
   white-space: pre-wrap;
@@ -445,14 +452,14 @@
 .enh-action-steps {
   margin: 2px 0;
   padding-left: 20px;
-  font-size: 13px;
+  font-size: 15px;
   color: #9b9ba6;
   line-height: 1.8;
 }
 .enh-action-steps li { color: #c4c4cc; }
 
 .enh-action-rationale {
-  font-size: 12px;
+  font-size: 14px;
   color: #4a4a54;
   font-style: italic;
   line-height: 1.4;
@@ -468,7 +475,7 @@
 .enh-action-btn-row .enh-btn {
   flex: 1;
   padding: 9px 16px;
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 600;
   margin-top: 0;
 }
@@ -521,7 +528,7 @@
 
 .enh-blocked-message {
   color: #f87171;
-  font-size: 12px;
+  font-size: 14px;
   text-align: center;
   padding: 14px;
   line-height: 1.5;
@@ -568,20 +575,20 @@
 }
 
 .enh-task-title {
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 500;
   color: #ededef;
   line-height: 1.4;
 }
 
 .enh-task-meta {
-  font-size: 11px;
+  font-size: 13px;
   color: #6b6b76;
 }
 
 .enh-create-btn {
   margin-top: 10px;
-  font-size: 13px;
+  font-size: 15px;
   padding: 10px;
 }
 
@@ -607,7 +614,7 @@
 .enh-product-card:hover { border-color: rgba(255, 255, 255, 0.1); }
 
 .enh-product-name {
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 500;
   color: #ededef;
   line-height: 1.4;
@@ -616,14 +623,14 @@
 .enh-product-meta {
   display: flex;
   gap: 10px;
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .enh-product-price { color: #34d399; font-weight: 600; }
 .enh-product-rating { color: #fbbf24; }
 
 .enh-product-link {
-  font-size: 12px;
+  font-size: 14px;
   color: #818cf8;
   text-decoration: none;
   align-self: flex-start;
@@ -634,7 +641,7 @@
 
 /* ── Text Result ──────────────────────────────────────────── */
 .enh-text-result {
-  font-size: 13px;
+  font-size: 15px;
   color: #c4c4cc;
   line-height: 1.6;
   padding: 4px 0;
@@ -658,7 +665,7 @@
 }
 
 .enh-orch-site-badge {
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   padding: 3px 10px;
   border-radius: 20px;
@@ -670,7 +677,7 @@
 }
 
 .enh-orch-criteria {
-  font-size: 11px;
+  font-size: 13px;
   color: #6b6b76;
   margin: 0;
 }
@@ -695,7 +702,7 @@
 }
 
 .enh-orch-badge-label {
-  font-size: 9px;
+  font-size: 11px;
   font-weight: 700;
   padding: 3px 10px;
   border-radius: 20px;
@@ -706,7 +713,7 @@
 }
 
 .enh-orch-status {
-  font-size: 12px;
+  font-size: 14px;
   color: #6b6b76;
   font-style: italic;
 }
@@ -721,7 +728,7 @@
   display: flex;
   align-items: center;
   gap: 5px;
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 500;
   padding: 5px 12px;
   border-radius: 8px;
@@ -747,7 +754,7 @@
   color: #f87171;
 }
 
-.enh-orch-site-icon { font-size: 12px; }
+.enh-orch-site-icon { font-size: 14px; }
 
 @keyframes enhSearchPulse {
   0%, 100% { opacity: 1; }
@@ -756,7 +763,7 @@
 
 /* Comparison results */
 .enh-orch-summary {
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 500;
   color: #9b9ba6;
   text-align: center;
@@ -779,7 +786,7 @@
 }
 
 .enh-orch-winner-label {
-  font-size: 9px;
+  font-size: 11px;
   font-weight: 700;
   color: #fbbf24;
   text-transform: uppercase;
@@ -787,7 +794,7 @@
 }
 
 .enh-orch-winner-title {
-  font-size: 14px;
+  font-size: 16px;
   font-weight: 600;
   color: #ededef;
   line-height: 1.4;
@@ -801,13 +808,13 @@
 }
 
 .enh-orch-winner-price {
-  font-size: 18px;
+  font-size: 21px;
   font-weight: 700;
   color: #34d399;
 }
 
 .enh-orch-winner-rationale {
-  font-size: 13px;
+  font-size: 15px;
   color: #9b9ba6;
   line-height: 1.5;
   margin: 0;
@@ -815,14 +822,14 @@
 
 .enh-orch-go-btn {
   margin-top: 4px;
-  font-size: 13px;
+  font-size: 15px;
   padding: 10px;
   width: 100%;
 }
 
 /* Alternatives */
 .enh-orch-alt-header {
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   color: #4a4a54;
   text-transform: uppercase;
@@ -852,7 +859,7 @@
 }
 
 .enh-orch-alt-title {
-  font-size: 12px;
+  font-size: 14px;
   font-weight: 500;
   color: #c4c4cc;
   line-height: 1.3;
@@ -866,7 +873,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 11px;
+  font-size: 13px;
   color: #6b6b76;
 }
 
@@ -876,7 +883,7 @@
 }
 
 .enh-orch-alt-note {
-  font-size: 11px;
+  font-size: 13px;
   color: #4a4a54;
   margin: 0;
   line-height: 1.3;
@@ -886,7 +893,7 @@
   flex-shrink: 0;
   width: auto;
   padding: 6px 14px;
-  font-size: 11px;
+  font-size: 13px;
   background: transparent;
   color: #9b9ba6;
   border: 1px solid rgba(255, 255, 255, 0.06);
@@ -898,7 +905,7 @@
 
 /* ── Trust Badges ─────────────────────────────────────────── */
 .enh-trust-badge {
-  font-size: 9px;
+  font-size: 11px;
   font-weight: 700;
   padding: 2px 7px;
   border-radius: 4px;
@@ -940,7 +947,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 11px;
+  font-size: 13px;
   color: #6b6b76;
   padding: 4px 0;
 }
@@ -959,7 +966,7 @@
 }
 
 .enh-draft-label {
-  font-size: 11px;
+  font-size: 13px;
   color: #8888a0;
   text-transform: uppercase;
   letter-spacing: 0.5px;
@@ -970,7 +977,7 @@
 .enh-draft-select {
   width: 100%;
   padding: 8px 10px;
-  font-size: 13px;
+  font-size: 15px;
   background: rgba(255, 255, 255, 0.06);
   color: #ededef;
   border: 1px solid rgba(255, 255, 255, 0.1);
@@ -1035,7 +1042,7 @@
 }
 
 .enh-auth-fallback-text {
-  font-size: 14px;
+  font-size: 17px;
   font-weight: 600;
   color: #e2e8f0;
   margin-bottom: 4px;
@@ -1054,8 +1061,8 @@
   background: rgba(255,255,255,0.06);
   border: 1px solid rgba(255,255,255,0.1);
   border-radius: 8px;
-  padding: 10px 12px;
-  font-size: 13px;
+  padding: 11px 14px;
+  font-size: 15px;
   color: #e2e8f0;
   font-family: inherit;
   outline: none;
@@ -1065,9 +1072,39 @@
 .enh-auth-input::placeholder { color: #4b5563; }
 
 .enh-auth-error {
-  font-size: 12px;
+  font-size: 14px;
   color: #f87171;
   text-align: center;
+}
+
+.enh-auth-success {
+  font-size: 14px;
+  color: #34d399;
+  text-align: center;
+}
+
+.enh-auth-links {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.enh-auth-link {
+  font-size: 14px;
+  color: #6366f1;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+.enh-auth-link:hover {
+  color: #818cf8;
+  text-decoration: underline;
+}
+
+.enh-auth-link-sep {
+  font-size: 14px;
+  color: #4b5563;
 }
 
 /* ── Chat Bubble Styles ────────────────────────────────────── */
@@ -1084,7 +1121,7 @@
   background: rgba(99, 102, 241, 0.15);
   border: 1px solid rgba(99, 102, 241, 0.2);
   border-radius: 14px 14px 4px 14px;
-  font-size: 13px;
+  font-size: 15px;
   color: #c4c4cc;
   margin-left: auto;
   word-wrap: break-word;
@@ -1100,7 +1137,7 @@
   background: rgba(239, 68, 68, 0.1);
   border: 1px solid rgba(239, 68, 68, 0.25);
   border-radius: 10px;
-  font-size: 12px;
+  font-size: 14px;
   color: #f87171;
   line-height: 1.4;
 }

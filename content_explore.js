@@ -63,6 +63,50 @@
     return document.querySelector(`[data-enh-sid="${sid}"]`);
   }
 
+  // ── Recovery Helper: Quick snapshot of available elements ───
+  // Called when an action fails due to missing element, so the AI
+  // knows what IS available and can self-correct on the next step.
+
+  function getRecoverySnapshot() {
+    const MAX_RECOVERY = 20; // Keep compact — just enough for alternatives
+    const elements = [];
+    let counter = 0;
+
+    function classify(node) {
+      const tag = node.tagName;
+      if (tag === 'BUTTON' || node.getAttribute('role') === 'button') return 'button';
+      if (tag === 'A') return 'link';
+      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return 'input';
+      return null;
+    }
+
+    function getText(node) {
+      return (node.innerText || node.textContent || node.value ||
+              node.getAttribute('aria-label') || node.getAttribute('title') ||
+              node.getAttribute('placeholder') || '').trim().slice(0, 80);
+    }
+
+    function walk(node) {
+      if (elements.length >= MAX_RECOVERY || !node || !node.tagName) return;
+      const SKIP = new Set(['SCRIPT','STYLE','NOSCRIPT','SVG','IFRAME','CANVAS','TEMPLATE']);
+      if (SKIP.has(node.tagName)) return;
+
+      const type = classify(node);
+      const text = getText(node);
+      if (type && text) {
+        const sid = node.getAttribute('data-enh-sid') || `${type.slice(0,4)}-${counter++}`;
+        try { node.setAttribute('data-enh-sid', sid); } catch {}
+        elements.push(`[${sid}] ${type}: "${text}"`);
+      }
+      for (const child of node.children) walk(child);
+    }
+
+    walk(document.body);
+    return elements.length
+      ? `\nAVAILABLE ELEMENTS ON PAGE:\n${elements.join('\n')}`
+      : '\nNo interactable elements found on this page.';
+  }
+
   // ── Exploration Actions ─────────────────────────────────────
 
   const EXPLORE_ACTIONS = {
@@ -71,7 +115,12 @@
       if (!target) return { success: false, error: 'No semantic ID provided for click' };
 
       const el = findBySid(target);
-      if (!el) return { success: false, error: `Element not found: ${target}` };
+      if (!el) {
+        return {
+          success: false,
+          error: `Element not found: ${target}. The element may have been removed or the page changed.${getRecoverySnapshot()}`,
+        };
+      }
 
       if (isSensitiveElement(el)) {
         return { success: false, error: 'BLOCKED: Sensitive field — cannot interact', blocked: true };
@@ -107,7 +156,12 @@
       if (!target) return { success: false, error: 'No semantic ID provided for read' };
 
       const el = findBySid(target);
-      if (!el) return { success: false, error: `Element not found: ${target}` };
+      if (!el) {
+        return {
+          success: false,
+          error: `Element not found: ${target}. Cannot read — element may have been removed or page changed.${getRecoverySnapshot()}`,
+        };
+      }
 
       const text = (el.innerText || el.textContent || '').trim().slice(0, 3000);
       return { success: true, observation: text || '(empty element)' };
@@ -117,7 +171,12 @@
       if (!target) return { success: false, error: 'No semantic ID provided for scroll' };
 
       const el = findBySid(target);
-      if (!el) return { success: false, error: `Element not found: ${target}` };
+      if (!el) {
+        return {
+          success: false,
+          error: `Element not found: ${target}. Cannot scroll to it — element may have been removed.${getRecoverySnapshot()}`,
+        };
+      }
 
       el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       return { success: true, observation: `Scrolled to element "${(el.innerText || '').trim().slice(0, 80)}"` };
