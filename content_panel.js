@@ -840,6 +840,33 @@
       return;
     }
 
+    // EXPLORE_RESULT: render as formatted card (same layout as showExplorationResult)
+    if (data.action_type === 'EXPLORE_RESULT') {
+      const card = document.createElement('div');
+      card.className = 'enh-action-card';
+
+      const headlineEl = document.createElement('p');
+      headlineEl.className = 'enh-action-headline';
+      headlineEl.textContent = data.goalResult ? 'Exploration Complete' : 'Exploration Failed';
+      card.appendChild(headlineEl);
+
+      const resultEl = document.createElement('div');
+      resultEl.className = 'enh-action-rationale';
+      resultEl.style.whiteSpace = 'pre-wrap';
+      resultEl.textContent = data.goalResult || 'Exploration finished.';
+      card.appendChild(resultEl);
+
+      if (data.stepsUsed) {
+        const metaEl = document.createElement('p');
+        metaEl.style.cssText = 'font-size: 10px; opacity: 0.5; margin-top: 8px;';
+        metaEl.textContent = `${data.stepsUsed} steps \u00B7 ${(data.creditsUsed || 0).toFixed(1)} EU`;
+        card.appendChild(metaEl);
+      }
+
+      container.appendChild(card);
+      return;
+    }
+
     if (data.type === 'tasks') {
       renderTaskList(container, data.items || []);
     } else if (data.type === 'products') {

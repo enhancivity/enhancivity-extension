@@ -167,6 +167,43 @@
       return { success: true, observation: text || '(empty element)' };
     },
 
+    type_text({ target, value }) {
+      if (!target) return { success: false, error: 'No semantic ID provided for type_text' };
+      if (!value) return { success: false, error: 'No text value provided to type' };
+
+      const el = findBySid(target);
+      if (!el) {
+        return {
+          success: false,
+          error: `Element not found: ${target}. Cannot type — element may have been removed or the page changed.${getRecoverySnapshot()}`,
+        };
+      }
+
+      if (isSensitiveElement(el)) {
+        return { success: false, error: 'BLOCKED: Sensitive field — cannot type into password/payment fields', blocked: true };
+      }
+
+      // Focus and clear existing value
+      el.focus();
+      el.value = '';
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+
+      // Type the text
+      el.value = value;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+
+      // Highlight briefly
+      const origOutline = el.style.outline;
+      el.style.outline = '2px solid #6366f1';
+      setTimeout(() => { el.style.outline = origOutline; }, 1500);
+
+      return {
+        success: true,
+        observation: `Typed "${value.slice(0, 80)}" into ${el.tagName.toLowerCase()}${el.placeholder ? ` (placeholder: "${el.placeholder}")` : ''}`,
+      };
+    },
+
     scroll_to_sid({ target }) {
       if (!target) return { success: false, error: 'No semantic ID provided for scroll' };
 
@@ -354,6 +391,7 @@
     const handlerMap = {
       'click_element': 'click_by_sid',
       'read_element':  'read_by_sid',
+      'type_text':     'type_text',
       'scroll':        'scroll_page',
       'scroll_to':     'scroll_to_sid',
       'scrape_page':   'extract_visible_text',

@@ -571,7 +571,10 @@ async function hudShow(tabId, taskTitle, initialSteps) {
     type: 'hud_show',
     taskTitle,
     initialSteps,
-  }).catch(() => null);
+  }).catch(err => {
+    console.warn(`[HUD] hudShow failed for tab ${tabId}: ${err.message}`);
+    return null;
+  });
 }
 
 async function hudUpdate(tabId, stepId, status, detail, label) {
@@ -581,7 +584,10 @@ async function hudUpdate(tabId, stepId, status, detail, label) {
     status,
     detail,
     label,
-  }).catch(() => null);
+  }).catch(err => {
+    console.warn(`[HUD] hudUpdate failed (${stepId}, ${status}): ${err.message}`);
+    return null;
+  });
 }
 
 async function hudTrust(tabId, trustBadge, trustScore, siteName) {
@@ -903,34 +909,28 @@ async function executeExploreAction(tabId, action, token) {
         return { success: false, error: `BLOCKED: Domain not allowed for exploration: ${url}` };
       }
 
-      const tab = await chrome.tabs.update(tabId, { url });
+      await chrome.tabs.update(tabId, { url });
       await waitForTabLoad(tabId, 15000, 500); // 500ms after load for SPA rendering
 
-      // Re-inject scripts with retry (Reddit/SPAs may need a moment)
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId },
-            files: ['content_explore.js'],
-          });
-          console.log('[Explore] Injected content_explore.js on', tab.url || url);
-          break;
-        } catch (injectErr) {
-          console.warn(`[Explore] content_explore.js inject attempt ${attempt + 1} failed:`, injectErr.message);
-          if (attempt === 0) await new Promise(r => setTimeout(r, 500));
-        }
-      }
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId },
-            files: ['content_panel.js'],
-          });
-          console.log('[Explore] Injected content_panel.js on', tab.url || url);
-          break;
-        } catch (injectErr) {
-          console.warn(`[Explore] content_panel.js inject attempt ${attempt + 1} failed:`, injectErr.message);
-          if (attempt === 0) await new Promise(r => setTimeout(r, 500));
+      // Get the ACTUAL loaded URL (chrome.tabs.update returns before navigation)
+      const loadedTab = await chrome.tabs.get(tabId);
+      const actualUrl = loadedTab.url || url;
+
+      // Re-inject ALL scripts with retry (Reddit/SPAs may need a moment)
+      const scriptsToInject = ['content_explore.js', 'content_panel.js', HUD_SCRIPT];
+      for (const script of scriptsToInject) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId },
+              files: [script],
+            });
+            console.log(`[Explore] Injected ${script} on`, actualUrl);
+            break;
+          } catch (injectErr) {
+            console.warn(`[Explore] ${script} inject attempt ${attempt + 1} failed:`, injectErr.message);
+            if (attempt === 0) await new Promise(r => setTimeout(r, 500));
+          }
         }
       }
 
@@ -939,8 +939,8 @@ async function executeExploreAction(tabId, action, token) {
 
       return {
         success: true,
-        observation: `Navigated to ${tab.url || url}`,
-        newUrl: tab.url || url,
+        observation: `Navigated to ${actualUrl}`,
+        newUrl: actualUrl,
       };
     }
 
@@ -991,6 +991,19 @@ async function finishExploration(result) {
 async function runExplorationLoop(explorePlan, tabId, token, resumeState = null) {
   const { goal, strategy, maxSteps, creditBudget, startAction } = explorePlan;
 
+  // Validate startAction before proceeding
+  if (!resumeState && (!startAction || !startAction.type)) {
+    console.error('[Explore] Invalid explorePlan: missing or malformed startAction', JSON.stringify(explorePlan).slice(0, 300));
+    return finishExploration({
+      success: false,
+      error: 'Invalid explore plan: missing startAction. Please try again.',
+      goalResult: null,
+      stepsUsed: 0,
+      creditsUsed: 0,
+      stepLog: [],
+    });
+  }
+
   const stepLog = resumeState?.stepLog || [];
   let currentStrategy = resumeState?.currentStrategy || strategy;
   let creditsUsed = resumeState?.creditsUsed || 0;
@@ -1003,12 +1016,13 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
     explorationActive: { goal, maxSteps, tabId: currentTabId, startedAt: Date.now() },
   });
 
-  // Auto-inject panel when the explore tab navigates (backup for executeExploreAction injection)
+  // Auto-inject panel + explore + HUD when the explore tab navigates (backup for executeExploreAction injection)
   const navListener = (details) => {
     if (details.tabId !== currentTabId || details.frameId !== 0) return;
-    console.log('[Explore] webNavigation.onCompleted — re-injecting panel on', details.url);
+    console.log('[Explore] webNavigation.onCompleted — re-injecting scripts on', details.url);
     chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: ['content_panel.js'] }).catch(() => {});
     chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: ['content_explore.js'] }).catch(() => {});
+    chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: [HUD_SCRIPT] }).catch(() => {});
   };
   chrome.webNavigation.onCompleted.addListener(navListener);
 
@@ -1151,13 +1165,15 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
       }
 
       // THINK: call backend for next action
+      const exploreStepUrl = `${API_BASE}/api/agent/explore-step`;
       await updateExplorationProgress(step, maxSteps, 'Deciding next action...', 'running');
 
       let decision;
       try {
+        console.log(`[Explore] Step ${step}: calling ${exploreStepUrl}`);
         console.log(`[Explore] Step ${step}: snapshot url=${snapshot.url}, elements=${snapshot.semanticElements?.length || 0}, content=${(snapshot.mainContent || '').length} chars`);
         const exploreByokConfig = await getByokConfig();
-        const thinkRes = await fetch(`${API_BASE}/api/agent/explore-step`, {
+        const thinkRes = await fetch(exploreStepUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
           body: JSON.stringify({
@@ -1177,23 +1193,29 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
             await hudUpdate(currentTabId, `explore-${step}`, 'error', 'Insufficient credits');
             break;
           }
-          throw new Error(err.error || `explore-step failed (${thinkRes.status})`);
+          throw new Error(err.error || `explore-step failed (HTTP ${thinkRes.status})`);
         }
 
         decision = await thinkRes.json();
         creditsUsed += 0.3;
+        console.log(`[Explore] Step ${step}: FULL decision object:`, JSON.stringify(decision, null, 2));
         console.log(`[Explore] Step ${step}: AI decided action=${decision.nextAction?.type}, desc="${decision.nextAction?.description}", goalComplete=${decision.isGoalComplete}`);
       } catch (err) {
-        console.error('[Explore] Think step failed:', err.message);
+        const errMsg = err.message || 'Unknown error';
+        const isNetworkError = errMsg.includes('Failed to fetch') || errMsg.includes('NetworkError') || errMsg.includes('ERR_CONNECTION');
+        const userMsg = isNetworkError
+          ? `Backend unreachable (${API_BASE}) — is the server running?`
+          : `AI error: ${errMsg}`;
+        console.error(`[Explore] Think step ${step} failed:`, errMsg);
         consecutiveFailures++;
         stepLog.push({
           step,
           action: { type: 'think', description: 'AI decision' },
           result: { success: false },
-          observation: `Think failed: ${err.message}`,
+          observation: `Think failed: ${userMsg}`,
         });
-        await hudUpdate(currentTabId, `explore-${step}`, 'error', `AI error: ${err.message}`);
-        await updateExplorationProgress(step, maxSteps, `Error: ${err.message}`, 'running');
+        await hudUpdate(currentTabId, `explore-${step}`, 'error', userMsg);
+        await updateExplorationProgress(step, maxSteps, userMsg, 'running');
         continue;
       }
 
@@ -1285,6 +1307,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
       // ACT: execute the decided action
       if (!decision.nextAction) {
         // AI returned no action and goal is not complete — treat as a failure
+        console.error(`[Explore] Step ${step}: NO nextAction! decision keys:`, Object.keys(decision), 'full:', JSON.stringify(decision).slice(0, 1000));
         consecutiveFailures++;
         stepLog.push({
           step,
@@ -1303,20 +1326,28 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
 
       const actionResult = await executeExploreAction(currentTabId, decision.nextAction, token);
 
-      // If navigation happened, re-inject both scripts (in case executeExploreAction's injection failed)
+      // If navigation happened, re-inject all scripts and restore HUD
       if (decision.nextAction?.type === 'navigate' && actionResult.success) {
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId: currentTabId },
-            files: ['content_explore.js'],
-          });
-        } catch {}
-        try {
-          await chrome.scripting.executeScript({
-            target: { tabId: currentTabId },
-            files: ['content_panel.js'],
-          });
-        } catch {}
+        for (const script of ['content_explore.js', 'content_panel.js', HUD_SCRIPT]) {
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId: currentTabId },
+              files: [script],
+            });
+          } catch {}
+        }
+        // Re-show HUD with current progress after navigation destroyed the DOM
+        const hudStepsForReshow = [];
+        for (let i = 0; i <= Math.min(maxSteps, 12); i++) {
+          hudStepsForReshow.push({ id: `explore-${i}`, label: i === 0 ? 'Start' : `Step ${i}` });
+        }
+        await hudShow(currentTabId, `Exploring: ${goal.slice(0, 60)}`, hudStepsForReshow);
+        // Mark completed/failed steps so HUD shows accurate state
+        for (const entry of stepLog) {
+          const status = entry.result?.success === false ? 'error' : 'success';
+          await hudUpdate(currentTabId, `explore-${entry.step}`, status,
+            entry.action?.description || entry.action?.type || '');
+        }
       }
 
       stepLog.push({
@@ -1345,21 +1376,39 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
     // Max steps reached or stopped
     cleanupLoop();
 
-    // Build partial result from observations
-    const observations = stepLog
+    // Build partial result from observations (successful steps)
+    const successObservations = stepLog
       .filter(s => s.observation && s.result?.success)
       .map(s => s.observation)
       .join('\n');
 
+    // Collect errors for diagnostic output
+    const errorObservations = stepLog
+      .filter(s => s.result?.success === false && s.observation)
+      .map(s => s.observation);
+
+    const stoppedDueToFailures = consecutiveFailures >= 3;
+    let goalResult;
+
+    if (stoppedDueToFailures && errorObservations.length > 0) {
+      // Show the actual errors so user/AI can diagnose
+      const lastError = errorObservations[errorObservations.length - 1];
+      goalResult = successObservations
+        ? `Exploration stopped after errors. What I found:\n\n${successObservations}\n\nLast error: ${lastError}`
+        : `Exploration failed: ${lastError}`;
+    } else if (successObservations) {
+      goalResult = `I explored ${stepLog.length} steps but couldn't fully complete the goal. Here's what I found:\n\n${successObservations}`;
+    } else {
+      goalResult = 'Exploration could not complete. Try rephrasing your request or check if the backend server is running.';
+    }
+
     await updateExplorationProgress(maxSteps, maxSteps,
-      consecutiveFailures >= 3 ? 'Stopped after repeated failures' : 'Max steps reached',
+      stoppedDueToFailures ? 'Stopped after repeated failures' : 'Max steps reached',
       'partial');
 
     return finishExploration({
       success: false,
-      goalResult: observations
-        ? `I explored ${stepLog.length} steps but couldn't fully complete the goal. Here's what I found:\n\n${observations}`
-        : 'I tried to explore but couldn\'t gather enough information. Try rephrasing your request.',
+      goalResult,
       stepsUsed: stepLog.length,
       creditsUsed,
       stepLog,

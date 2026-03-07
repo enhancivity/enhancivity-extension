@@ -1064,6 +1064,8 @@ async function startExploration(explorePlan) {
       if (progress.status === 'running') icon.textContent = '...';
       else if (progress.status === 'complete') icon.textContent = '\u2713';
       else if (progress.status === 'partial') icon.textContent = '\u25CB';
+      else if (progress.status === 'consent') icon.textContent = '\u26A0';
+      else if (progress.status === 'login_required') icon.textContent = '\uD83D\uDD12';
       else icon.textContent = '\u2022';
 
       const text = document.createElement('span');
@@ -1093,6 +1095,32 @@ async function startExploration(explorePlan) {
 
   chrome.storage.onChanged.removeListener(explorationListener);
   explorationListener = null;
+
+  // Handle login pause — agent detected a login page and paused
+  if (res?.paused) {
+    area.innerHTML = '';
+    const card = document.createElement('div');
+    card.className = 'action-card';
+    card.style.borderColor = 'rgba(245, 158, 11, 0.3)';
+
+    const headlineEl = document.createElement('p');
+    headlineEl.className = 'action-headline';
+    headlineEl.textContent = '\uD83D\uDD12 Login Required';
+    card.appendChild(headlineEl);
+
+    const reasonEl = document.createElement('p');
+    reasonEl.className = 'action-rationale';
+    reasonEl.textContent = res.pauseReason || 'Sign in on this page. The agent will detect when you\'re done and resume automatically.';
+    card.appendChild(reasonEl);
+
+    const hintEl = document.createElement('p');
+    hintEl.style.cssText = 'font-size: 11px; color: rgba(245, 158, 11, 0.8); margin-top: 8px;';
+    hintEl.textContent = 'Watching for login completion... will auto-resume';
+    card.appendChild(hintEl);
+
+    area.appendChild(card);
+    return;
+  }
 
   // Render result
   area.innerHTML = '';
