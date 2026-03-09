@@ -7,6 +7,12 @@
 (() => {
   'use strict';
 
+  // Truncate long text for display (e.g., exploration results with raw page content)
+  function truncateForDisplay(text, maxLen = 500) {
+    if (!text || text.length <= maxLen) return text;
+    return text.slice(0, maxLen) + '... [see full results]';
+  }
+
   // Double-injection guard — but allow re-init if DOM was removed (SPA navigation)
   if (window.__enhPanelLoaded) {
     const hostStillInDom = document.getElementById('enh-panel-host');
@@ -350,7 +356,9 @@
     e.preventDefault();
   });
 
-  document.addEventListener('mousemove', (e) => {
+  // Drag move — listen on BOTH document and shadow root to handle
+  // cases where mouse leaves the shadow DOM (iframes, cross-origin elements)
+  function onDragMove(e) {
     if (!isDragging) return;
     let newLeft = e.clientX - dragOffsetX;
     let newTop = e.clientY - dragOffsetY;
@@ -365,12 +373,44 @@
     panel.style.top = newTop + 'px';
     panel.style.right = 'auto';
     panel.style.bottom = 'auto';
-  });
+  }
 
-  document.addEventListener('mouseup', () => {
+  function onDragEnd() {
     if (!isDragging) return;
     isDragging = false;
     saveState();
+  }
+
+  document.addEventListener('mousemove', onDragMove);
+  document.addEventListener('mouseup', onDragEnd);
+  // Shadow root listeners — catch events that don't reach outer document
+  shadow.addEventListener('mousemove', onDragMove);
+  shadow.addEventListener('mouseup', onDragEnd);
+
+  // Safety: if mouse re-enters the panel after a lost mouseup (e.g. mouse left
+  // the browser window or crossed an iframe), reset isDragging on next mousedown
+  // inside the panel so buttons aren't stuck.
+  panel.addEventListener('mousedown', () => {
+    // If we somehow still think we're dragging but the user clicked inside
+    // the panel again (not on the header), force-end the drag.
+    // Header mousedown has its own handler that fires first (bubbling).
+  });
+  document.addEventListener('mouseenter', () => {
+    // Mouse re-entered the page — if no button is held, end any stuck drag
+    // (mouseenter fires even if mouseup was missed)
+  });
+  window.addEventListener('blur', () => {
+    // Window lost focus (user alt-tabbed, clicked iframe, etc.) — end drag
+    if (isDragging) {
+      isDragging = false;
+      saveState();
+    }
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (isDragging) {
+      isDragging = false;
+      saveState();
+    }
   });
 
   // ── Panel Visibility ────────────────────────────────────────
@@ -406,8 +446,18 @@
   // Expose toggle for re-injection calls
   window.__enhPanelToggle = togglePanel;
 
-  closeBtn.addEventListener('click', closePanel);
-  minimizeBtn.addEventListener('click', togglePanel);
+  // Close/minimize: use pointerdown so they fire even if isDragging is stuck
+  // (click can be swallowed when drag state is confused). Force-reset drag first.
+  closeBtn.addEventListener('pointerdown', (e) => {
+    e.stopPropagation();
+    isDragging = false;
+    closePanel();
+  });
+  minimizeBtn.addEventListener('pointerdown', (e) => {
+    e.stopPropagation();
+    isDragging = false;
+    togglePanel();
+  });
   signOutBtn?.addEventListener('click', async () => {
     await chrome.storage.local.clear();
     // Reload panel to show auth fallback
@@ -853,7 +903,7 @@
       const resultEl = document.createElement('div');
       resultEl.className = 'enh-action-rationale';
       resultEl.style.whiteSpace = 'pre-wrap';
-      resultEl.textContent = data.goalResult || 'Exploration finished.';
+      resultEl.textContent = truncateForDisplay(data.goalResult || 'Exploration finished.');
       card.appendChild(resultEl);
 
       if (data.stepsUsed) {
@@ -1734,12 +1784,51 @@
       tabId = null;
     }
 
-    // Start exploration via background
-    const res = await sendToBackground('explore_start', { explorePlan, tabId }, 130000); // 130s timeout (120s loop + 10s buffer)
+    // Start exploration via background (fire-and-forget — result arrives via chrome.storage)
+    const startRes = await sendToBackground('explore_start', { explorePlan, tabId }, 10000);
+
+    if (!startRes?.success && !startRes?.async) {
+      // Immediate failure (e.g., no tabId, invalid plan)
+      chrome.storage.onChanged.removeListener(explorationListener);
+      explorationListener = null;
+      exploreWrapper.innerHTML = `<div class="enh-action-card"><p class="enh-error-message">${startRes?.error || 'Failed to start exploration.'}</p></div>`;
+      resultsArea.classList.remove('enh-hidden');
+      chatArea.scrollTop = chatArea.scrollHeight;
+      promptInput.focus();
+      return;
+    }
+
+    // Wait for the final result via chrome.storage.session (set by background when loop finishes)
+    const res = await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        resolve({ success: false, error: 'Exploration timed out after 130 seconds.' });
+      }, 130000);
+
+      const resultListener = (changes, areaName) => {
+        if (areaName !== 'session' || !changes.explorationResult) return;
+        clearTimeout(timeout);
+        chrome.storage.onChanged.removeListener(resultListener);
+        resolve(changes.explorationResult.newValue);
+      };
+      chrome.storage.onChanged.addListener(resultListener);
+
+      // Also check if result already arrived (race condition guard)
+      chrome.storage.session.get(['explorationResult']).then(data => {
+        if (data.explorationResult) {
+          clearTimeout(timeout);
+          chrome.storage.onChanged.removeListener(resultListener);
+          // Clear it so next exploration starts fresh
+          chrome.storage.session.remove(['explorationResult']).catch(() => {});
+          resolve(data.explorationResult);
+        }
+      }).catch(() => {});
+    });
 
     // Clean up listener
-    chrome.storage.onChanged.removeListener(explorationListener);
-    explorationListener = null;
+    if (explorationListener) {
+      chrome.storage.onChanged.removeListener(explorationListener);
+      explorationListener = null;
+    }
 
     // If paused for login, show login-required UI and wait for user action
     if (res?.paused) {
@@ -1749,7 +1838,7 @@
         timestamp: Date.now(),
       });
       saveConversation();
-      renderLoginRequired(res.pauseReason, res.resumeStateKey);
+      renderLoginRequired(res.pauseReason, res.resumeStateKey, res.authType);
       return;
     }
 
@@ -1768,7 +1857,7 @@
       const resultEl = document.createElement('div');
       resultEl.className = 'enh-action-rationale';
       resultEl.style.whiteSpace = 'pre-wrap';
-      resultEl.textContent = res.goalResult || 'Exploration finished.';
+      resultEl.textContent = truncateForDisplay(res.goalResult || 'Exploration finished.');
       card.appendChild(resultEl);
 
       if (res.stepsUsed) {
@@ -1927,7 +2016,7 @@
         timestamp: Date.now(),
       });
       saveConversation();
-      renderLoginRequired(res.pauseReason, res.resumeStateKey);
+      renderLoginRequired(res.pauseReason, res.resumeStateKey, res.authType);
       return;
     }
 
@@ -1943,7 +2032,7 @@
       const resultEl = document.createElement('div');
       resultEl.className = 'enh-action-rationale';
       resultEl.style.whiteSpace = 'pre-wrap';
-      resultEl.textContent = res.goalResult || 'Exploration finished.';
+      resultEl.textContent = truncateForDisplay(res.goalResult || 'Exploration finished.');
       card.appendChild(resultEl);
 
       if (res.stepsUsed) {
@@ -1984,7 +2073,7 @@
 
   // ── Login Required: Pause exploration and wait for user login ──
 
-  function renderLoginRequired(pauseReason, resumeStateKey) {
+  function renderLoginRequired(pauseReason, resumeStateKey, authType) {
     resultsArea.classList.remove('enh-hidden');
 
     const wrapper = document.createElement('div');
@@ -1994,19 +2083,28 @@
     card.className = 'enh-action-card enh-consent-soft';
     card.style.cssText = 'border-color: rgba(245, 158, 11, 0.25); background: rgba(24, 18, 8, 0.85);';
 
+    // Auth-type-specific UI
+    const authUI = {
+      login:       { icon: '\uD83D\uDD12', title: 'Login Required',        instruction: 'Sign in on this page. The agent will detect when you\u2019re done and resume automatically.' },
+      two_factor:  { icon: '\uD83D\uDD10', title: 'Verification Required',  instruction: 'Complete the two-factor verification. The agent will resume when you\u2019re through.' },
+      captcha:     { icon: '\uD83E\uDDE9', title: 'CAPTCHA Required',       instruction: 'Solve the CAPTCHA challenge. The agent will resume once verified.' },
+      oauth:       { icon: '\uD83D\uDD11', title: 'Sign-In Required',       instruction: 'Complete the single sign-on process. The agent will resume automatically.' },
+    };
+    const ui = authUI[authType] || authUI.login;
+
     // Headline row
     const headlineRow = document.createElement('div');
     headlineRow.style.cssText = 'display: flex; align-items: center; gap: 8px;';
 
     const icon = document.createElement('span');
     icon.style.cssText = 'font-size: 16px;';
-    icon.textContent = '\uD83D\uDD12'; // lock
+    icon.textContent = ui.icon;
     headlineRow.appendChild(icon);
 
     const headline = document.createElement('p');
     headline.className = 'enh-action-headline';
     headline.style.cssText = 'margin: 0; color: #fbbf24;';
-    headline.textContent = 'Login Required';
+    headline.textContent = ui.title;
     headlineRow.appendChild(headline);
     card.appendChild(headlineRow);
 
@@ -2018,7 +2116,7 @@
 
     const instructions = document.createElement('p');
     instructions.style.cssText = 'font-size: 11px; color: rgba(255,255,255,0.4); margin: 0;';
-    instructions.textContent = 'Sign in on this page. The agent will detect when you\u2019re done and resume automatically.';
+    instructions.textContent = ui.instruction;
     card.appendChild(instructions);
 
     // Auto-resume indicator
@@ -2140,7 +2238,7 @@
 
       // Another login page — recursive pause
       if (res?.paused) {
-        renderLoginRequired(res.pauseReason, res.resumeStateKey);
+        renderLoginRequired(res.pauseReason, res.resumeStateKey, res.authType);
         return;
       }
 
@@ -2158,7 +2256,7 @@
         const r = document.createElement('div');
         r.className = 'enh-action-rationale';
         r.style.whiteSpace = 'pre-wrap';
-        r.textContent = res.goalResult || 'Exploration finished.';
+        r.textContent = truncateForDisplay(res.goalResult || 'Exploration finished.');
         rCard.appendChild(r);
         if (res.stepsUsed) {
           const m = document.createElement('p');
@@ -2278,10 +2376,45 @@
 
     chrome.storage.onChanged.addListener(orchestrationListener);
 
-    const res = await sendToBackground('orchestrate_search', { searchPlan, userPrompt });
+    // Fire-and-forget — result arrives via chrome.storage.session
+    const startRes = await sendToBackground('orchestrate_search', { searchPlan, userPrompt });
 
-    chrome.storage.onChanged.removeListener(orchestrationListener);
-    orchestrationListener = null;
+    if (!startRes?.success && !startRes?.async) {
+      chrome.storage.onChanged.removeListener(orchestrationListener);
+      orchestrationListener = null;
+      orchWrapper.innerHTML = `<div class="enh-action-card"><p class="enh-error-message">${startRes?.error || 'Failed to start search.'}</p></div>`;
+      return;
+    }
+
+    // Wait for the final result via chrome.storage.session
+    const res = await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        resolve({ success: false, error: 'Search timed out after 60 seconds.' });
+      }, 60000);
+
+      const resultListener = (changes, areaName) => {
+        if (areaName !== 'session' || !changes.orchestrationResult) return;
+        clearTimeout(timeout);
+        chrome.storage.onChanged.removeListener(resultListener);
+        resolve(changes.orchestrationResult.newValue);
+      };
+      chrome.storage.onChanged.addListener(resultListener);
+
+      // Race condition guard
+      chrome.storage.session.get(['orchestrationResult']).then(data => {
+        if (data.orchestrationResult) {
+          clearTimeout(timeout);
+          chrome.storage.onChanged.removeListener(resultListener);
+          chrome.storage.session.remove(['orchestrationResult']).catch(() => {});
+          resolve(data.orchestrationResult);
+        }
+      }).catch(() => {});
+    });
+
+    if (orchestrationListener) {
+      chrome.storage.onChanged.removeListener(orchestrationListener);
+      orchestrationListener = null;
+    }
 
     if (!res?.success) {
       orchWrapper.innerHTML = `<div class="enh-action-card"><p class="enh-error-message">${res?.error || 'Search failed. Please try again.'}</p></div>`;

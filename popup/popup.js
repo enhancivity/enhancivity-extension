@@ -2,6 +2,12 @@
 // Enhancivity Popup Script — Chief of Staff Edition
 // ============================================================
 
+// Truncate long text for display (e.g., exploration results with raw page content)
+function truncateForDisplay(text, maxLen = 500) {
+  if (!text || text.length <= maxLen) return text;
+  return text.slice(0, maxLen) + '... [see full results]';
+}
+
 const PLACEHOLDERS = {
   gmail:   "Analyze this email...",
   amazon:  "Evaluate this product...",
@@ -1088,13 +1094,47 @@ async function startExploration(explorePlan) {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   const tabId = tabs[0]?.id;
 
-  const res = await chrome.runtime.sendMessage({
+  const startRes = await chrome.runtime.sendMessage({
     type: 'explore_start',
     data: { explorePlan, tabId },
   });
 
-  chrome.storage.onChanged.removeListener(explorationListener);
-  explorationListener = null;
+  if (!startRes?.success && !startRes?.async) {
+    chrome.storage.onChanged.removeListener(explorationListener);
+    explorationListener = null;
+    area.innerHTML = `<div class="action-card"><p class="error-message">${startRes?.error || 'Failed to start exploration.'}</p></div>`;
+    return;
+  }
+
+  // Wait for the final result via chrome.storage.session
+  const res = await new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      resolve({ success: false, error: 'Exploration timed out after 130 seconds.' });
+    }, 130000);
+
+    const resultListener = (changes, areaName) => {
+      if (areaName !== 'session' || !changes.explorationResult) return;
+      clearTimeout(timeout);
+      chrome.storage.onChanged.removeListener(resultListener);
+      resolve(changes.explorationResult.newValue);
+    };
+    chrome.storage.onChanged.addListener(resultListener);
+
+    // Race condition guard
+    chrome.storage.session.get(['explorationResult']).then(data => {
+      if (data.explorationResult) {
+        clearTimeout(timeout);
+        chrome.storage.onChanged.removeListener(resultListener);
+        chrome.storage.session.remove(['explorationResult']).catch(() => {});
+        resolve(data.explorationResult);
+      }
+    }).catch(() => {});
+  });
+
+  if (explorationListener) {
+    chrome.storage.onChanged.removeListener(explorationListener);
+    explorationListener = null;
+  }
 
   // Handle login pause — agent detected a login page and paused
   if (res?.paused) {
@@ -1137,7 +1177,7 @@ async function startExploration(explorePlan) {
     const resultEl = document.createElement('div');
     resultEl.className = 'action-rationale';
     resultEl.style.whiteSpace = 'pre-wrap';
-    resultEl.textContent = res.goalResult || 'Exploration finished.';
+    resultEl.textContent = truncateForDisplay(res.goalResult || 'Exploration finished.');
     card.appendChild(resultEl);
 
     if (res.stepsUsed) {
@@ -1232,12 +1272,46 @@ async function startOrchestration(searchPlan, userPrompt) {
 
   chrome.storage.onChanged.addListener(orchestrationListener);
 
-  // Trigger the actual orchestration
-  const res = await sendToBackground('orchestrate_search', { searchPlan, userPrompt });
+  // Trigger the actual orchestration (fire-and-forget — result via chrome.storage)
+  const startRes = await sendToBackground('orchestrate_search', { searchPlan, userPrompt });
+
+  if (!startRes?.success && !startRes?.async) {
+    chrome.storage.onChanged.removeListener(orchestrationListener);
+    orchestrationListener = null;
+    area.innerHTML = `<div class="action-card"><p class="error-message">${startRes?.error || 'Failed to start search.'}</p></div>`;
+    return;
+  }
+
+  // Wait for the final result via chrome.storage.session
+  const res = await new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      resolve({ success: false, error: 'Search timed out after 60 seconds.' });
+    }, 60000);
+
+    const resultListener = (changes, areaName) => {
+      if (areaName !== 'session' || !changes.orchestrationResult) return;
+      clearTimeout(timeout);
+      chrome.storage.onChanged.removeListener(resultListener);
+      resolve(changes.orchestrationResult.newValue);
+    };
+    chrome.storage.onChanged.addListener(resultListener);
+
+    // Race condition guard
+    chrome.storage.session.get(['orchestrationResult']).then(data => {
+      if (data.orchestrationResult) {
+        clearTimeout(timeout);
+        chrome.storage.onChanged.removeListener(resultListener);
+        chrome.storage.session.remove(['orchestrationResult']).catch(() => {});
+        resolve(data.orchestrationResult);
+      }
+    }).catch(() => {});
+  });
 
   // Clean up listener
-  chrome.storage.onChanged.removeListener(orchestrationListener);
-  orchestrationListener = null;
+  if (orchestrationListener) {
+    chrome.storage.onChanged.removeListener(orchestrationListener);
+    orchestrationListener = null;
+  }
 
   if (!res?.success) {
     area.innerHTML = `<div class="action-card"><p class="error-message">${res?.error || 'Search failed. Please try again.'}</p></div>`;

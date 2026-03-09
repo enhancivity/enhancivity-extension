@@ -286,6 +286,26 @@ async function trySessionBypass(tabId, currentUrl) {
       const newSnapshot = await takePageSnapshot(tabId);
 
       if (!newSnapshot.isLoginPage) {
+        // Extra check: even though it's not a "login page" (no password field),
+        // the page might still show the user as NOT signed in (e.g., Amazon homepage
+        // with "Sign in" link). Check for signed-in indicators vs sign-in prompts.
+        const pageText = (newSnapshot.mainContent || '').toLowerCase();
+        const hasSignInPrompt = newSnapshot.semanticElements?.some(el => {
+          const text = (el.text || '').toLowerCase();
+          return (text.includes('sign in') || text.includes('log in') || text.includes('hello, sign in'))
+            && (el.type === 'link' || el.type === 'button');
+        });
+        const hasSignedInIndicator = newSnapshot.semanticElements?.some(el => {
+          const text = (el.text || '').toLowerCase();
+          return text.includes('sign out') || text.includes('log out') || text.includes('my account')
+            || text.includes('your account') || text.includes('hello,') && !text.includes('hello, sign in');
+        });
+
+        if (hasSignInPrompt && !hasSignedInIndicator) {
+          console.log(`[AuthBridge] Bypass landed on non-login page but user is NOT signed in (${candidateUrl}). Continuing to next candidate.`);
+          continue; // Try next candidate
+        }
+
         console.log(`[AuthBridge] Bypass SUCCESS for ${domain} via ${candidateUrl}`);
         await markSiteAuthenticated(baseDomain);
 
@@ -899,12 +919,46 @@ async function scrapePageState(tabId) {
   return null;
 }
 
+// Placeholder URL patterns — these are template URLs, not real websites
+const PLACEHOLDER_URL_PATTERNS = [
+  'your-', 'example.', 'placeholder', 'instance-url', 'xxx.',
+  'sample.', 'test.', 'demo.', 'foo.', 'bar.',
+  '[your', '{your', '<your',
+];
+
+function isPlaceholderUrl(url) {
+  const lower = (url || '').toLowerCase();
+  return PLACEHOLDER_URL_PATTERNS.some(p => lower.includes(p));
+}
+
 async function executeExploreAction(tabId, action, token) {
   try {
+    // AUTH GATE PRE-CHECK: Before any DOM-interactive action, verify we're not on an auth page.
+    // This catches session expiry mid-task (user gets redirected to login).
+    if (['click_element', 'type_text', 'fill_field', 'read_element'].includes(action.type)) {
+      try {
+        await chrome.scripting.executeScript({ target: { tabId }, files: ['content_explore.js'] }).catch(() => {});
+        const authCheck = await chrome.tabs.sendMessage(tabId, { type: 'explore_action', actionType: 'auth_check' }).catch(() => null);
+        if (authCheck?.isAuthPage) {
+          return {
+            success: false,
+            error: `AUTH_GATE_DETECTED (${authCheck.authType}): Page is an authentication page. Agent cannot interact — user must log in manually.`,
+            blocked: true,
+            authGate: { authType: authCheck.authType, signals: authCheck.signals },
+          };
+        }
+      } catch {
+        // Non-fatal — if auth check fails, proceed with action (content script may not be ready)
+      }
+    }
+
     if (action.type === 'navigate') {
       // Navigate to URL
       const url = action.target || action.value;
       if (!url) return { success: false, error: 'No URL provided for navigate' };
+      if (isPlaceholderUrl(url)) {
+        return { success: false, error: 'BLOCKED: This appears to be a placeholder URL, not a real website. Ask the user for the actual URL.' };
+      }
       if (!isAllowedForExplore(url)) {
         return { success: false, error: `BLOCKED: Domain not allowed for exploration: ${url}` };
       }
@@ -942,6 +996,23 @@ async function executeExploreAction(tabId, action, token) {
         observation: `Navigated to ${actualUrl}`,
         newUrl: actualUrl,
       };
+    }
+
+    // resolve_element: multi-signal element resolution, returns best match SID
+    if (action.type === 'resolve_element') {
+      try {
+        await chrome.scripting.executeScript({ target: { tabId }, files: ['content_explore.js'] }).catch(() => {});
+        await new Promise(r => setTimeout(r, 200));
+        const result = await chrome.tabs.sendMessage(tabId, {
+          type: 'explore_action',
+          actionType: 'resolve_element',
+          target: action.target,
+          value: action.value,
+        });
+        return result || { success: false, error: 'No response from resolve_element' };
+      } catch (err) {
+        return { success: false, error: `resolve_element failed: ${err.message}` };
+      }
     }
 
     // fill_field: delegate to Ghost-Driver's semantic form filler
@@ -1105,26 +1176,68 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
 
       const snapshot = await takePageSnapshot(currentTabId);
 
-      // ── AUTH BRIDGE: Smart login handling ──────────────────────
-      // Instead of immediately pausing, try to use existing sessions.
-      if (snapshot.isLoginPage) {
+      // ── AUTH GATE DETECTOR: Comprehensive auth page handling ──
+      // Runs BEFORE any action decision. Checks for login, 2FA, CAPTCHA, OAuth.
+      // Uses the enhanced AuthGateDetector in content_explore.js for multi-signal detection.
+      const authGateInfo = snapshot.authGate || (snapshot.isLoginPage ? { authType: 'login', signals: ['legacy_detection'], signalCount: 1 } : null);
+      const isAuthGatePage = snapshot.isLoginPage || (authGateInfo && authGateInfo.signalCount >= 2);
+
+      if (isAuthGatePage) {
         const loginDomain = (() => { try { return new URL(snapshot.url).hostname; } catch { return 'unknown'; } })();
-        console.log(`[AuthBridge] Login page detected on ${loginDomain}`);
+        const authType = authGateInfo?.authType || 'login';
+        const authSignals = authGateInfo?.signals || [];
+        console.log(`[AuthGate] ${authType} page detected on ${loginDomain} (signals: ${authSignals.join(', ')})`);
+
+        // 2FA and CAPTCHA pages: user MUST handle these manually, no bypass possible
+        if (authType === 'two_factor' || authType === 'captcha') {
+          console.log(`[AuthGate] ${authType} detected — immediate pause, no bypass attempt`);
+          const stateKey = `exploreResume_${Date.now()}`;
+          await chrome.storage.session.set({
+            [stateKey]: {
+              stepLog, currentStrategy, creditsUsed,
+              consecutiveFailures, nextStep: step,
+              explorePlan, tabId: currentTabId,
+            },
+          });
+
+          const pauseMsg = authType === 'two_factor'
+            ? `Two-factor verification required on ${loginDomain}. Please complete the verification — the agent will resume automatically.`
+            : `CAPTCHA verification required on ${loginDomain}. Please solve the CAPTCHA — the agent will resume automatically.`;
+
+          await updateExplorationProgress(step, maxSteps, pauseMsg, 'login_required');
+          watchForLoginCompletion(currentTabId, stateKey, token);
+          cleanupLoop();
+
+          return finishExploration({
+            success: false, paused: true,
+            pauseReason: pauseMsg,
+            resumeStateKey: stateKey,
+            creditsUsed, stepLog,
+            authType,
+          });
+        }
+
+        // Login/OAuth pages: try session bypass first
+        // Loop detection: if we already attempted auth_bypass for this domain, don't try again
+        const alreadyTriedBypass = stepLog.some(s => s.action?.type === 'auth_bypass' && s.observation?.includes(loginDomain));
+        if (alreadyTriedBypass) {
+          console.log(`[AuthGate] Already tried bypass for ${loginDomain} — skipping to manual login`);
+        }
+
         await updateExplorationProgress(step, maxSteps, `Checking session for ${loginDomain}...`, 'running');
 
         // Layer 1: Probe for existing session (other tabs, cookies, cache)
         const sessionProbe = await probeExistingSession(loginDomain);
 
-        if (sessionProbe.hasSession) {
-          console.log(`[AuthBridge] Session hint found: ${sessionProbe.method} — ${sessionProbe.detail}`);
+        if (sessionProbe.hasSession && !alreadyTriedBypass) {
+          console.log(`[AuthGate] Session hint found: ${sessionProbe.method} — ${sessionProbe.detail}`);
           await updateExplorationProgress(step, maxSteps, `Found session (${sessionProbe.method}) — trying bypass...`, 'running');
 
           // Layer 2: Try to bypass the login page
           const bypass = await trySessionBypass(currentTabId, snapshot.url);
 
           if (bypass.bypassed) {
-            // Success — user is authenticated, continue exploration
-            console.log(`[AuthBridge] Bypassed login for ${loginDomain}`);
+            console.log(`[AuthGate] Bypassed login for ${loginDomain}`);
             await updateExplorationProgress(step, maxSteps, `Signed in to ${loginDomain} (existing session)`, 'running');
             stepLog.push({
               step,
@@ -1138,7 +1251,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
         }
 
         // No session found or bypass failed — must pause for manual login
-        console.log(`[AuthBridge] No usable session for ${loginDomain} — pausing for user login`);
+        console.log(`[AuthGate] No usable session for ${loginDomain} — pausing for user login`);
         const stateKey = `exploreResume_${Date.now()}`;
         await chrome.storage.session.set({
           [stateKey]: {
@@ -1151,9 +1264,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
         await updateExplorationProgress(step, maxSteps,
           'Login required \u2014 sign in and the agent will resume', 'login_required');
 
-        // Start auto-resume watcher — will resume exploration when user finishes logging in
         watchForLoginCompletion(currentTabId, stateKey, token);
-
         cleanupLoop();
 
         return finishExploration({
@@ -1161,7 +1272,47 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
           pauseReason: `This page requires you to sign in to ${loginDomain}. Log in on this page — the agent will detect when you're done and resume automatically.`,
           resumeStateKey: stateKey,
           creditsUsed, stepLog,
+          authType,
         });
+      }
+
+      // ── SESSION CONTEXT VALIDATOR: Track & validate active account ──
+      // Detects which account is active on multi-account platforms (Google, Facebook, AWS)
+      // and stores it in session-level context. The AI receives this info to make
+      // account-aware decisions.
+      if (snapshot.accountContext && snapshot.accountContext.activeAccount) {
+        const acct = snapshot.accountContext;
+        try {
+          const { sessionAccountMap = {} } = await chrome.storage.session.get('sessionAccountMap');
+          const platform = acct.platform || 'unknown';
+
+          // Store/update account context for this platform
+          sessionAccountMap[platform] = {
+            activeAccount: acct.activeAccount,
+            accountIndex: acct.accountIndex,
+            allAccounts: acct.allAccounts || [],
+            composingAs: acct.composingAs || null,
+            businessAccountId: acct.businessAccountId || null,
+            lastSeen: Date.now(),
+          };
+          await chrome.storage.session.set({ sessionAccountMap });
+
+          // Log for debugging
+          console.log(`[SessionContext] ${platform}: active=${acct.activeAccount}, index=${acct.accountIndex}`);
+
+          // Inject account context into step log observation so AI knows which account is active
+          // This doesn't cost a step — it's metadata attached to the snapshot observation
+          if (step === startStep || (stepLog.length > 0 && stepLog[stepLog.length - 1].action?.type === 'navigate')) {
+            stepLog.push({
+              step: -1, // meta-step, not counted
+              action: { type: 'session_context', description: `Detected active account: ${acct.activeAccount}` },
+              result: { success: true },
+              observation: `Active ${platform} account: ${acct.activeAccount}${acct.accountIndex !== null ? ` (index ${acct.accountIndex})` : ''}${acct.composingAs ? ` | Composing as: ${acct.composingAs}` : ''}${acct.allAccounts.length > 1 ? ` | All accounts: ${acct.allAccounts.join(', ')}` : ''}`,
+            });
+          }
+        } catch (e) {
+          console.warn('[SessionContext] Failed to store account context:', e.message);
+        }
       }
 
       // THINK: call backend for next action
@@ -1217,6 +1368,79 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
         await hudUpdate(currentTabId, `explore-${step}`, 'error', userMsg);
         await updateExplorationProgress(step, maxSteps, userMsg, 'running');
         continue;
+      }
+
+      // ── Loop Detection: stop the AI from repeating the same action ──
+      if (decision.nextAction && stepLog.length > 0) {
+        const currType = decision.nextAction.type;
+        const currTarget = decision.nextAction.target;
+
+        // Skip loop detection for non-interactive actions
+        if (currType !== 'scrape_page' && currType !== 'scroll' && currType !== 'wait' && currType !== 'resolve_element') {
+          // Count consecutive repeats of the exact same action+target
+          let repeatCount = 0;
+          for (let ri = stepLog.length - 1; ri >= 0; ri--) {
+            if (stepLog[ri].action?.type === currType && stepLog[ri].action?.target === currTarget) repeatCount++;
+            else break;
+          }
+          repeatCount++; // include current attempt
+
+          if (repeatCount >= 3) {
+            console.warn(`[Explore] Step ${step}: LOOP DETECTED — ${currType}(${currTarget}) repeated ${repeatCount} times`);
+            // Log the loop and try alternative approach
+            stepLog.push({
+              step,
+              action: { type: 'loop_break', description: `Loop detected: ${currType}(${currTarget}) x${repeatCount}` },
+              result: { success: false },
+              observation: `LOOP BREAK: Agent tried ${currType} on "${currTarget}" ${repeatCount} times with no progress. Attempting alternative approach: scroll + re-scan.`,
+            });
+
+            // Try scrolling to reveal hidden elements, then force scrape
+            try {
+              await chrome.tabs.sendMessage(currentTabId, {
+                type: 'explore_action', actionType: 'scroll', target: 'down',
+              }).catch(() => {});
+            } catch {}
+            await new Promise(r => setTimeout(r, 500));
+
+            decision.nextAction = {
+              type: 'scrape_page',
+              description: `Re-scanning after loop break (tried ${currType} on ${currTarget} ${repeatCount}x)`,
+            };
+            decision.revisedStrategy = `Previous approach failed (loop on ${currTarget}). Try a different element, use keyboard navigation, or navigate to a different URL.`;
+            consecutiveFailures++;
+            continue;
+          }
+
+          if (repeatCount >= 2) {
+            // Force a scrape_page on second repeat instead of letting it continue
+            console.warn(`[Explore] Step ${step}: Blocked repeated ${currType}(${currTarget}), forcing scrape_page`);
+            decision.nextAction = {
+              type: 'scrape_page',
+              description: `Re-reading page (blocked repeated ${currType} on ${currTarget})`,
+            };
+          }
+
+          // Also detect "same action type on different targets with no state change"
+          // (e.g., clicking 3 different "Edit" buttons with none working)
+          if (currType === 'click_element' && stepLog.length >= 3) {
+            const recentClicks = stepLog.slice(-3).filter(s =>
+              s.action?.type === 'click_element' && s.result?.success !== false
+            );
+            if (recentClicks.length >= 3) {
+              // Check if the page URL hasn't changed across these clicks
+              const sameUrl = recentClicks.every(s =>
+                s.observation && !s.observation.includes('Navigated')
+              );
+              if (sameUrl) {
+                console.warn(`[Explore] Step ${step}: 3 clicks with no navigation — adding disambiguation hint`);
+                // Don't break, but inject a hint for the AI
+                decision.revisedStrategy = (decision.revisedStrategy || currentStrategy) +
+                  ' NOTE: Multiple clicks have not changed the page. Consider using resolve_element to find the correct target, or try a completely different approach.';
+              }
+            }
+          }
+        }
       }
 
       // Check if goal is complete
@@ -1281,6 +1505,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
             pauseReason: `Sign in to ${loginDomain} on this page — the agent will resume automatically when you're done.`,
             resumeStateKey: stateKey,
             creditsUsed, stepLog,
+            authType: 'login',
           });
         }
 
@@ -1581,22 +1806,44 @@ async function stageAction(tabId, userGoal, category, token) {
 // --- Central Message Handler ---
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  // Timeout guard: if handleMessage takes longer than 30s, send an error response
+  // so the message channel doesn't hang open indefinitely (causing "message channel closed" warnings).
+  let responded = false;
+  const safeRespond = (result) => {
+    if (responded) return; // Only send once
+    responded = true;
+    try { sendResponse(result); } catch (_) { /* channel already closed */ }
+  };
+
+  const timeoutId = setTimeout(() => {
+    if (!responded) {
+      console.warn(`[BG_TIMEOUT] Handler for '${request.type}' exceeded 30s — sending timeout response.`);
+      safeRespond({
+        success: false,
+        errorType: 'BACKEND_TIMEOUT',
+        error: `Handler for '${request.type}' timed out after 30 seconds. The operation may still be running in the background.`,
+      });
+    }
+  }, 30000);
+
   handleMessage(request, sender)
     .then(result => {
+      clearTimeout(timeoutId);
       // Ensure we ALWAYS send a valid response object
       const safeResult = (result && typeof result === 'object')
         ? result
         : { success: false, errorType: 'EMPTY_HANDLER', error: `Handler for '${request.type}' returned no data.` };
-      try { sendResponse(safeResult); } catch (_) { /* channel closed */ }
+      safeRespond(safeResult);
     })
     .catch(err => {
+      clearTimeout(timeoutId);
       console.error(`[BG_ERROR] ${request.type}:`, err);
       const errorObj = {
         success: false,
         errorType: 'HANDLER_CRASH',
         error: (err && err.message) || 'Background handler crashed unexpectedly.',
       };
-      try { sendResponse(errorObj); } catch (_) { /* channel closed */ }
+      safeRespond(errorObj);
     });
   return true; // Keep message channel open for async response
 });
@@ -2084,6 +2331,7 @@ async function handleMessage(request, sender) {
   }
 
   // ── ORCHESTRATE: Multi-site parallel search ──────────────
+  // Fire-and-forget: return immediately, results come via chrome.storage/progress events
   if (request.type === 'orchestrate_search') {
     const { searchPlan, userPrompt } = request.data;
 
@@ -2091,7 +2339,21 @@ async function handleMessage(request, sender) {
       return { success: false, error: 'Invalid search plan: no sites specified.' };
     }
 
-    return await runOrchestration(userPrompt, searchPlan, token);
+    // Clear stale result before starting
+    await chrome.storage.session.remove(['orchestrationResult']).catch(() => {});
+
+    // Run in background — don't await (prevents message channel timeout)
+    runOrchestration(userPrompt, searchPlan, token)
+      .then(result => {
+        // Store result for the panel to pick up
+        chrome.storage.session.set({ orchestrationResult: result }).catch(() => {});
+        console.log('[Orchestrate] Completed in background, result stored in session storage.');
+      })
+      .catch(err => {
+        console.error('[Orchestrate] Background error:', err);
+        chrome.storage.session.set({ orchestrationResult: { success: false, error: err.message } }).catch(() => {});
+      });
+    return { success: true, async: true, message: 'Orchestration started. Results will arrive via progress updates.' };
   }
 
   // ── OPEN SETTINGS: Open popup in a new tab at #settings ────
@@ -2102,6 +2364,7 @@ async function handleMessage(request, sender) {
   }
 
   // ── EXPLORE: Multi-step agentic exploration loop ────────────
+  // Fire-and-forget: return immediately, results come via updateExplorationProgress
   if (request.type === 'explore_start') {
     const { explorePlan } = request.data;
     if (!explorePlan || !explorePlan.goal) {
@@ -2118,7 +2381,21 @@ async function handleMessage(request, sender) {
     if (!tabId) {
       return { success: false, error: 'Could not determine which tab to explore.' };
     }
-    return await runExplorationLoop(explorePlan, tabId, token);
+
+    // Clear stale result before starting
+    await chrome.storage.session.remove(['explorationResult']).catch(() => {});
+
+    // Run in background — don't await (prevents message channel timeout)
+    runExplorationLoop(explorePlan, tabId, token)
+      .then(result => {
+        chrome.storage.session.set({ explorationResult: result }).catch(() => {});
+        console.log('[Explore] Loop completed in background, result stored in session storage.');
+      })
+      .catch(err => {
+        console.error('[Explore] Background loop error:', err);
+        chrome.storage.session.set({ explorationResult: { success: false, error: err.message } }).catch(() => {});
+      });
+    return { success: true, async: true, message: 'Exploration started. Progress updates will arrive separately.' };
   }
 
   // ── EXPLORE RESUME: Continue a paused exploration after login ──
