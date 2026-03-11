@@ -415,10 +415,7 @@ function watchForLoginCompletion(tabId, resumeStateKey, token) {
           `Signed in to ${domain} — resuming...`, 'running'
         );
 
-        // Re-inject panel so user can see progress
-        try {
-          await chrome.scripting.executeScript({ target: { tabId }, files: ['content_panel.js'] });
-        } catch {}
+        // Side panel persists — no re-injection needed for panel UI
 
         // Resume the exploration loop
         const result = await runExplorationLoop(
@@ -850,9 +847,9 @@ async function runOrchestration(userPrompt, searchPlan, token) {
 
 // --- EXPLORE: Multi-step agentic exploration loop ---
 
-async function updateExplorationProgress(step, total, description, status) {
+async function updateExplorationProgress(step, total, description, status, phase = 1) {
   await chrome.storage.local.set({
-    explorationProgress: { step, total, description, status, timestamp: Date.now() },
+    explorationProgress: { step, total, description, status, phase, timestamp: Date.now() },
   });
 }
 
@@ -935,7 +932,31 @@ async function executeExploreAction(tabId, action, token) {
   try {
     // AUTH GATE PRE-CHECK: Before any DOM-interactive action, verify we're not on an auth page.
     // This catches session expiry mid-task (user gets redirected to login).
-    if (['click_element', 'type_text', 'fill_field', 'read_element'].includes(action.type)) {
+    if (['click_element', 'type_text', 'fill_field', 'read_element', 'select_option'].includes(action.type)) {
+      // LAYER 1: URL-level check in background.js (works even if content script fails)
+      if (action.type === 'type_text' || action.type === 'fill_field' || action.type === 'select_option') {
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          const tabUrl = (tab.url || '').toLowerCase();
+          const AUTH_URL_PATTERNS_BG = ['signin', 'sign-in', 'login', 'log-in', '/auth/', '/oauth/', '/sso/', '/ap/signin', '/accounts/login', '/servicelogin', '/session/new', '/password', '/users/sign_in', '/account/login', '/authenticate', '/uc/login', '/id/signin', '/idp/login'];
+          const AUTH_DOMAINS_BG = ['accounts.google.com', 'login.microsoftonline.com', 'login.live.com', 'auth0.com', 'okta.com', 'login.yahoo.com', 'appleid.apple.com', 'id.atlassian.com', 'login.salesforce.com', 'sso.godaddy.com'];
+          let tabHostname = '';
+          try { tabHostname = new URL(tab.url || '').hostname.toLowerCase(); } catch {}
+          const isLoginUrl = AUTH_URL_PATTERNS_BG.some(p => tabUrl.includes(p));
+          const isAuthDomain = AUTH_DOMAINS_BG.some(d => tabHostname === d || tabHostname.endsWith('.' + d));
+          if (isLoginUrl || isAuthDomain) {
+            console.log(`[SECURITY] BLOCKED ${action.type} at background.js level. URL: ${tab.url}`);
+            return {
+              success: false,
+              error: `SECURITY_BLOCK: This is a login/authentication page (${tab.url}). The agent cannot type or fill fields here. Please log in manually.`,
+              blocked: true,
+              authGate: { authType: 'login', signals: ['url_pattern_background'] },
+            };
+          }
+        } catch {}
+      }
+
+      // LAYER 2: Content script auth check (DOM-level, catches password fields)
       try {
         await chrome.scripting.executeScript({ target: { tabId }, files: ['content_explore.js'] }).catch(() => {});
         const authCheck = await chrome.tabs.sendMessage(tabId, { type: 'explore_action', actionType: 'auth_check' }).catch(() => null);
@@ -948,7 +969,7 @@ async function executeExploreAction(tabId, action, token) {
           };
         }
       } catch {
-        // Non-fatal — if auth check fails, proceed with action (content script may not be ready)
+        // Non-fatal — if auth check fails, URL check above already caught login pages
       }
     }
 
@@ -970,8 +991,9 @@ async function executeExploreAction(tabId, action, token) {
       const loadedTab = await chrome.tabs.get(tabId);
       const actualUrl = loadedTab.url || url;
 
-      // Re-inject ALL scripts with retry (Reddit/SPAs may need a moment)
-      const scriptsToInject = ['content_explore.js', 'content_panel.js', HUD_SCRIPT];
+      // Re-inject DOM interaction scripts with retry (Reddit/SPAs may need a moment)
+      // Side panel UI persists — only content scripts need re-injection
+      const scriptsToInject = ['content_explore.js', HUD_SCRIPT];
       for (const script of scriptsToInject) {
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
@@ -1059,7 +1081,44 @@ async function finishExploration(result) {
   return result;
 }
 
-async function runExplorationLoop(explorePlan, tabId, token, resumeState = null) {
+// ── Checkpoint Generator: builds a compact summary from stepLog ──
+// No AI call needed — just extracts what was done from the step log.
+function generateCheckpoint(stepLog, goal) {
+  const successfulSteps = stepLog.filter(s => s.result?.success !== false && s.action?.type !== 'session_context');
+  const failedSteps = stepLog.filter(s => s.result?.success === false);
+
+  // Build a compact list of what was accomplished
+  // CRITICAL: Strip semantic IDs (butt-5, link-12, inp-0, etc.) from descriptions
+  // so the AI doesn't try to reuse stale IDs from a previous phase
+  const SID_PATTERN = /\b(butt|link|inp|sel|chk|rad|tab|menu|img|icon|txt)-\d+\b/g;
+
+  const accomplishments = successfulSteps
+    .map(s => {
+      let desc = s.action?.description || s.action?.type || 'action';
+      // Remove semantic IDs to prevent stale ID usage in next phase
+      desc = desc.replace(SID_PATTERN, '').replace(/\s{2,}/g, ' ').trim();
+      // Truncate long descriptions
+      return desc.length > 80 ? desc.slice(0, 77) + '...' : desc;
+    })
+    .filter(d => d && d.length > 2); // Filter out empty results after stripping
+
+  // Deduplicate similar steps (e.g., multiple "Observing page..." entries)
+  const uniqueAccomplishments = [...new Set(accomplishments)];
+
+  const checkpoint = [
+    `Completed ${successfulSteps.length} actions (${failedSteps.length} failed).`,
+    `Done: ${uniqueAccomplishments.join('; ')}.`,
+  ].join(' ');
+
+  // Cap at 500 chars to keep prompt compact
+  return checkpoint.length > 500 ? checkpoint.slice(0, 497) + '...' : checkpoint;
+}
+
+// ── Auto-Continuation Constants ──
+const MAX_PHASES = 3;         // Max 3 phases × 30 steps = 90 steps total
+const PHASE_TIMEOUT_MS = 480000; // 8 minutes per phase (accounts for slow connections + observe→plan call)
+
+async function runExplorationLoop(explorePlan, tabId, token, resumeState = null, continuationContext = null) {
   const { goal, strategy, maxSteps, creditBudget, startAction } = explorePlan;
 
   // Validate startAction before proceeding
@@ -1082,16 +1141,22 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
   let consecutiveFailures = resumeState?.consecutiveFailures || 0;
   const startStep = resumeState?.nextStep || 1;
 
+  // Auto-continuation context
+  const currentPhase = continuationContext?.phase || 1;
+  const previousPhases = continuationContext?.previousPhases || [];
+  const originalPrompt = continuationContext?.originalPrompt || null;
+  const totalStepsAcrossPhases = continuationContext?.totalSteps || 0;
+
   // Mark exploration as in-progress (so re-injected panel can detect it)
   await chrome.storage.session.set({
-    explorationActive: { goal, maxSteps, tabId: currentTabId, startedAt: Date.now() },
+    explorationActive: { goal, maxSteps, tabId: currentTabId, startedAt: Date.now(), phase: currentPhase },
   });
 
   // Auto-inject panel + explore + HUD when the explore tab navigates (backup for executeExploreAction injection)
   const navListener = (details) => {
     if (details.tabId !== currentTabId || details.frameId !== 0) return;
-    console.log('[Explore] webNavigation.onCompleted — re-injecting scripts on', details.url);
-    chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: ['content_panel.js'] }).catch(() => {});
+    console.log('[Explore] webNavigation.onCompleted — re-injecting DOM scripts on', details.url);
+    // Side panel persists — only re-inject content scripts for DOM interaction
     chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: ['content_explore.js'] }).catch(() => {});
     chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: [HUD_SCRIPT] }).catch(() => {});
   };
@@ -1102,10 +1167,10 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
     chrome.runtime.getPlatformInfo(() => {});
   }, 20000);
 
-  // Total exploration timeout (120 seconds)
+  // Per-phase timeout (5 minutes per phase)
   const explorationTimeout = setTimeout(() => {
     cleanupLoop();
-  }, 120000);
+  }, PHASE_TIMEOUT_MS);
 
   // Cleanup helper — called at every exit
   function cleanupLoop() {
@@ -1115,12 +1180,14 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
   }
 
   try {
-    // Show HUD on the page
+    // Show HUD on the page — show up to 10 step dots for readability
     const hudSteps = [];
-    for (let i = 0; i <= Math.min(maxSteps, 12); i++) {
-      hudSteps.push({ id: `explore-${i}`, label: i === 0 ? 'Start' : `Step ${i}` });
+    const hudMax = Math.min(maxSteps, 10);
+    for (let i = 0; i <= hudMax; i++) {
+      const label = i === 0 ? 'Start' : (currentPhase > 1 ? `P${currentPhase}:${i}` : `Step ${i}`);
+      hudSteps.push({ id: `explore-${i}`, label });
     }
-    await hudShow(currentTabId, `Exploring: ${goal.slice(0, 60)}`, hudSteps);
+    await hudShow(currentTabId, `${currentPhase > 1 ? `[Phase ${currentPhase}] ` : ''}Exploring: ${goal.slice(0, 50)}`, hudSteps);
 
     // Inject explore content script
     try {
@@ -1149,6 +1216,83 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
         startAction.description);
 
       if (!startResult.success) consecutiveFailures++;
+
+      // ── OBSERVE → PLAN: Call grounded planner with real page snapshot ──
+      // The AI now sees the actual page before creating a strategy.
+      // This replaces the blind strategy guess from agentProcess.js.
+      // Fires after ANY successful startAction (navigate, scrape_page, etc.)
+      if (startResult.success) {
+        try {
+          await updateExplorationProgress(0, maxSteps, 'Creating strategy from observed page...', 'running');
+          console.log('[Explore] Observe→Plan: taking snapshot for grounded planning...');
+
+          const planSnapshot = await takePageSnapshot(currentTabId);
+          const planByokConfig = await getByokConfig();
+          const planUrl = `${API_BASE}/api/agent/explore-plan`;
+
+          const planPayload = JSON.stringify({
+            goal,
+            currentPageState: planSnapshot,
+            previousPhases: previousPhases.length > 0 ? previousPhases : undefined,
+            originalPrompt: originalPrompt || undefined,
+            ...byokPayload(planByokConfig),
+          });
+
+          // Retry logic for network resilience (1 retry on transient failure)
+          let planRes = null;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+              planRes = await fetch(planUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                body: planPayload,
+              });
+              break;
+            } catch (fetchErr) {
+              if (attempt === 0 && (fetchErr.message || '').match(/Failed to fetch|NetworkError|ERR_CONNECTION|ECONNRESET|ETIMEDOUT/)) {
+                console.warn('[Explore] Observe→Plan: fetch failed, retrying in 2s...');
+                await new Promise(r => setTimeout(r, 2000));
+              } else {
+                throw fetchErr;
+              }
+            }
+          }
+
+          if (planRes.ok) {
+            const planData = await planRes.json();
+            if (planData.strategy && planData.strategy.length > 10) {
+              currentStrategy = planData.strategy;
+              console.log(`[Explore] Observe→Plan: grounded strategy created (${planData.maxSteps} steps recommended): ${currentStrategy.slice(0, 200)}`);
+
+              // Update maxSteps if the planner recommends a different amount
+              // (only if the planner's recommendation is within bounds)
+              if (planData.maxSteps && planData.maxSteps >= 1 && planData.maxSteps <= 30) {
+                // Use the planner's recommendation, but don't exceed the original budget
+                const originalMaxSteps = maxSteps;
+                // Note: we don't override maxSteps here — the plan just informs strategy.
+                // The original maxSteps from agentProcess.js is the budget cap.
+                console.log(`[Explore] Planner recommended ${planData.maxSteps} steps (budget cap: ${originalMaxSteps})`);
+              }
+
+              creditsUsed += 0.5; // EXPLORE_PLAN cost
+
+              stepLog.push({
+                step: -1, // meta-step, not counted
+                action: { type: 'grounded_plan', description: 'Created strategy from observed page' },
+                result: { success: true },
+                observation: `Grounded strategy: ${currentStrategy.slice(0, 250)}`,
+              });
+            } else {
+              console.warn('[Explore] Observe→Plan: AI returned weak strategy, keeping original');
+            }
+          } else {
+            const planErr = await planRes.json().catch(() => ({}));
+            console.warn('[Explore] Observe→Plan: planning call failed:', planErr.error || planRes.status, '— continuing with original strategy');
+          }
+        } catch (planError) {
+          console.warn('[Explore] Observe→Plan: error during planning call:', planError.message, '— continuing with original strategy');
+        }
+      }
 
       // Brief pause after start action
       await new Promise(r => setTimeout(r, 800));
@@ -1324,19 +1468,43 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
         console.log(`[Explore] Step ${step}: calling ${exploreStepUrl}`);
         console.log(`[Explore] Step ${step}: snapshot url=${snapshot.url}, elements=${snapshot.semanticElements?.length || 0}, content=${(snapshot.mainContent || '').length} chars`);
         const exploreByokConfig = await getByokConfig();
-        const thinkRes = await fetch(exploreStepUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({
-            goal,
-            strategy: currentStrategy,
-            stepNumber: step,
-            maxSteps,
-            previousActions: stepLog,
-            currentPageState: snapshot,
-            ...byokPayload(exploreByokConfig),
-          }),
-        });
+        const stepPayload = {
+          goal,
+          strategy: currentStrategy,
+          stepNumber: step,
+          maxSteps,
+          previousActions: stepLog,
+          currentPageState: snapshot,
+          previousPhases: previousPhases.length > 0 ? previousPhases : undefined,
+          originalPrompt: originalPrompt || undefined,
+          ...byokPayload(exploreByokConfig),
+        };
+
+        // Retry logic for network resilience (up to 2 retries on transient failures)
+        let thinkRes = null;
+        let lastFetchErr = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            thinkRes = await fetch(exploreStepUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+              body: JSON.stringify(stepPayload),
+            });
+            lastFetchErr = null;
+            break; // Success — exit retry loop
+          } catch (fetchErr) {
+            lastFetchErr = fetchErr;
+            const isTransient = (fetchErr.message || '').match(/Failed to fetch|NetworkError|ERR_CONNECTION|ECONNRESET|ETIMEDOUT/);
+            if (isTransient && attempt < 2) {
+              console.warn(`[Explore] Step ${step}: fetch attempt ${attempt + 1} failed (${fetchErr.message}), retrying in ${(attempt + 1) * 2}s...`);
+              await new Promise(r => setTimeout(r, (attempt + 1) * 2000));
+            } else {
+              break; // Non-transient error or max retries — stop
+            }
+          }
+        }
+
+        if (lastFetchErr) throw lastFetchErr;
 
         if (!thinkRes.ok) {
           const err = await thinkRes.json().catch(() => ({}));
@@ -1355,7 +1523,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
         const errMsg = err.message || 'Unknown error';
         const isNetworkError = errMsg.includes('Failed to fetch') || errMsg.includes('NetworkError') || errMsg.includes('ERR_CONNECTION');
         const userMsg = isNetworkError
-          ? `Backend unreachable (${API_BASE}) — is the server running?`
+          ? `Backend unreachable (${API_BASE}) — is the server running? (retried 3 times)`
           : `AI error: ${errMsg}`;
         console.error(`[Explore] Think step ${step} failed:`, errMsg);
         consecutiveFailures++;
@@ -1553,7 +1721,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
 
       // If navigation happened, re-inject all scripts and restore HUD
       if (decision.nextAction?.type === 'navigate' && actionResult.success) {
-        for (const script of ['content_explore.js', 'content_panel.js', HUD_SCRIPT]) {
+        for (const script of ['content_explore.js', HUD_SCRIPT]) {
           try {
             await chrome.scripting.executeScript({
               target: { tabId: currentTabId },
@@ -1563,10 +1731,12 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
         }
         // Re-show HUD with current progress after navigation destroyed the DOM
         const hudStepsForReshow = [];
-        for (let i = 0; i <= Math.min(maxSteps, 12); i++) {
-          hudStepsForReshow.push({ id: `explore-${i}`, label: i === 0 ? 'Start' : `Step ${i}` });
+        const hudMaxReshow = Math.min(maxSteps, 10);
+        for (let i = 0; i <= hudMaxReshow; i++) {
+          const label = i === 0 ? 'Start' : (currentPhase > 1 ? `P${currentPhase}:${i}` : `Step ${i}`);
+          hudStepsForReshow.push({ id: `explore-${i}`, label });
         }
-        await hudShow(currentTabId, `Exploring: ${goal.slice(0, 60)}`, hudStepsForReshow);
+        await hudShow(currentTabId, `${currentPhase > 1 ? `[Phase ${currentPhase}] ` : ''}Exploring: ${goal.slice(0, 50)}`, hudStepsForReshow);
         // Mark completed/failed steps so HUD shows accurate state
         for (const entry of stepLog) {
           const status = entry.result?.success === false ? 'error' : 'success';
@@ -1601,43 +1771,91 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null)
     // Max steps reached or stopped
     cleanupLoop();
 
-    // Build partial result from observations (successful steps)
+    const stoppedDueToFailures = consecutiveFailures >= 3;
+
+    // ── AUTO-CONTINUATION: if goal not complete and phases remain, auto-continue ──
+    if (!stoppedDueToFailures && currentPhase < MAX_PHASES) {
+      const checkpoint = generateCheckpoint(stepLog, goal);
+      const newPhaseNumber = currentPhase + 1;
+      const newTotalSteps = totalStepsAcrossPhases + stepLog.length;
+
+      console.log(`[Explore] Phase ${currentPhase} complete (${stepLog.length} steps). Auto-continuing to phase ${newPhaseNumber}. Checkpoint: ${checkpoint.slice(0, 200)}`);
+
+      await updateExplorationProgress(maxSteps, maxSteps,
+        `Phase ${currentPhase} complete — continuing automatically (phase ${newPhaseNumber}/${MAX_PHASES})...`, 'running');
+
+      // Build continuation context for the next phase
+      const newPreviousPhases = [
+        ...previousPhases,
+        { phase: currentPhase, stepsUsed: stepLog.length, checkpoint, creditsUsed },
+      ];
+
+      // New explore plan for continuation — start with scrape_page to observe current state
+      const continuationPlan = {
+        goal,
+        strategy: currentStrategy || strategy,
+        maxSteps,
+        creditBudget,
+        startAction: { type: 'scrape_page', description: `Phase ${newPhaseNumber} — observing current page state` },
+      };
+
+      const newContinuationContext = {
+        phase: newPhaseNumber,
+        previousPhases: newPreviousPhases,
+        originalPrompt: originalPrompt || goal,
+        totalSteps: newTotalSteps,
+      };
+
+      // Brief pause between phases
+      await new Promise(r => setTimeout(r, 1000));
+
+      // Recursively start next phase (non-blocking — returns result up the chain)
+      return runExplorationLoop(continuationPlan, currentTabId, token, null, newContinuationContext);
+    }
+
+    // ── No more phases or stopped due to failures — build final result ──
     const successObservations = stepLog
       .filter(s => s.observation && s.result?.success)
       .map(s => s.observation)
       .join('\n');
 
-    // Collect errors for diagnostic output
     const errorObservations = stepLog
       .filter(s => s.result?.success === false && s.observation)
       .map(s => s.observation);
 
-    const stoppedDueToFailures = consecutiveFailures >= 3;
     let goalResult;
 
     if (stoppedDueToFailures && errorObservations.length > 0) {
-      // Show the actual errors so user/AI can diagnose
       const lastError = errorObservations[errorObservations.length - 1];
       goalResult = successObservations
         ? `Exploration stopped after errors. What I found:\n\n${successObservations}\n\nLast error: ${lastError}`
         : `Exploration failed: ${lastError}`;
+    } else if (currentPhase >= MAX_PHASES) {
+      // Exhausted all phases
+      const allPhasesSummary = previousPhases.map(p => `Phase ${p.phase}: ${p.checkpoint}`).join('\n');
+      goalResult = successObservations
+        ? `Completed ${currentPhase} phases (${totalStepsAcrossPhases + stepLog.length} total steps). Here's what was accomplished:\n\n${allPhasesSummary ? allPhasesSummary + '\n\nFinal phase:\n' : ''}${successObservations}`
+        : `Completed ${currentPhase} phases but could not fully achieve the goal.\n\n${allPhasesSummary || 'No results captured.'}`;
     } else if (successObservations) {
       goalResult = `I explored ${stepLog.length} steps but couldn't fully complete the goal. Here's what I found:\n\n${successObservations}`;
     } else {
       goalResult = 'Exploration could not complete. Try rephrasing your request or check if the backend server is running.';
     }
 
-    await updateExplorationProgress(maxSteps, maxSteps,
-      stoppedDueToFailures ? 'Stopped after repeated failures' : 'Max steps reached',
-      'partial');
+    const finalStatus = stoppedDueToFailures ? 'Stopped after repeated failures'
+      : currentPhase >= MAX_PHASES ? `All ${MAX_PHASES} phases completed`
+      : 'Max steps reached';
+
+    await updateExplorationProgress(maxSteps, maxSteps, finalStatus, 'partial');
 
     return finishExploration({
-      success: false,
+      success: !stoppedDueToFailures && currentPhase >= MAX_PHASES,
       goalResult,
-      stepsUsed: stepLog.length,
+      stepsUsed: totalStepsAcrossPhases + stepLog.length,
       creditsUsed,
       stepLog,
       partial: true,
+      phasesUsed: currentPhase,
     });
 
   } catch (err) {
@@ -1849,6 +2067,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 async function handleMessage(request, sender) {
+
+  // ── GET ACTIVE TAB: Returns current active tab info ───
+  if (request.type === 'get_active_tab') {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      return { url: tab?.url || '', title: tab?.title || '', id: tab?.id };
+    } catch {
+      return { url: '', title: '', id: null };
+    }
+  }
 
   // ── MODEL REGISTRY: Fetch from backend for settings UI ───
   if (request.type === 'fetch_model_registry') {
@@ -2252,21 +2480,25 @@ async function handleMessage(request, sender) {
       if (!isAllowedUrl(action.value)) {
         return { success: false, error: `Navigation to ${action.value} is not allowed.` };
       }
-      // Navigate in the current tab instead of opening a new one
-      let navTabId = tabId;
-      if (!navTabId) {
-        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        navTabId = activeTab?.id;
-      }
-      if (navTabId) {
-        await chrome.tabs.update(navTabId, { url: action.value, active: true });
+      // Check if the target URL is already open in an existing tab
+      const allTabs = await chrome.tabs.query({ currentWindow: true });
+      const targetHost = new URL(action.value).hostname;
+      const existingTab = allTabs.find(t => {
+        try { return new URL(t.url).hostname === targetHost; } catch { return false; }
+      });
+
+      let navTabId;
+      if (existingTab) {
+        // Site already open — just switch to it
+        await chrome.tabs.update(existingTab.id, { active: true });
+        navTabId = existingTab.id;
       } else {
+        // Open in a NEW tab so the current page is preserved
         const newTab = await chrome.tabs.create({ url: action.value, active: true });
         navTabId = newTab.id;
+        await waitForTabLoad(navTabId, 10000);
       }
-      await waitForTabLoad(navTabId, 10000);
-      const pageStateAfter = await scrapePageState(navTabId);
-      return { success: true, tabId: navTabId, pageStateAfter };
+      return { success: true, tabId: navTabId };
     }
 
     // semantic_fill: Ghost-Driver AI form filling (stageAction already returns pageStateAfter)
@@ -2366,7 +2598,7 @@ async function handleMessage(request, sender) {
   // ── EXPLORE: Multi-step agentic exploration loop ────────────
   // Fire-and-forget: return immediately, results come via updateExplorationProgress
   if (request.type === 'explore_start') {
-    const { explorePlan } = request.data;
+    const { explorePlan, userPrompt } = request.data;
     if (!explorePlan || !explorePlan.goal) {
       return { success: false, error: 'Invalid explore plan: no goal specified.' };
     }
@@ -2385,11 +2617,19 @@ async function handleMessage(request, sender) {
     // Clear stale result before starting
     await chrome.storage.session.remove(['explorationResult']).catch(() => {});
 
+    // Initial continuation context with the original user prompt
+    const initialContinuationContext = {
+      phase: 1,
+      previousPhases: [],
+      originalPrompt: userPrompt || explorePlan.goal,
+      totalSteps: 0,
+    };
+
     // Run in background — don't await (prevents message channel timeout)
-    runExplorationLoop(explorePlan, tabId, token)
+    runExplorationLoop(explorePlan, tabId, token, null, initialContinuationContext)
       .then(result => {
         chrome.storage.session.set({ explorationResult: result }).catch(() => {});
-        console.log('[Explore] Loop completed in background, result stored in session storage.');
+        console.log(`[Explore] Loop completed in background (${result.phasesUsed || 1} phase(s), ${result.stepsUsed || 0} steps). Result stored.`);
       })
       .catch(err => {
         console.error('[Explore] Background loop error:', err);
@@ -2631,7 +2871,7 @@ async function handleMessage(request, sender) {
       // Step 2: Inject content_gmail.js and click the first result + open reply
       const result = await chrome.tabs.sendMessage(tabId, {
         type: 'gmail_open_first_and_reply',
-        data: { replyBody },
+        data: { replyBody, searchQuery },
       }).catch(() => null);
 
       if (result?.success) {
@@ -2644,7 +2884,7 @@ async function handleMessage(request, sender) {
 
       const retryResult = await chrome.tabs.sendMessage(tabId, {
         type: 'gmail_open_first_and_reply',
-        data: { replyBody },
+        data: { replyBody, searchQuery },
       }).catch(() => null);
 
       return retryResult || { success: false, error: 'Could not open the email thread.' };
@@ -2668,43 +2908,24 @@ async function handleMessage(request, sender) {
     }
 
     try {
-      // Get the tab to inject into — prefer sender tab, fall back to active tab
-      let tabId = sender?.tab?.id;
-      if (!tabId) {
-        console.log('[GhostDrive] No sender tab, querying active tab...');
-        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        tabId = activeTab?.id;
-      }
-      if (!tabId) throw new Error('No tab available for panel injection');
-      console.log('[GhostDrive] Target tab:', tabId);
-
-      // Check if panel already exists on the tab
-      let panelExists = false;
-      try {
-        const pong = await chrome.tabs.sendMessage(tabId, { type: 'enh_panel_ping' });
-        panelExists = !!pong?.ok;
-        console.log('[GhostDrive] Panel ping result:', pong);
-      } catch (pingErr) {
-        console.log('[GhostDrive] Panel not found, will inject:', pingErr.message);
+      // Open side panel and send delegate auto-fill via runtime message
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const windowId = activeTab?.windowId || sender?.tab?.windowId;
+      if (windowId) {
+        await chrome.sidePanel.open({ windowId });
+        // Small delay for side panel to initialize
+        await new Promise(r => setTimeout(r, 500));
       }
 
-      if (!panelExists) {
-        console.log('[GhostDrive] Injecting panel JS into tab', tabId);
-        await chrome.scripting.executeScript({ target: { tabId }, files: ['content_panel.js'] });
-        // Wait for panel to initialize (init() is async — does storage + network calls)
-        await new Promise(r => setTimeout(r, 600));
-        console.log('[GhostDrive] Panel injected, waited 600ms');
-      }
-
-      // Send auto-fill with retry — panel listener may need a moment
+      // Send auto-fill via runtime message (side panel listens on chrome.runtime.onMessage)
       let autofillSent = false;
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const result = await chrome.tabs.sendMessage(tabId, {
+          await chrome.runtime.sendMessage({
             type: 'enh_delegate_autofill',
             payload,
           });
-          console.log(`[GhostDrive] Auto-fill sent (attempt ${attempt + 1}):`, result);
+          console.log(`[GhostDrive] Auto-fill sent to side panel (attempt ${attempt + 1})`);
           autofillSent = true;
           break;
         } catch (sendErr) {
@@ -2715,45 +2936,37 @@ async function handleMessage(request, sender) {
 
       if (!autofillSent) {
         console.error('[GhostDrive] All auto-fill attempts failed');
-        return { success: false, error: 'Panel injected but auto-fill failed. Try clicking the extension icon.' };
+        return { success: false, error: 'Side panel opened but auto-fill failed. Try clicking the extension icon.' };
       }
 
-      return { success: true, message: 'Task loaded into extension panel.' };
+      return { success: true, message: 'Task loaded into side panel.' };
     } catch (err) {
-      console.error('[GhostDrive] Failed to inject panel for delegation:', err.message);
-      return { success: false, error: 'Could not open extension panel on this page.' };
+      console.error('[GhostDrive] Failed to open side panel for delegation:', err.message);
+      return { success: false, error: 'Could not open side panel.' };
     }
   }
 
-  // ── INJECT PANEL HERE: Bridge requests panel injection on its own tab ──
+  // ── OPEN SIDE PANEL: Bridge requests panel open ──
   if (request.type === 'inject_panel_here') {
-    const tabId = sender?.tab?.id;
-    console.log('[BG] inject_panel_here requested, sender tab:', tabId);
-    if (!tabId) {
-      // Fallback: find active tab
-      try {
-        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (activeTab?.id) {
-          await chrome.scripting.executeScript({ target: { tabId: activeTab.id }, files: ['content_panel.js'] });
-          console.log('[BG] Panel injected into active tab:', activeTab.id);
-          return { success: true };
-        }
-      } catch (err) {
-        console.error('[BG] Fallback injection failed:', err.message);
-      }
-      return { success: false, error: 'No tab to inject into' };
-    }
     try {
-      await chrome.scripting.executeScript({ target: { tabId }, files: ['content_panel.js'] });
-      console.log('[BG] Panel injected into sender tab:', tabId);
+      const windowId = sender?.tab?.windowId;
+      if (windowId) {
+        await chrome.sidePanel.open({ windowId });
+      } else {
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (activeTab?.windowId) {
+          await chrome.sidePanel.open({ windowId: activeTab.windowId });
+        }
+      }
+      console.log('[BG] Side panel opened');
       return { success: true };
     } catch (err) {
-      console.error('[BG] Panel injection error:', err.message);
+      console.error('[BG] Side panel open error:', err.message);
       return { success: false, error: err.message };
     }
   }
 
-  // ── GET CURRENT TAB (for content_panel.js) ─────────────────
+  // ── GET CURRENT TAB (for sidepanel.js) ─────────────────
   if (request.type === 'GET_CURRENT_TAB') {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -2930,124 +3143,12 @@ async function notifyDashboardTabs(type, payload) {
   }
 }
 
-// ── Floating Panel: Icon Click → Inject/Toggle ─────────────────
-
-// List of restricted URL prefixes where content scripts cannot be injected
-const RESTRICTED_URL_PREFIXES = ['chrome://', 'chrome-extension://', 'edge://', 'about:', 'devtools://'];
-
-function isRestrictedUrl(url) {
-  return !url || RESTRICTED_URL_PREFIXES.some(p => url.startsWith(p));
-}
+// ── Side Panel: Icon Click → Open Side Panel ─────────────────
 
 chrome.action.onClicked.addListener(async (tab) => {
-  // If the tab is restricted (chrome://, about:, etc.), navigate the SAME tab to Google and inject panel
-  if (isRestrictedUrl(tab.url)) {
-    await chrome.tabs.update(tab.id, { url: 'https://www.google.com' });
-    const injectOnLoad = (tabId, changeInfo) => {
-      if (tabId === tab.id && changeInfo.status === 'complete') {
-        chrome.tabs.onUpdated.removeListener(injectOnLoad);
-        chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content_panel.js'] }).catch(() => {});
-      }
-    };
-    chrome.tabs.onUpdated.addListener(injectOnLoad);
-    return;
-  }
-
   try {
-    // Try toggling — if panel is already injected, it will respond with {ok: true}
-    const response = await chrome.tabs.sendMessage(tab.id, { type: 'enh_panel_toggle' });
-    if (response?.ok) {
-      // Panel handled the toggle
-      return;
-    }
-  } catch {
-    // No listener at all — expected when panel not yet injected
-  }
-
-  // Panel not injected yet (or other scripts swallowed the message) — inject it
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: ['content_panel.js'],
-    });
+    await chrome.sidePanel.open({ windowId: tab.windowId });
   } catch (err) {
-    console.warn('[Enhancivity] Panel injection failed:', err.message);
-    // Last-resort fallback: open popup.html in a new tab
-    await chrome.tabs.create({ url: chrome.runtime.getURL('popup/popup.html') });
-  }
-});
-
-// ── Re-inject panel after same-tab navigation (if panel was open) ──
-
-async function reInjectPanelIfNeeded(tabId, url, trigger) {
-  if (isRestrictedUrl(url)) return;
-  try {
-    const { enhPanelState } = await chrome.storage.session.get('enhPanelState');
-    if (!enhPanelState?.isOpen && !enhPanelState?.isMinimized) return;
-
-    // Check if panel DOM actually exists on the page
-    let panelExists = false;
-    try {
-      const pong = await chrome.tabs.sendMessage(tabId, { type: 'enh_panel_ping' });
-      panelExists = !!pong?.ok;
-    } catch { /* content script not present at all */ }
-
-    console.log(`[Panel Re-inject] trigger=${trigger} tabId=${tabId} panelExists=${panelExists} url=${url?.substring(0, 80)}`);
-
-    if (!panelExists) {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: ['content_panel.js'],
-      });
-      console.log(`[Panel Re-inject] Injected content_panel.js into tab ${tabId}`);
-    }
-  } catch (err) {
-    console.log(`[Panel Re-inject] Failed for tab ${tabId}:`, err?.message);
-  }
-}
-
-// Full page loads (standard navigation)
-chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (changeInfo.status !== 'complete') return;
-  console.log('[NAV-DEBUG] onUpdated fired', tabId, tab.url?.substring(0, 60));
-  const { enhPanelState } = await chrome.storage.session.get('enhPanelState');
-  console.log('[NAV-DEBUG] enhPanelState =', JSON.stringify(enhPanelState));
-  await reInjectPanelIfNeeded(tabId, tab.url, 'onUpdated');
-});
-
-// SPA-style navigation (GitHub Turbo, pushState, replaceState)
-chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
-  if (details.frameId !== 0) return;   // Only main frame
-  // Small delay — let the SPA finish rendering before injecting
-  await new Promise(r => setTimeout(r, 500));
-  await reInjectPanelIfNeeded(details.tabId, details.url, 'historyState');
-});
-
-// ── Re-inject panel when user switches tabs (if panel was open) ──
-
-chrome.tabs.onActivated.addListener(async ({ tabId }) => {
-  try {
-    const { enhPanelState } = await chrome.storage.session.get('enhPanelState');
-    // Re-inject if panel was open OR minimized (so data is ready when user clicks icon)
-    if (!enhPanelState?.isOpen && !enhPanelState?.isMinimized) return;
-
-    const tab = await chrome.tabs.get(tabId);
-    if (isRestrictedUrl(tab.url)) return;
-
-    // Check if panel already exists — must verify response
-    let panelExists = false;
-    try {
-      const pong = await chrome.tabs.sendMessage(tabId, { type: 'enh_panel_ping' });
-      panelExists = !!pong?.ok;
-    } catch { /* no listener at all */ }
-
-    if (!panelExists) {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: ['content_panel.js'],
-      });
-    }
-  } catch {
-    // Non-fatal — tab might not support injection
+    console.warn('[Enhancivity] Side panel open failed:', err.message);
   }
 });

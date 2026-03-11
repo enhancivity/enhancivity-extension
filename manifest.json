@@ -10,7 +10,8 @@
     "identity",
     "tabs",
     "webNavigation",
-    "cookies"
+    "cookies",
+    "sidePanel"
   ],
   "host_permissions": [
     "<all_urls>",
@@ -56,6 +57,9 @@
       "128": "images/icon128.png"
     }
   },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
   "background": {
     "service_worker": "background.js"
   },
@@ -70,7 +74,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["images/*.png", "content_panel.css"],
+      "resources": ["images/*.png"],
       "matches": ["<all_urls>"]
     }
   ]

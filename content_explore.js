@@ -558,9 +558,16 @@
       if (!target) return { success: false, error: 'No semantic ID provided for type_text' };
       if (!value) return { success: false, error: 'No text value provided to type' };
 
-      // SECURITY: Block ALL typing on login/auth pages (URL match OR password field present)
-      if (isLoginPage()) {
-        return { success: false, error: 'LOGIN_PAGE_DETECTED: Agent cannot interact with login forms. User must log in manually.', blocked: true };
+      // ── HARD BLOCK LAYER 1: Never type on login/auth pages ──
+      const currentUrl = window.location.href.toLowerCase();
+      const hardLoginPatterns = ['signin', 'sign-in', 'login', 'log-in', '/auth/', '/oauth/', '/sso/', '/ap/signin', '/accounts/login', '/servicelogin', '/session/new', '/password', '/users/sign_in', '/account/login', '/authenticate', '/uc/login', '/id/signin', '/idp/login'];
+      const isOnLoginPage = hardLoginPatterns.some(pattern => currentUrl.includes(pattern));
+      const pageHasPasswordField = !!document.querySelector('input[type="password"]');
+      const isOnAuthDomain = AUTH_PROVIDER_DOMAINS.some(d => window.location.hostname.toLowerCase() === d || window.location.hostname.toLowerCase().endsWith('.' + d));
+
+      if (isOnLoginPage || pageHasPasswordField || isOnAuthDomain) {
+        console.log('[SECURITY] BLOCKED type_text: Login/auth page detected. URL:', currentUrl, 'hasPassword:', pageHasPasswordField, 'authDomain:', isOnAuthDomain);
+        return { success: false, error: 'SECURITY_BLOCK: This is a login page. The agent cannot type here. Please log in manually.', blocked: true };
       }
 
       const el = findBySid(target);
@@ -571,24 +578,132 @@
         };
       }
 
-      // SECURITY: Block password fields even on non-login pages
-      if (el.matches('input[type="password"]')) {
-        return { success: false, error: 'BLOCKED: Cannot type in password fields.', blocked: true };
+      // ── HARD BLOCK LAYER 2: Never type in sensitive fields on ANY page ──
+      const fieldType = (el.getAttribute('type') || '').toLowerCase();
+      const fieldName = (el.getAttribute('name') || '').toLowerCase();
+      const fieldId = (el.getAttribute('id') || '').toLowerCase();
+      const fieldAutocomplete = (el.getAttribute('autocomplete') || '').toLowerCase();
+      const fieldPlaceholder = (el.getAttribute('placeholder') || '').toLowerCase();
+      const fieldAriaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+
+      const sensitivePatterns = ['password', 'passwd', 'pass', 'secret', 'credential', 'pin', 'ssn', 'cvv', 'cvc', 'card-number', 'cardnumber', 'security-code', 'securitycode', 'credit-card', 'creditcard', 'social-security', 'routing', 'account-number'];
+
+      const isSensitiveField = fieldType === 'password' ||
+        sensitivePatterns.some(p => fieldName.includes(p) || fieldId.includes(p) || fieldAutocomplete.includes(p) || fieldPlaceholder.includes(p) || fieldAriaLabel.includes(p));
+
+      if (isSensitiveField) {
+        console.log('[SECURITY] BLOCKED type_text: Sensitive field detected. type:', fieldType, 'name:', fieldName, 'id:', fieldId);
+        return { success: false, error: 'SECURITY_BLOCK: Cannot type in password/credential fields.', blocked: true };
       }
 
       if (isSensitiveElement(el)) {
         return { success: false, error: 'BLOCKED: Cannot interact with sensitive credential fields. User must enter credentials manually.', blocked: true };
       }
 
-      // Focus and clear existing value
+      // Focus the element
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       el.focus();
-      el.value = '';
-      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('focus', { bubbles: true }));
 
-      // Type the text
-      el.value = value;
-      el.dispatchEvent(new Event('input', { bubbles: true }));
+      // Handle contentEditable elements (used by Facebook, Gmail compose, Reddit, etc.)
+      if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
+        // Ensure focus is on the exact element (Reddit/ProseMirror need click + focus)
+        el.click();
+        el.focus();
+        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+        // Select all existing content using Selection API (more reliable than execCommand selectAll)
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        sel.removeAllRanges();
+        sel.addRange(range);
+
+        // Try execCommand first (works on most contentEditable)
+        let typed = false;
+        try {
+          document.execCommand('delete', false, null);
+          typed = document.execCommand('insertText', false, value);
+        } catch {}
+
+        // Verify after execCommand
+        const afterExec = (el.innerText || el.textContent || '').trim();
+
+        // Fallback: direct text node insertion (for ProseMirror/Draft.js/React editors)
+        if (!typed || !afterExec) {
+          el.innerHTML = '';
+          // Insert as a text node (preserves editor state better than innerHTML)
+          const textNode = document.createTextNode(value);
+          el.appendChild(textNode);
+          // Move cursor to end
+          const newRange = document.createRange();
+          newRange.selectNodeContents(el);
+          newRange.collapse(false);
+          sel.removeAllRanges();
+          sel.addRange(newRange);
+        }
+
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+
+        // Verify text was actually inserted
+        const actualText = (el.innerText || el.textContent || '').trim();
+        const hasContent = actualText.length > 0;
+
+        const origOutline = el.style.outline;
+        el.style.outline = '2px solid #6366f1';
+        setTimeout(() => { el.style.outline = origOutline; }, 1500);
+
+        return {
+          success: hasContent,
+          observation: hasContent
+            ? `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()}`
+            : `WARNING: Attempted to type into contentEditable ${el.tagName.toLowerCase()} but verification shows the field is empty. The editor may have rejected the input. Try click_element on the field first, then type_text again.`,
+        };
+      }
+
+      // Use native setter to bypass React/Vue/Angular controlled input tracking.
+      // Frameworks like React override the .value setter — setting el.value directly
+      // doesn't trigger their internal state update. The native setter + synthetic
+      // InputEvent trick forces the framework to recognize the change.
+
+      // Click + focus first (ensures React state tracks the interaction)
+      el.click();
+      el.focus();
+      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      el.dispatchEvent(new Event('focus', { bubbles: true }));
+
+      const nativeSetter =
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set ||
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+
+      // Clear existing value: use select-all + delete keyboard events first (most robust),
+      // then fallback to native setter
+      el.select?.(); // Select all text in input
+      el.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', ctrlKey: true, bubbles: true }));
+      if (nativeSetter) {
+        nativeSetter.call(el, '');
+      } else {
+        el.value = '';
+      }
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+
+      // Set the new value
+      if (nativeSetter) {
+        nativeSetter.call(el, value);
+      } else {
+        el.value = value;
+      }
+      // Dispatch full event sequence that React/frameworks expect
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
+
+      // Verify the value was actually set (React can reject it)
+      const actualValue = el.value;
+      const valueSet = actualValue === value;
 
       // Highlight briefly
       const origOutline = el.style.outline;
@@ -597,8 +712,126 @@
 
       return {
         success: true,
-        observation: `Typed "${value.slice(0, 80)}" into ${el.tagName.toLowerCase()}${el.placeholder ? ` (placeholder: "${el.placeholder}")` : ''}`,
+        observation: `Typed "${value.slice(0, 80)}" into ${el.tagName.toLowerCase()}${el.placeholder ? ` (placeholder: "${el.placeholder}")` : ''}${!valueSet ? ` [WARNING: field shows "${actualValue.slice(0, 40)}" — React may have rejected the value. Try click_element on the field first, then type_text again, or use fill_field instead.]` : ''}`,
       };
+    },
+
+    // ── select_option: Change a <select> dropdown or click a custom dropdown option ──
+    // target = SID of the <select> element (or the dropdown trigger)
+    // value = the option text or value to select
+    select_option({ target, value }) {
+      if (!target) return { success: false, error: 'No semantic ID provided for select_option' };
+      if (!value) return { success: false, error: 'No option value provided for select_option' };
+
+      const el = findBySid(target);
+      if (!el) {
+        return {
+          success: false,
+          error: `Element not found: ${target}. Cannot select option.${getRecoverySnapshot()}`,
+        };
+      }
+
+      if (isSensitiveElement(el)) {
+        return { success: false, error: 'BLOCKED: Sensitive field — cannot interact', blocked: true };
+      }
+
+      const valueLower = value.toLowerCase().trim();
+
+      // Case 1: Native <select> element
+      if (el.tagName === 'SELECT') {
+        let bestMatch = null;
+        let bestScore = 0;
+        for (const opt of el.options) {
+          const optText = (opt.text || '').toLowerCase().trim();
+          const optVal = (opt.value || '').toLowerCase().trim();
+          // Exact match
+          if (optText === valueLower || optVal === valueLower) {
+            bestMatch = opt;
+            bestScore = 1;
+            break;
+          }
+          // Partial match
+          if (optText.includes(valueLower) || valueLower.includes(optText)) {
+            const score = 0.5;
+            if (score > bestScore) { bestMatch = opt; bestScore = score; }
+          }
+        }
+
+        if (!bestMatch) {
+          const available = Array.from(el.options).map(o => o.text).join(', ');
+          return { success: false, error: `No matching option for "${value}". Available: ${available}` };
+        }
+
+        // Use native setter trick for React compatibility
+        const nativeSetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+        if (nativeSetter) {
+          nativeSetter.call(el, bestMatch.value);
+        } else {
+          el.value = bestMatch.value;
+        }
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+
+        el.style.outline = '2px solid #6366f1';
+        setTimeout(() => { el.style.outline = ''; }, 1500);
+
+        return {
+          success: true,
+          observation: `Selected "${bestMatch.text}" in ${el.name || el.id || 'dropdown'}`,
+        };
+      }
+
+      // Case 2: Custom dropdown (role=combobox, aria-haspopup, etc.)
+      // Click the trigger to open it, then look for matching options
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.click();
+
+      // Brief delay for dropdown animation
+      return new Promise(resolve => {
+        setTimeout(() => {
+          // Look for listbox/menu options that appeared
+          const optionSelectors = [
+            '[role="option"]', '[role="menuitem"]', '[role="listbox"] > *',
+            '[class*="option"]', '[class*="Option"]',
+            '[class*="menu-item"]', '[class*="MenuItem"]',
+            '[class*="dropdown-item"]', '[class*="DropdownItem"]',
+            'li[data-value]', 'li[role="option"]',
+          ];
+
+          let bestOption = null;
+          let bestScore = 0;
+
+          for (const sel of optionSelectors) {
+            try {
+              for (const opt of document.querySelectorAll(sel)) {
+                const optText = (opt.innerText || opt.textContent || '').toLowerCase().trim();
+                if (optText === valueLower) { bestOption = opt; bestScore = 1; break; }
+                if (optText.includes(valueLower) || valueLower.includes(optText)) {
+                  const score = 0.5;
+                  if (score > bestScore) { bestOption = opt; bestScore = score; }
+                }
+              }
+            } catch {}
+            if (bestScore === 1) break;
+          }
+
+          if (bestOption) {
+            bestOption.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            bestOption.click();
+            resolve({
+              success: true,
+              observation: `Selected "${(bestOption.innerText || '').trim().slice(0, 80)}" from dropdown`,
+            });
+          } else {
+            // Couldn't find option — close dropdown and report
+            el.click(); // close it
+            resolve({
+              success: false,
+              error: `Opened dropdown but couldn't find option matching "${value}". Try click_element on the specific option after the dropdown is open.`,
+            });
+          }
+        }, 400);
+      });
     },
 
     scroll_to_sid({ target }) {
@@ -672,8 +905,9 @@
     },
 
     take_snapshot() {
-      // Build a compact semantic map (top 50 elements)
-      const MAX_ELEMENTS = 50;
+      // Build a compact semantic map
+      // Increased to 80 to capture form fields on complex pages (Facebook Ads, etc.)
+      const MAX_ELEMENTS = 80;
       const elements = [];
       let counter = 0;
 
@@ -732,18 +966,40 @@
         return null;
       }
 
+      // Email action labels — elements with these labels are always interactive
+      const EMAIL_ACTION_LABELS = ['reply', 'reply all', 'forward', 'compose', 'send', 'discard', 'archive', 'delete', 'mark as read', 'mark as unread', 'snooze', 'move to', 'more options', 'newer', 'older'];
+
       function classifyElement(node) {
         const tag = node.tagName;
-        if (tag === 'BUTTON' || node.getAttribute('role') === 'button') return 'button';
+        const role = node.getAttribute('role');
+        if (tag === 'BUTTON' || role === 'button') return 'button';
         if (tag === 'A') return 'link';
         if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return 'input';
+        // Detect toggle switches, checkboxes, and radio buttons by role
+        if (role === 'switch' || role === 'checkbox' || role === 'radio') return 'input';
+        // Detect custom form controls used by React apps (Facebook, etc.)
+        if (role === 'combobox' || role === 'listbox' || role === 'spinbutton' ||
+            role === 'slider' || role === 'textbox' || role === 'searchbox') return 'input';
+        // Detect contentEditable elements (custom text inputs)
+        if (node.isContentEditable || node.getAttribute('contenteditable') === 'true') return 'input';
+        // Detect elements with aria-haspopup (custom dropdowns)
+        if (node.getAttribute('aria-haspopup') === 'listbox' || node.getAttribute('aria-haspopup') === 'menu') return 'input';
+        // Gmail/email clients: detect action buttons by aria-label, data-tooltip, or title
+        const ariaLabel = (node.getAttribute('aria-label') || '').toLowerCase();
+        const dataTooltip = (node.getAttribute('data-tooltip') || '').toLowerCase();
+        const title = (node.getAttribute('title') || '').toLowerCase();
+        if (EMAIL_ACTION_LABELS.some(a => ariaLabel.includes(a) || dataTooltip.includes(a) || title.includes(a))) {
+          return 'button';
+        }
+        // Detect clickable elements with tabindex and role
+        if (role === 'link' || role === 'tab' || role === 'menuitem') return 'button';
         return null;
       }
 
       function getElementText(node) {
         const text = (node.innerText || node.textContent || node.value ||
-                node.getAttribute('aria-label') || node.getAttribute('title') ||
-                node.getAttribute('placeholder') || '').trim().slice(0, 120);
+                node.getAttribute('aria-label') || node.getAttribute('data-tooltip') ||
+                node.getAttribute('title') || node.getAttribute('placeholder') || '').trim().slice(0, 120);
 
         // If no meaningful text, try icon meaning
         if (!text || text.length < 2) {
@@ -872,6 +1128,7 @@
           if (descEl) attrs.ariaDescription = (descEl.innerText || '').trim().slice(0, 80);
         }
         if (node.getAttribute('title')) attrs.title = node.getAttribute('title');
+        if (node.getAttribute('data-tooltip')) attrs.dataTooltip = node.getAttribute('data-tooltip');
         if (node.getAttribute('role')) attrs.role = node.getAttribute('role');
         const iconMeaning = getIconMeaning(node);
         if (iconMeaning) attrs.iconMeaning = iconMeaning;
@@ -885,13 +1142,105 @@
         const domDepth = getDomDepth(node);
         const similarCount = countSimilarSiblings(node, text);
 
+        // ── Toggle/Switch/Checkbox state detection ──
+        let toggleState = null;
+        const nodeRole = node.getAttribute('role');
+        const nodeType = (node.getAttribute('type') || '').toLowerCase();
+
+        if (nodeRole === 'switch' || nodeRole === 'checkbox' || nodeRole === 'radio' ||
+            nodeType === 'checkbox' || nodeType === 'radio') {
+          const ariaChecked = node.getAttribute('aria-checked');
+          const ariaPressed = node.getAttribute('aria-pressed');
+          const isChecked = node.checked ||
+            ariaChecked === 'true' ||
+            ariaPressed === 'true' ||
+            node.classList.contains('active') ||
+            node.classList.contains('on') ||
+            node.classList.contains('enabled') ||
+            node.classList.contains('checked');
+          toggleState = isChecked ? 'ON/ENABLED' : 'OFF/DISABLED';
+        }
+
+        // Get the label near this toggle for context
+        let toggleLabel = null;
+        if (toggleState) {
+          toggleLabel = node.closest('label')?.textContent?.trim() ||
+            node.closest('[class*="setting"]')?.querySelector('h3, h4, label, span')?.textContent?.trim() ||
+            node.getAttribute('aria-label') ||
+            sectionHeading || '';
+          if (toggleLabel) toggleLabel = toggleLabel.slice(0, 100);
+        }
+
+        // Append toggle state to text for AI visibility
+        let finalText = text;
+        if (toggleState) {
+          finalText += ` [STATE: ${toggleState}]`;
+          if (toggleLabel && !text.includes(toggleLabel)) {
+            finalText += ` Label: "${toggleLabel}"`;
+          }
+        }
+
+        // ── Current Value Detection for form fields ──
+        // Captures the ACTUAL current value of inputs, selects, textareas
+        // so the AI can see what defaults are set and decide whether to change them.
+        let currentValue = null;
+        const tag = node.tagName;
+
+        if (tag === 'INPUT') {
+          const iType = (node.getAttribute('type') || 'text').toLowerCase();
+          if (iType !== 'checkbox' && iType !== 'radio' && iType !== 'hidden' && iType !== 'submit' && iType !== 'button') {
+            const val = (node.value || '').trim();
+            if (val) currentValue = val.slice(0, 120);
+          }
+        } else if (tag === 'TEXTAREA') {
+          const val = (node.value || '').trim();
+          if (val) currentValue = val.slice(0, 200);
+        } else if (tag === 'SELECT') {
+          const selOpt = node.options?.[node.selectedIndex];
+          if (selOpt) currentValue = (selOpt.text || selOpt.value || '').trim().slice(0, 120);
+        }
+
+        // Also detect custom dropdown/combobox current values (React, Facebook, etc.)
+        if (!currentValue) {
+          const nodeRole = node.getAttribute('role');
+          if (nodeRole === 'combobox' || nodeRole === 'listbox' || nodeRole === 'spinbutton' ||
+              node.getAttribute('aria-haspopup') === 'listbox' || node.getAttribute('aria-haspopup') === 'true') {
+            const ariaVal = node.getAttribute('aria-valuenow') || node.getAttribute('aria-valuetext');
+            if (ariaVal) {
+              currentValue = ariaVal.slice(0, 120);
+            } else {
+              // Facebook/React: value is often the innerText of the control
+              const innerVal = (node.innerText || node.textContent || '').trim();
+              if (innerVal && innerVal.length < 80 && innerVal !== text) {
+                currentValue = innerVal.slice(0, 120);
+              }
+            }
+          }
+          // ContentEditable elements (custom text inputs)
+          if (!currentValue && (node.isContentEditable || node.getAttribute('contenteditable') === 'true')) {
+            const ceVal = (node.innerText || node.textContent || '').trim();
+            if (ceVal) currentValue = ceVal.slice(0, 200);
+          }
+          // Role=textbox (custom input elements)
+          if (!currentValue && nodeRole === 'textbox') {
+            const tbVal = (node.innerText || node.textContent || node.value || '').trim();
+            if (tbVal) currentValue = tbVal.slice(0, 120);
+          }
+        }
+
+        // Append current value to text so AI can see it
+        if (currentValue && !finalText.includes(currentValue)) {
+          finalText += ` [CURRENT VALUE: "${currentValue}"]`;
+        }
+
         return {
-          sid, type, text, attrs,
+          sid, type, text: finalText, attrs,
           context: parentText,
           inModal: isModal,
           section: sectionHeading,        // nearest heading above this element
           depth: domDepth,                 // DOM depth for structural grouping
           duplicates: similarCount,        // count of siblings with identical text
+          currentValue: currentValue,      // raw value for programmatic access
         };
       }
 
@@ -1160,6 +1509,7 @@
       'click_element': 'click_by_sid',
       'read_element':  'read_by_sid',
       'type_text':     'type_text',
+      'select_option': 'select_option',
       'scroll':        'scroll_page',
       'scroll_to':     'scroll_to_sid',
       'scrape_page':   'extract_visible_text',
@@ -1169,16 +1519,25 @@
     };
 
     // SECURITY: Block fill_field and type_text entirely on login/auth pages
-    // Use AuthGateDetector for comprehensive detection
-    const authCheck = AuthGateDetector.detect();
-    if ((actionType === 'fill_field' || actionType === 'type_text') && authCheck.isAuthPage) {
-      sendResponse({
-        success: false,
-        error: `AUTH_GATE_DETECTED (${authCheck.authType}): Agent cannot interact with authentication pages. User must log in manually.`,
-        blocked: true,
-        authGate: { authType: authCheck.authType, signals: authCheck.signals },
-      });
-      return true;
+    // Triple-check: AuthGateDetector + URL patterns + password field presence + auth domains
+    if (actionType === 'fill_field' || actionType === 'type_text' || actionType === 'select_option') {
+      const authCheck = AuthGateDetector.detect();
+      const currentUrl = window.location.href.toLowerCase();
+      const hardLoginPatterns = ['signin', 'sign-in', 'login', 'log-in', '/auth/', '/oauth/', '/sso/', '/ap/signin', '/accounts/login', '/servicelogin', '/session/new', '/password', '/users/sign_in', '/account/login', '/authenticate', '/uc/login', '/id/signin', '/idp/login'];
+      const isOnLoginUrl = hardLoginPatterns.some(p => currentUrl.includes(p));
+      const hasPasswordField = !!document.querySelector('input[type="password"]');
+      const isOnAuthDomain = AUTH_PROVIDER_DOMAINS.some(d => window.location.hostname.toLowerCase() === d || window.location.hostname.toLowerCase().endsWith('.' + d));
+
+      if (authCheck.isAuthPage || isOnLoginUrl || hasPasswordField || isOnAuthDomain) {
+        console.log('[SECURITY] BLOCKED', actionType, 'at dispatch level. authGate:', authCheck.isAuthPage, 'loginUrl:', isOnLoginUrl, 'passwordField:', hasPasswordField, 'authDomain:', isOnAuthDomain);
+        sendResponse({
+          success: false,
+          error: `SECURITY_BLOCK: This is a login/authentication page. The agent cannot type or fill fields here. Please log in manually.`,
+          blocked: true,
+          authGate: { authType: authCheck.authType || 'login', signals: authCheck.signals || ['url_or_password_field'] },
+        });
+        return true;
+      }
     }
 
     const handlerName = handlerMap[actionType] || actionType;

@@ -15,6 +15,8 @@ const PLACEHOLDERS = {
   general: "Command Enhancivity..."
 };
 
+let lastUserPrompt = '';
+
 const BADGE_CONFIG = {
   gmail:   { label: 'Gmail',   color: '#ef4444' },
   amazon:  { label: 'Amazon',  color: '#f59e0b' },
@@ -170,6 +172,7 @@ async function handleSubmit() {
   const promptInput = document.getElementById('prompt-input');
   const userPrompt  = promptInput.value.trim();
   if (!userPrompt) return;
+  lastUserPrompt = userPrompt;
 
   // Hide greeting on first submit
   const greeting = document.getElementById('chat-greeting');
@@ -226,6 +229,12 @@ async function handleSubmit() {
   // EXPLORE: multi-step agentic exploration loop
   if (res.data?.action_type === 'EXPLORE' && res.data?.explore_plan) {
     renderExplorePlan(res.data, res.data.consent_level === 'auto');
+    return;
+  }
+
+  // CLARIFY: present clarification options to user
+  if (res.data?.action_type === 'CLARIFY' && res.data?.clarification) {
+    renderClarification(res.data);
     return;
   }
 
@@ -346,6 +355,66 @@ function renderBillingBlocked(area, data) {
   card.appendChild(btn);
 
   area.appendChild(card);
+}
+
+// ── Clarification Rendering ───────────────────────────────────
+
+function renderClarification(data) {
+  const area = document.getElementById('results-area');
+  area.innerHTML = '';
+  area.classList.remove('hidden');
+  const clarification = data.clarification;
+
+  const question = document.createElement('p');
+  question.style.cssText = 'color: #e2e8f0; font-size: 13px; margin-bottom: 10px;';
+  question.textContent = clarification.question;
+  area.appendChild(question);
+
+  const optionsContainer = document.createElement('div');
+  optionsContainer.style.cssText = 'display: flex; flex-direction: column; gap: 6px;';
+
+  clarification.options.forEach(option => {
+    if (option.value === 'custom') {
+      const customBtn = document.createElement('button');
+      customBtn.style.cssText = 'background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; color: #94a3b8; padding: 8px 12px; cursor: pointer; font-size: 12px; text-align: left;';
+      customBtn.textContent = option.label;
+      customBtn.addEventListener('click', () => {
+        customBtn.style.display = 'none';
+        const inputRow = document.createElement('div');
+        inputRow.style.cssText = 'display: flex; gap: 6px;';
+        const inp = document.createElement('input');
+        inp.type = 'text';
+        inp.placeholder = 'Type your answer...';
+        inp.style.cssText = 'flex: 1; background: rgba(255,255,255,0.06); border: 1px solid rgba(99,102,241,0.3); border-radius: 8px; color: #e2e8f0; padding: 8px 12px; font-size: 12px; outline: none;';
+        const sendBtn = document.createElement('button');
+        sendBtn.textContent = 'Send';
+        sendBtn.style.cssText = 'background: #6366f1; border: none; border-radius: 8px; color: white; padding: 8px 14px; cursor: pointer; font-size: 12px;';
+        sendBtn.addEventListener('click', () => { if (inp.value.trim()) submitClarification(inp.value.trim()); });
+        inp.addEventListener('keydown', (e) => { if (e.key === 'Enter' && inp.value.trim()) submitClarification(inp.value.trim()); });
+        inputRow.appendChild(inp);
+        inputRow.appendChild(sendBtn);
+        optionsContainer.appendChild(inputRow);
+        inp.focus();
+      });
+      optionsContainer.appendChild(customBtn);
+    } else {
+      const btn = document.createElement('button');
+      btn.style.cssText = 'background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.2); border-radius: 8px; color: #e2e8f0; padding: 8px 12px; cursor: pointer; font-size: 12px; text-align: left;';
+      btn.addEventListener('click', () => { submitClarification(option.value); });
+      btn.textContent = option.label;
+      optionsContainer.appendChild(btn);
+    }
+  });
+
+  area.appendChild(optionsContainer);
+}
+
+function submitClarification(answer) {
+  const promptInput = document.getElementById('prompt-input');
+  const originalPrompt = lastUserPrompt || '';
+  const clarifiedPrompt = `${originalPrompt} [User clarification: ${answer}]`;
+  promptInput.value = clarifiedPrompt;
+  handleSubmit();
 }
 
 // ── Results Rendering ─────────────────────────────────────────
@@ -1096,7 +1165,7 @@ async function startExploration(explorePlan) {
 
   const startRes = await chrome.runtime.sendMessage({
     type: 'explore_start',
-    data: { explorePlan, tabId },
+    data: { explorePlan, tabId, userPrompt: explorePlan.goal },
   });
 
   if (!startRes?.success && !startRes?.async) {
@@ -1109,8 +1178,8 @@ async function startExploration(explorePlan) {
   // Wait for the final result via chrome.storage.session
   const res = await new Promise((resolve) => {
     const timeout = setTimeout(() => {
-      resolve({ success: false, error: 'Exploration timed out after 130 seconds.' });
-    }, 130000);
+      resolve({ success: false, error: 'Exploration timed out after 10 minutes.' });
+    }, 600000);
 
     const resultListener = (changes, areaName) => {
       if (areaName !== 'session' || !changes.explorationResult) return;

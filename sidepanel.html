@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Enhancivity</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+
+  <!-- ── AUTH VIEW ─────────────────────────────────────────── -->
+  <div id="auth-view" class="view hidden">
+    <div class="auth-container">
+      <div class="auth-logo-wrap">
+        <img src="images/icon48.png" alt="Enhancivity" class="logo">
+      </div>
+      <h2>Enhancivity</h2>
+      <p class="auth-subtitle">Your Chief of Staff, always on.</p>
+
+      <form id="auth-form">
+        <input type="text" id="auth-name" class="input-field hidden" placeholder="Full name" autocomplete="name" />
+        <input type="email" id="auth-email" class="input-field" placeholder="Email" autocomplete="email" required />
+        <input type="password" id="auth-password" class="input-field" placeholder="Password" autocomplete="current-password" required />
+        <input type="password" id="auth-new-password" class="input-field hidden" placeholder="New password (min 6 characters)" autocomplete="new-password" />
+        <button type="submit" class="btn btn-primary" id="auth-submit">Sign In</button>
+      </form>
+
+      <p id="auth-error" class="error-message"></p>
+      <p id="auth-success" class="success-message hidden"></p>
+
+      <div class="auth-links">
+        <span class="auth-link" id="auth-toggle-signup">Create account</span>
+        <span class="auth-link-sep" id="auth-link-sep">|</span>
+        <span class="auth-link" id="auth-toggle-forgot">Forgot password?</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── MAIN VIEW ─────────────────────────────────────────── -->
+  <div id="main-view" class="view hidden">
+
+    <!-- Header -->
+    <header class="main-header">
+      <div class="header-left">
+        <span class="brand-text">Enhancivity</span>
+        <div id="memory-indicator" class="memory-indicator hidden">
+          <span class="memory-pulse"></span>
+          <span class="memory-text">MEMORY</span>
+        </div>
+        <div id="byok-badge" class="byok-badge hidden">
+          <span class="byok-text">BYOK</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <button id="settings-btn" class="icon-btn" title="Settings">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+        <button id="sign-out-btn" class="icon-btn" title="Sign Out">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <polyline points="16 17 21 12 16 7"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Context Strip -->
+    <div class="context-strip">
+      <span id="context-badge" class="context-badge">General</span>
+    </div>
+
+    <!-- Chat Area -->
+    <div id="chat-area" class="chat-area">
+      <div id="chat-greeting" class="chat-greeting">
+        <div class="greeting-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.4">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M12 16v-4"/>
+            <path d="M12 8h.01"/>
+          </svg>
+        </div>
+        <p class="greeting-text">Ready when you are.</p>
+      </div>
+
+      <!-- Results Area -->
+      <div id="results-area" class="results-area hidden"></div>
+
+      <!-- Loading -->
+      <div id="loading-bar" class="loading-bar hidden">
+        <div class="loading-glow"></div>
+        <div class="loading-content">
+          <div class="loading-spinner"></div>
+          <span class="loading-label">Thinking with your memory...</span>
+        </div>
+      </div>
+
+      <!-- Error -->
+      <p id="main-error" class="error-message"></p>
+    </div>
+
+    <!-- Input Area -->
+    <div class="input-area">
+      <div class="input-pill" id="input-pill">
+        <textarea
+          id="prompt-input"
+          class="prompt-field"
+          placeholder="Command Enhancivity..."
+          autocomplete="off"
+          rows="1"
+        ></textarea>
+        <button id="submit-btn" class="send-btn" title="Send" disabled>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="19" x2="12" y2="5"/>
+            <polyline points="5 12 12 5 19 12"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── SETTINGS VIEW ─────────────────────────────────────── -->
+  <div id="settings-view" class="view hidden">
+    <header class="main-header">
+      <div class="header-left">
+        <button id="settings-back-btn" class="icon-btn" title="Back">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="15 18 9 12 15 6"/>
+          </svg>
+        </button>
+        <span class="brand-text">Settings</span>
+      </div>
+    </header>
+
+    <div class="settings-content">
+      <div class="settings-section">
+        <h3 class="settings-section-title">API Keys (BYOK)</h3>
+        <p class="settings-section-desc">Use your own API key for 10x cheaper pricing. Keys are stored locally and never saved on our servers.</p>
+
+        <label class="settings-label">Provider</label>
+        <div class="settings-field">
+          <select id="byok-provider-select" class="input-field select-field">
+            <option value="" disabled selected>Select provider...</option>
+            <option value="openai">OpenAI</option>
+            <option value="anthropic">Anthropic</option>
+          </select>
+        </div>
+
+        <label class="settings-label" id="api-key-label">API Key</label>
+        <div class="settings-field">
+          <input
+            type="password"
+            id="api-key-input"
+            class="input-field mono-field"
+            placeholder="Select a provider first..."
+            autocomplete="off"
+            disabled
+          >
+        </div>
+
+        <div id="api-key-status" class="api-key-status hidden"></div>
+
+        <div class="settings-btn-row">
+          <button id="save-api-key-btn" class="btn btn-primary btn-sm" disabled>Save Key</button>
+          <button id="clear-api-key-btn" class="btn btn-ghost btn-sm">Clear Key</button>
+        </div>
+
+        <div id="byok-trial-info" class="byok-trial-info hidden"></div>
+      </div>
+
+      <div class="settings-section" id="model-section">
+        <div class="settings-section-header">
+          <h3 class="settings-section-title">Model</h3>
+          <button id="advanced-model-toggle" class="icon-btn" title="Advanced model options">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+          </button>
+        </div>
+
+        <div id="intent-slider-group" class="intent-slider-group">
+          <div class="intent-options">
+            <button class="intent-btn" data-intent="fast">Fast</button>
+            <button class="intent-btn active" data-intent="balanced">Balanced</button>
+            <button class="intent-btn" data-intent="reasoning">Max Reasoning</button>
+          </div>
+          <div id="intent-model-label" class="intent-model-label"></div>
+        </div>
+
+        <div id="advanced-model-panel" class="advanced-model-panel hidden">
+          <label class="settings-label">Model from Registry</label>
+          <div class="settings-field">
+            <select id="model-select" class="input-field select-field">
+              <option value="" selected>Use intent-based (auto)</option>
+            </select>
+          </div>
+
+          <label class="settings-label">Custom Model ID</label>
+          <p class="settings-hint">For fine-tuned models (e.g. ft:gpt-4o:my-org:custom). Overrides dropdown above.</p>
+          <div class="settings-field">
+            <input
+              type="text"
+              id="custom-model-input"
+              class="input-field mono-field"
+              placeholder="ft:gpt-4o:my-org:custom..."
+              autocomplete="off"
+            >
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>

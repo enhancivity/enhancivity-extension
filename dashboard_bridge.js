@@ -12,26 +12,19 @@
 
   console.log('[Bridge] Dashboard bridge loading on:', window.location.href);
 
-  // ─── Helper: ensure floating panel is injected on this page ──
-  async function ensurePanelInjected() {
-    if (window.__enhPanelLoaded) {
-      console.log('[Bridge] Panel already loaded on this page');
-      return true;
-    }
-
-    // Ask background to inject panel CSS + JS into this tab
-    console.log('[Bridge] Requesting panel injection from background...');
+  // ─── Helper: ensure side panel is open ──
+  async function ensureSidePanelOpen() {
+    console.log('[Bridge] Requesting side panel open from background...');
     try {
       const response = await chrome.runtime.sendMessage({ type: 'inject_panel_here' });
-      console.log('[Bridge] Injection response:', response);
+      console.log('[Bridge] Side panel open response:', response);
       if (!response?.success) return false;
 
-      // Wait for panel to initialize
-      await new Promise(r => setTimeout(r, 800));
-      console.log('[Bridge] Panel injection wait complete, __enhPanelLoaded:', !!window.__enhPanelLoaded);
-      return !!window.__enhPanelLoaded;
+      // Wait for side panel to initialize
+      await new Promise(r => setTimeout(r, 600));
+      return true;
     } catch (err) {
-      console.error('[Bridge] Panel injection failed:', err.message);
+      console.error('[Bridge] Side panel open failed:', err.message);
       return false;
     }
   }
@@ -56,71 +49,68 @@
     }
 
     // ── DELEGATE_TASK: Dashboard "Delegate" button ──
-    // 1. Ensure the floating panel is injected on this page
-    // 2. Send auto-fill payload directly via window.postMessage (same page)
+    // 1. Ensure the side panel is open
+    // 2. Send auto-fill payload via chrome.runtime.sendMessage (side panel listens)
     if (event.data.type === 'DELEGATE_TASK') {
       const payload = event.data.payload;
       console.log('[Bridge] Handling DELEGATE_TASK:', payload?.taskTitle);
 
-      // Ensure panel is on the page
       let panelReady = false;
       try {
-        panelReady = await ensurePanelInjected();
+        panelReady = await ensureSidePanelOpen();
       } catch (err) {
         if (err.message?.includes('Extension context invalidated')) {
           console.warn('[Bridge] Extension was reloaded — page needs refresh');
           alert('Enhancivity extension was updated. Please refresh this page (Ctrl+R) and try again.');
           return;
         }
-        console.error('[Bridge] Panel injection error:', err.message);
+        console.error('[Bridge] Side panel open error:', err.message);
       }
 
       if (!panelReady) {
-        console.error('[Bridge] Could not inject panel — delegation aborted');
+        console.error('[Bridge] Could not open side panel — delegation aborted');
         return;
       }
 
-      // Send auto-fill directly to panel via window.postMessage
-      // (both bridge and panel are content scripts on the same page)
-      console.log('[Bridge] Sending auto-fill to panel via window.postMessage');
-      window.postMessage({
-        type: 'ENHANCIVITY_DELEGATE_AUTOFILL',
-        source: BRIDGE_SOURCE,
+      // Send auto-fill to side panel via chrome.runtime.sendMessage
+      console.log('[Bridge] Sending auto-fill to side panel via runtime message');
+      chrome.runtime.sendMessage({
+        type: 'enh_delegate_autofill',
         payload,
-      }, '*');
+      }).catch(err => console.error('[Bridge] Auto-fill send failed:', err.message));
     }
 
     // ── BRIEFING_ACTION: Briefing dynamic action button ──
-    // 1. Ensure the floating panel is injected on this page
-    // 2. Send the actionIntent as an auto-fill prompt to the panel
+    // 1. Ensure the side panel is open
+    // 2. Send the actionIntent via chrome.runtime.sendMessage (side panel listens)
     if (event.data.type === 'BRIEFING_ACTION') {
       const payload = event.data.payload;
       console.log('[Bridge] Handling BRIEFING_ACTION:', payload?.buttonText, '| Intent:', payload?.actionIntent);
 
       let panelReady = false;
       try {
-        panelReady = await ensurePanelInjected();
+        panelReady = await ensureSidePanelOpen();
       } catch (err) {
         if (err.message?.includes('Extension context invalidated')) {
           console.warn('[Bridge] Extension was reloaded — page needs refresh');
           alert('Enhancivity extension was updated. Please refresh this page (Ctrl+R) and try again.');
           return;
         }
-        console.error('[Bridge] Panel injection error:', err.message);
+        console.error('[Bridge] Side panel open error:', err.message);
       }
 
       if (!panelReady) {
-        console.error('[Bridge] Could not inject panel — briefing action aborted');
+        console.error('[Bridge] Could not open side panel — briefing action aborted');
         return;
       }
 
-      // Send briefing action to panel via window.postMessage
-      console.log('[Bridge] Sending briefing action to panel via window.postMessage');
-      window.postMessage({
+      // Send briefing action to side panel via chrome.runtime.sendMessage
+      console.log('[Bridge] Sending briefing action to side panel via runtime message');
+      chrome.runtime.sendMessage({
         type: 'ENHANCIVITY_BRIEFING_ACTION',
         source: BRIDGE_SOURCE,
         payload,
-      }, '*');
+      }).catch(err => console.error('[Bridge] Briefing action send failed:', err.message));
     }
   });
 

@@ -62,6 +62,7 @@
   let orchestrationListener = null;
   let explorationListener = null;
   let conversationMessages = []; // { role: 'user'|'assistant', content: string, data?: object, timestamp: number }
+  let lastUserPrompt = ''; // Track last prompt for clarification re-submission
 
   // ── Conversation Helpers ───────────────────────────────────────
 
@@ -560,6 +561,7 @@
   async function handleSubmit() {
     const userPrompt = promptInput.value.trim();
     if (!userPrompt) return;
+    lastUserPrompt = userPrompt;
 
     // Hide greeting on first submit
     if (greeting) greeting.style.display = 'none';
@@ -646,6 +648,12 @@
     // FIND_AND_REPLY: auto-execute (searches inbox + pre-fills reply)
     if (res.data?.action_type === 'FIND_AND_REPLY') {
       await handleFindAndReply(res.data);
+      return;
+    }
+
+    // CLARIFY: present clarification options to user
+    if (res.data?.action_type === 'CLARIFY' && res.data?.clarification) {
+      renderClarification(res.data);
       return;
     }
 
@@ -780,6 +788,13 @@
 
     const { searchQuery, replyBody, subject } = payload;
 
+    // BUG 2 FIX: Validate searchQuery before proceeding
+    if (!searchQuery || !searchQuery.trim()) {
+      statusEl.textContent = 'Cannot search: no sender or search query provided. Please specify who to reply to.';
+      statusEl.style.color = '#f87171';
+      return;
+    }
+
     // Step 1: If we're already on Gmail, search for the email
     if (!currentTabUrl.includes('mail.google.com')) {
       // Navigate to Gmail first
@@ -789,6 +804,10 @@
         statusEl.textContent = 'Could not open Gmail. Please navigate there manually.';
         statusEl.style.color = '#f87171';
         return;
+      }
+      // BUG 1 FIX: Update currentTabId so gmail_find_and_reply targets the correct Gmail tab
+      if (navRes.tabId) {
+        currentTabId = navRes.tabId;
       }
       // Update our tab reference
       currentTabUrl = 'https://mail.google.com/mail/';
@@ -917,6 +936,28 @@
       return;
     }
 
+    // FIND_AND_REPLY: auto-execute the full pipeline (search → open → reply)
+    if (data.action_type === 'FIND_AND_REPLY') {
+      const findReplyCard = document.createElement('div');
+      findReplyCard.className = 'enh-action-card enh-consent-soft';
+      const frHeadline = document.createElement('p');
+      frHeadline.className = 'enh-action-headline';
+      frHeadline.textContent = data.headline || 'Finding email & drafting reply…';
+      findReplyCard.appendChild(frHeadline);
+      const frStatus = document.createElement('p');
+      frStatus.className = 'enh-action-summary';
+      frStatus.textContent = 'Searching your inbox…';
+      findReplyCard.appendChild(frStatus);
+      container.appendChild(findReplyCard);
+
+      // Auto-execute in background
+      handleFindAndReply(data).catch(() => {
+        frStatus.textContent = 'Could not complete the reply. Please try again.';
+        frStatus.style.color = '#f87171';
+      });
+      return;
+    }
+
     if (data.type === 'tasks') {
       renderTaskList(container, data.items || []);
     } else if (data.type === 'products') {
@@ -944,6 +985,91 @@
     resultsArea.appendChild(wrapper);
     resultsArea.classList.remove('enh-hidden');
     chatArea.scrollTop = chatArea.scrollHeight;
+  }
+
+  function renderClarification(data) {
+    const clarification = data.clarification;
+    const wrapper = document.createElement('div');
+    wrapper.className = 'enh-msg enh-msg-assistant';
+
+    // Question text
+    const question = document.createElement('p');
+    question.style.cssText = 'color: #e2e8f0; font-size: 13px; margin-bottom: 10px;';
+    question.textContent = clarification.question;
+    wrapper.appendChild(question);
+
+    // Option buttons
+    const optionsContainer = document.createElement('div');
+    optionsContainer.style.cssText = 'display: flex; flex-direction: column; gap: 6px;';
+
+    clarification.options.forEach(option => {
+      if (option.value === 'custom') {
+        // "Something else" — show input field when clicked
+        const customBtn = document.createElement('button');
+        customBtn.style.cssText = 'background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; color: #94a3b8; padding: 8px 12px; cursor: pointer; font-size: 12px; text-align: left; transition: all 0.15s;';
+        customBtn.textContent = option.label;
+        customBtn.addEventListener('mouseenter', () => { customBtn.style.background = 'rgba(99,102,241,0.15)'; customBtn.style.borderColor = 'rgba(99,102,241,0.3)'; });
+        customBtn.addEventListener('mouseleave', () => { customBtn.style.background = 'rgba(255,255,255,0.06)'; customBtn.style.borderColor = 'rgba(255,255,255,0.1)'; });
+        customBtn.addEventListener('click', () => {
+          // Replace button with input field
+          customBtn.style.display = 'none';
+          const inputRow = document.createElement('div');
+          inputRow.style.cssText = 'display: flex; gap: 6px;';
+          const inp = document.createElement('input');
+          inp.type = 'text';
+          inp.placeholder = 'Type your answer...';
+          inp.style.cssText = 'flex: 1; background: rgba(255,255,255,0.06); border: 1px solid rgba(99,102,241,0.3); border-radius: 8px; color: #e2e8f0; padding: 8px 12px; font-size: 12px; outline: none;';
+          const sendBtn = document.createElement('button');
+          sendBtn.textContent = 'Send';
+          sendBtn.style.cssText = 'background: #6366f1; border: none; border-radius: 8px; color: white; padding: 8px 14px; cursor: pointer; font-size: 12px;';
+          sendBtn.addEventListener('click', () => {
+            if (inp.value.trim()) {
+              submitClarification(inp.value.trim());
+            }
+          });
+          inp.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && inp.value.trim()) {
+              submitClarification(inp.value.trim());
+            }
+          });
+          inputRow.appendChild(inp);
+          inputRow.appendChild(sendBtn);
+          optionsContainer.appendChild(inputRow);
+          inp.focus();
+        });
+        optionsContainer.appendChild(customBtn);
+      } else {
+        const btn = document.createElement('button');
+        btn.style.cssText = 'background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.2); border-radius: 8px; color: #e2e8f0; padding: 8px 12px; cursor: pointer; font-size: 12px; text-align: left; transition: all 0.15s;';
+        btn.textContent = option.label;
+        btn.addEventListener('mouseenter', () => { btn.style.background = 'rgba(99,102,241,0.25)'; btn.style.borderColor = 'rgba(99,102,241,0.4)'; });
+        btn.addEventListener('mouseleave', () => { btn.style.background = 'rgba(99,102,241,0.1)'; btn.style.borderColor = 'rgba(99,102,241,0.2)'; });
+        btn.addEventListener('click', () => {
+          submitClarification(option.value);
+        });
+        optionsContainer.appendChild(btn);
+      }
+    });
+
+    wrapper.appendChild(optionsContainer);
+    resultsArea.appendChild(wrapper);
+    resultsArea.classList.remove('enh-hidden');
+    chatArea.scrollTop = chatArea.scrollHeight;
+  }
+
+  function submitClarification(answer) {
+    // Show user's choice as a chat message
+    const userMsg = document.createElement('div');
+    userMsg.className = 'enh-msg enh-msg-user';
+    userMsg.textContent = answer;
+    resultsArea.appendChild(userMsg);
+    chatArea.scrollTop = chatArea.scrollHeight;
+
+    // Re-submit the original prompt with the clarification appended
+    const originalPrompt = lastUserPrompt || '';
+    const clarifiedPrompt = `${originalPrompt} [User clarification: ${answer}]`;
+    promptInput.value = clarifiedPrompt;
+    handleSubmit();
   }
 
   function renderTaskList(container, tasks) {
@@ -1198,8 +1324,15 @@
     container.appendChild(card);
 
     // Execute immediately — no user approval needed
-    executeAutoAction(data).then(res => {
+    executeAutoAction(data).then(async (res) => {
       if (res?.success) {
+        // For NAVIGATE actions, just confirm — page opened in a new tab
+        if (data.action_type === 'NAVIGATE' || (data.dom_actions?.[0]?.action === 'navigate')) {
+          statusEl.textContent = 'Done — page opened.';
+          statusEl.style.color = '#34d399';
+          return;
+        }
+
         const verification = interpretPageState(res.pageStateAfter);
         if (verification?.type === 'success') {
           statusEl.textContent = `Done \u2014 ${verification.snippet}`;
@@ -1303,7 +1436,14 @@
 
     const content = document.createElement('p');
     content.className = 'enh-action-content';
-    content.textContent = data.primary_content;
+    let pc = data.primary_content;
+    // Parse JSON strings (common for FIND_AND_REPLY, COMPOSE_EMAIL)
+    if (typeof pc === 'string' && pc.startsWith('{')) {
+      try { pc = JSON.parse(pc); } catch {}
+    }
+    content.textContent = typeof pc === 'object' && pc !== null
+      ? (pc.replyBody || pc.body || pc.text || pc.message || JSON.stringify(pc, null, 2))
+      : (pc || '');
     card.appendChild(content);
 
     if (data.rationale) {
@@ -1739,7 +1879,8 @@
       const progress = changes.explorationProgress.newValue;
       if (!progress) return;
 
-      statusEl.textContent = `Step ${progress.step}/${progress.total}: ${progress.description || ''}`;
+      const phaseLabel = progress.phase > 1 ? `[Phase ${progress.phase}] ` : '';
+      statusEl.textContent = `${phaseLabel}Step ${progress.step}/${progress.total}: ${progress.description || ''}`;
 
       // Add step entry to log
       if (progress.step >= 0 && progress.description) {
@@ -1784,8 +1925,12 @@
       tabId = null;
     }
 
+    // Get the user's original prompt for auto-continuation context anchoring
+    const lastUserMsg = conversationMessages.filter(m => m.role === 'user').pop();
+    const userPrompt = lastUserMsg?.content || explorePlan.goal;
+
     // Start exploration via background (fire-and-forget — result arrives via chrome.storage)
-    const startRes = await sendToBackground('explore_start', { explorePlan, tabId }, 10000);
+    const startRes = await sendToBackground('explore_start', { explorePlan, tabId, userPrompt }, 10000);
 
     if (!startRes?.success && !startRes?.async) {
       // Immediate failure (e.g., no tabId, invalid plan)
@@ -1801,8 +1946,8 @@
     // Wait for the final result via chrome.storage.session (set by background when loop finishes)
     const res = await new Promise((resolve) => {
       const timeout = setTimeout(() => {
-        resolve({ success: false, error: 'Exploration timed out after 130 seconds.' });
-      }, 130000);
+        resolve({ success: false, error: 'Exploration timed out after 10 minutes.' });
+      }, 600000);
 
       const resultListener = (changes, areaName) => {
         if (areaName !== 'session' || !changes.explorationResult) return;
@@ -1948,7 +2093,8 @@
         const progress = changes.explorationProgress.newValue;
         if (!progress) return;
 
-        statusEl.textContent = `Step ${progress.step}/${progress.total}: ${progress.description || ''}`;
+        const phaseLabel = progress.phase > 1 ? `[Phase ${progress.phase}] ` : '';
+      statusEl.textContent = `${phaseLabel}Step ${progress.step}/${progress.total}: ${progress.description || ''}`;
 
         if (progress.step >= 0 && progress.description) {
           const stepEntry = document.createElement('div');
