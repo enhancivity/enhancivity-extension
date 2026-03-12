@@ -62,15 +62,17 @@ async function getByokKey() {
 }
 
 async function getByokConfig() {
-  const { userApiKey, userApiKeyProvider, userIntent, userSelectedModel, userCustomModel } = await chrome.storage.local.get([
-    'userApiKey', 'userApiKeyProvider', 'userIntent', 'userSelectedModel', 'userCustomModel'
+  const { userApiKey, userApiKeyProvider, userIntent, userSelectedModel, userCustomModel, apiMode } = await chrome.storage.local.get([
+    'userApiKey', 'userApiKeyProvider', 'userIntent', 'userSelectedModel', 'userCustomModel', 'apiMode'
   ]);
+  // If user is on Enhancivity-provided mode, don't send BYOK key even if one is stored
+  const isByok = apiMode === 'byok' && userApiKey;
   return {
-    userApiKey: userApiKey || null,
-    userApiKeyProvider: userApiKeyProvider || null,
+    userApiKey: isByok ? userApiKey : null,
+    userApiKeyProvider: isByok ? (userApiKeyProvider || null) : null,
     userIntent: userIntent || 'balanced',
-    userSelectedModel: userSelectedModel || null,
-    userCustomModel: userCustomModel || null,
+    userSelectedModel: isByok ? (userSelectedModel || null) : null,
+    userCustomModel: isByok ? (userCustomModel || null) : null,
   };
 }
 
@@ -647,6 +649,49 @@ function waitForTabLoad(tabId, timeout = 15000, extraDelay = 2000) {
   });
 }
 
+// ── DOM Stability Check ──────────────────────────────────────
+// Polls the content script for a lightweight DOM fingerprint every
+// `intervalMs`. Resolves as soon as two consecutive fingerprints
+// match (page stopped changing) or `maxWaitMs` is exceeded.
+// Falls back to a fixed delay if fingerprinting fails (e.g. page
+// blocks script injection). Much faster than hardcoded waits on
+// fast pages, and more reliable on slow SPA pages.
+async function waitForDomStable(tabId, maxWaitMs = 3000, intervalMs = 300) {
+  const minWaitMs = 150; // always wait at least this long
+  await new Promise(r => setTimeout(r, minWaitMs));
+
+  let prevFingerprint = null;
+  const deadline = Date.now() + maxWaitMs;
+
+  while (Date.now() < deadline) {
+    try {
+      const fp = await chrome.tabs.sendMessage(tabId, {
+        type: 'explore_action',
+        actionType: 'dom_fingerprint',
+      });
+
+      if (fp?.success && fp.fingerprint) {
+        if (prevFingerprint !== null && fp.fingerprint === prevFingerprint) {
+          return; // DOM is stable — done
+        }
+        prevFingerprint = fp.fingerprint;
+      }
+    } catch {
+      // Content script not available (page navigated, restricted page, etc.)
+      // Fall through to fixed delay below
+      break;
+    }
+
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+
+  // If we broke out early (script unavailable), wait remaining time as fixed delay
+  const remaining = deadline - Date.now();
+  if (remaining > 0) {
+    await new Promise(r => setTimeout(r, remaining));
+  }
+}
+
 async function updateOrchestrationProgress(phase, detail) {
   await chrome.storage.local.set({
     orchestrationProgress: { phase, detail, timestamp: Date.now() }
@@ -1064,6 +1109,7 @@ async function executeExploreAction(tabId, action, token) {
       actionType: action.type,
       target: action.target,
       value: action.value,
+      consentApproved: action.consentApproved || false,
     });
 
     return result || { success: false, error: 'No response from content script' };
@@ -1608,6 +1654,22 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
               }
             }
           }
+
+          // Detect repeated type_text failures across ANY targets
+          // (Rich text editors reject all programmatic input — stop wasting steps)
+          if (currType === 'type_text') {
+            const recentTypeFailures = stepLog.filter(s =>
+              s.action?.type === 'type_text' && s.result?.success === false
+            ).length;
+            if (recentTypeFailures >= 2) {
+              console.warn(`[Explore] Step ${step}: type_text failed ${recentTypeFailures} times — rich text editor cannot accept input. Forcing goal complete.`);
+              // Force goal complete with the text content for the user
+              const textValue = decision.nextAction.value || '';
+              decision.isGoalComplete = true;
+              decision.goalResult = `This page uses a rich text editor that blocks programmatic text input. Here is the content I prepared for you to copy and paste:\n\n${textValue || '(The text was not available — please type your content manually.)'}`;
+              decision.nextAction = null;
+            }
+          }
         }
       }
 
@@ -1677,19 +1739,46 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           });
         }
 
-        // Non-login consent (e.g., payment) — skip and continue
+        // Non-login consent (e.g., posting, submitting, sending) — show consent card
+        // The One-Inch Rule: agent does 99% of the work, user approves the final action
         await updateExplorationProgress(step, maxSteps,
-          `Consent needed: ${decision.consentReason || 'Action requires approval'}`, 'consent');
-        stepLog.push({
-          step,
-          action: decision.nextAction,
-          reasoning: decision.reasoning,
-          result: { success: false },
-          observation: `Skipped — requires consent: ${decision.consentReason}`,
-        });
-        await hudUpdate(currentTabId, `explore-${step}`, 'error',
-          `Needs consent: ${decision.consentReason || 'Requires approval'}`);
-        continue;
+          `Awaiting approval: ${decision.consentReason || 'Action requires approval'}`, 'consent');
+
+        const consent = await hudConsent(currentTabId,
+          decision.consentReason || 'The agent wants to perform an action. Approve to continue.');
+
+        if (consent?.approved) {
+          // User approved — tag the action so click_by_sid bypasses isDangerousClick
+          console.log('[Explore] Consent approved for step', step, '— executing action');
+          decision.nextAction.consentApproved = true;
+          decision.needsConsent = false; // Clear so normal execution proceeds
+          await hudUpdate(currentTabId, `explore-${step}`, 'processing',
+            decision.nextAction?.description || 'Executing approved action...');
+
+          // Fall through to normal action execution below
+        } else {
+          // User declined — skip this action and mark goal complete with current progress
+          console.log('[Explore] Consent declined for step', step);
+          stepLog.push({
+            step,
+            action: decision.nextAction,
+            reasoning: decision.reasoning,
+            result: { success: false },
+            observation: `User declined consent: ${decision.consentReason}`,
+          });
+          await hudUpdate(currentTabId, `explore-${step}`, 'error',
+            `Declined: ${decision.consentReason || 'Action not approved'}`);
+
+          // End exploration — user chose not to proceed
+          cleanupLoop();
+          return finishExploration({
+            success: true,
+            goalResult: `Action paused by user. The form has been filled and is ready for manual submission. Reason for pause: ${decision.consentReason || 'User declined'}`,
+            stepsUsed: step,
+            creditsUsed,
+            stepLog,
+          });
+        }
       }
 
       // Update strategy if revised
@@ -2007,9 +2096,9 @@ async function stageAction(tabId, userGoal, category, token) {
   // Post-action verification: re-scrape page to detect success/error state
   let pageStateAfter = null;
   if (allSuccess) {
-    await new Promise(r => setTimeout(r, 1500)); // Wait for SPA/AJAX to settle
+    await waitForDomStable(tabId, 3000); // Dynamic wait — resolves when DOM stops changing
     pageStateAfter = await scrapePageState(tabId);
-    setTimeout(() => hudHide(tabId), 1500); // Auto-hide HUD (adjusted for the 1.5s wait)
+    setTimeout(() => hudHide(tabId), 1500);
   }
 
   return {
@@ -2067,6 +2156,204 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 async function handleMessage(request, sender) {
+
+  // ── CDP INSERT TEXT: Universal text insertion via Chrome DevTools Protocol ──
+  // Used as Tier 3 fallback when DOM-based methods (execCommand, ClipboardEvent)
+  // fail on canvas-based editors (Word Online, Google Docs) or heavily sandboxed
+  // editors. Generates TRUSTED input events at the browser level.
+  // Enhanced: clicks center of text area first to activate focus trap (Word Online).
+  if (request.type === 'cdp_insert_text') {
+    const tabId = sender?.tab?.id;
+    if (!tabId || !request.text) {
+      return { success: false, error: 'Missing tabId or text for CDP insertion' };
+    }
+    try {
+      const target = { tabId };
+      await chrome.debugger.attach(target, '1.3');
+
+      // ── ELEMENT-SPECIFIC FOCUS ──
+      // If the content script passed element coordinates, click that exact position
+      // to ensure the correct editor surface has focus before typing.
+      // Falls back to viewport center if no coordinates provided (canvas editors).
+      try {
+        let clickX, clickY;
+        if (request.elementRect?.x && request.elementRect?.y) {
+          // Click the exact center of the target element
+          clickX = request.elementRect.x;
+          clickY = request.elementRect.y;
+          console.log('[CDP] Clicking element center at', clickX, clickY);
+        } else {
+          // Fallback: check if anything is focused, click center if not
+          const { result: hasFocusedInput } = await chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+            expression: `!!document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA' || document.activeElement.isContentEditable)`,
+            returnByValue: true,
+          });
+          if (hasFocusedInput?.value) {
+            clickX = null; // already focused, no click needed
+          } else {
+            const { result: dims } = await chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+              expression: `JSON.stringify({ w: window.innerWidth, h: window.innerHeight })`,
+              returnByValue: true,
+            });
+            const { w, h } = JSON.parse(dims?.value || '{"w":960,"h":540}');
+            clickX = Math.round(w / 2);
+            clickY = Math.round(h / 2);
+            console.log('[CDP] No focused input — clicking viewport center', clickX, clickY);
+          }
+        }
+        if (clickX != null) {
+          await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+            type: 'mousePressed', x: clickX, y: clickY, button: 'left', clickCount: 1,
+          });
+          await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+            type: 'mouseReleased', x: clickX, y: clickY, button: 'left', clickCount: 1,
+          });
+          await new Promise(r => setTimeout(r, 150));
+        }
+      } catch (focusErr) {
+        console.warn('[CDP] Focus detection failed (non-fatal):', focusErr.message);
+      }
+
+      await chrome.debugger.sendCommand(target, 'Input.insertText', { text: request.text });
+      await chrome.debugger.detach(target);
+      return { success: true };
+    } catch (err) {
+      try { await chrome.debugger.detach({ tabId }); } catch (_) {}
+      console.warn('[CDP] Input.insertText failed:', err.message);
+      return { success: false, error: err.message };
+    }
+  }
+
+  // ── CDP TYPE KEYS: Character-by-character key dispatch via DevTools Protocol ──
+  // Tier 3b: For editors that ignore Input.insertText but respond to individual
+  // key events (Word Online, Google Docs canvas layer). Uses Input.dispatchKeyEvent
+  // to send keyDown + char + keyUp per character — generates TRUSTED keyboard events.
+  // When initializeBuffer=true, sends Enter then Backspace first to activate Word's
+  // text buffer (Word requires these to initialize its input handler).
+  if (request.type === 'cdp_type_keys') {
+    const tabId = sender?.tab?.id;
+    if (!tabId || !request.text) {
+      return { success: false, error: 'Missing tabId or text for CDP key dispatch' };
+    }
+    try {
+      const target = { tabId };
+      await chrome.debugger.attach(target, '1.3');
+
+      // ── ELEMENT-SPECIFIC FOCUS (same logic as cdp_insert_text) ──
+      try {
+        let clickX, clickY;
+        if (request.elementRect?.x && request.elementRect?.y) {
+          clickX = request.elementRect.x;
+          clickY = request.elementRect.y;
+          console.log('[CDP-KEYS] Clicking element center at', clickX, clickY);
+        } else {
+          const { result: hasFocus } = await chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+            expression: `!!document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA' || document.activeElement.isContentEditable)`,
+            returnByValue: true,
+          });
+          if (hasFocus?.value) {
+            clickX = null;
+          } else {
+            const { result: dims } = await chrome.debugger.sendCommand(target, 'Runtime.evaluate', {
+              expression: `JSON.stringify({ w: window.innerWidth, h: window.innerHeight })`,
+              returnByValue: true,
+            });
+            const { w, h } = JSON.parse(dims?.value || '{"w":960,"h":540}');
+            clickX = Math.round(w / 2);
+            clickY = Math.round(h / 2);
+            console.log('[CDP-KEYS] No focused input — clicking viewport center');
+          }
+        }
+        if (clickX != null) {
+          await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+            type: 'mousePressed', x: clickX, y: clickY, button: 'left', clickCount: 1,
+          });
+          await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+            type: 'mouseReleased', x: clickX, y: clickY, button: 'left', clickCount: 1,
+          });
+          await new Promise(r => setTimeout(r, 200));
+        }
+      } catch (_) { /* non-fatal */ }
+
+      // ── BUFFER INITIALIZATION (Word Online requires this) ──
+      // Word's canvas editor needs an Enter then Backspace to activate the text buffer.
+      // Without this, subsequent key events are silently ignored.
+      if (request.initializeBuffer) {
+        console.log('[CDP-KEYS] Initializing text buffer with Enter + Backspace');
+        // Enter key
+        await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+          type: 'keyDown', key: 'Enter', code: 'Enter',
+          windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+        });
+        await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+          type: 'keyUp', key: 'Enter', code: 'Enter',
+          windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+        });
+        await new Promise(r => setTimeout(r, 100));
+
+        // Backspace to remove the Enter we just typed
+        await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+          type: 'keyDown', key: 'Backspace', code: 'Backspace',
+          windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
+        });
+        await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+          type: 'keyUp', key: 'Backspace', code: 'Backspace',
+          windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8,
+        });
+        await new Promise(r => setTimeout(r, 100));
+      }
+
+      // ── CHARACTER-BY-CHARACTER KEY DISPATCH ──
+      const text = request.text;
+      console.log('[CDP-KEYS] Typing', text.length, 'characters via dispatchKeyEvent');
+      for (let i = 0; i < text.length; i++) {
+        const char = text[i];
+        const isNewline = char === '\n';
+
+        if (isNewline) {
+          // Enter key — must use keyDown type specifically (Word requires this)
+          await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+            type: 'keyDown', key: 'Enter', code: 'Enter',
+            windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+          });
+          await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+            type: 'keyUp', key: 'Enter', code: 'Enter',
+            windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13,
+          });
+        } else {
+          // Regular character: keyDown → char → keyUp
+          const keyCode = char.charCodeAt(0);
+          const code = char.match(/[a-zA-Z]/) ? `Key${char.toUpperCase()}` : `Digit${char}`;
+
+          await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+            type: 'keyDown', key: char, code,
+            windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode,
+          });
+          await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+            type: 'char', key: char, code, text: char,
+            windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode,
+          });
+          await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+            type: 'keyUp', key: char, code,
+            windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode,
+          });
+        }
+
+        // 5-10ms jitter between characters (anti-bot safe, fast enough for long text)
+        if (i < text.length - 1) {
+          await new Promise(r => setTimeout(r, 5 + Math.floor(Math.random() * 5)));
+        }
+      }
+
+      console.log('[CDP-KEYS] Completed typing', text.length, 'characters');
+      await chrome.debugger.detach(target);
+      return { success: true };
+    } catch (err) {
+      try { await chrome.debugger.detach({ tabId }); } catch (_) {}
+      console.warn('[CDP-KEYS] dispatchKeyEvent failed:', err.message);
+      return { success: false, error: err.message };
+    }
+  }
 
   // ── GET ACTIVE TAB: Returns current active tab info ───
   if (request.type === 'get_active_tab') {
@@ -2547,15 +2834,15 @@ async function handleMessage(request, sender) {
         return { success: false, failedAt: results.length - 1, results };
       }
 
-      // If the step was a navigation, update tabId and wait for page load
+      // If the step was a navigation, update tabId and wait for DOM to stabilize
       if (step.action === 'navigate' && stepResult.tabId) {
         currentTabId = stepResult.tabId;
-        await new Promise(r => setTimeout(r, 2500));
+        await waitForDomStable(currentTabId, 4000); // navigation needs longer max
       }
 
-      // If the step was semantic_fill, allow time for fields to settle
+      // If the step was semantic_fill, wait for fields/validation to settle
       if (step.action === 'semantic_fill') {
-        await new Promise(r => setTimeout(r, 1000));
+        await waitForDomStable(currentTabId, 2000);
       }
     }
 

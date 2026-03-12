@@ -1267,3 +1267,27 @@ h2 {
   padding-top: 12px;
   border-top: 1px solid rgba(255, 255, 255, 0.04);
 }
+
+/* API Mode Toggle (Enhancivity / BYOK) */
+.api-mode-btn {
+  flex: 1;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  color: #6b6b76;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.api-mode-btn:hover { color: #9b9ba6; }
+.api-mode-btn.active {
+  background: rgba(99, 102, 241, 0.15);
+  color: #818cf8;
+}
+
+.api-mode-panel {
+  margin-top: 12px;
+}

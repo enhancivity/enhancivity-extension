@@ -2217,7 +2217,229 @@ function setupAuthHandlers() {
 
 // ── Settings / Header Buttons ────────────────────────────────
 
-settingsBtn?.addEventListener('click', () => showView('#settings-view'));
+const apiModeBtns        = document.querySelectorAll('.api-mode-btn');
+const enhancivityPanel   = $('#enhancivity-mode-info');
+const byokPanel          = $('#byok-mode-panel');
+const byokProviderSelect = $('#byok-provider-select');
+const apiKeyInput        = $('#api-key-input');
+const apiKeyStatus       = $('#api-key-status');
+const saveApiKeyBtn      = $('#save-api-key-btn');
+const clearApiKeyBtn     = $('#clear-api-key-btn');
+const intentBtns         = document.querySelectorAll('.intent-btn');
+const intentModelLabel   = $('#intent-model-label');
+
+// Model labels per intent + provider
+const MODEL_LABELS = {
+  openai:    { fast: 'gpt-4o-mini', balanced: 'gpt-4o', reasoning: 'o1' },
+  anthropic: { fast: 'claude-haiku', balanced: 'claude-sonnet', reasoning: 'claude-opus' },
+  default:   { fast: 'Fast model', balanced: 'Balanced model', reasoning: 'Max reasoning model' },
+};
+
+function maskKey(key) {
+  if (!key) return '';
+  const show = Math.min(key.length, 5);
+  return key.slice(0, show) + '••••••••';
+}
+
+function showKeyStatus(msg, type = 'info') {
+  if (!apiKeyStatus) return;
+  apiKeyStatus.textContent = msg;
+  apiKeyStatus.className = 'api-key-status';
+  apiKeyStatus.style.color = type === 'success' ? '#4ade80' : type === 'error' ? '#ef4444' : '#8888a0';
+  apiKeyStatus.classList.remove('hidden');
+}
+
+function hideKeyStatus() {
+  if (apiKeyStatus) apiKeyStatus.classList.add('hidden');
+}
+
+function updateIntentLabel(intent, provider) {
+  if (!intentModelLabel) return;
+  const labels = MODEL_LABELS[provider] || MODEL_LABELS.default;
+  intentModelLabel.textContent = labels[intent] || '';
+}
+
+function setApiMode(mode) {
+  apiModeBtns.forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+  if (enhancivityPanel) enhancivityPanel.classList.toggle('hidden', mode !== 'enhancivity');
+  if (byokPanel) byokPanel.classList.toggle('hidden', mode !== 'byok');
+  chrome.storage.local.set({ apiMode: mode });
+}
+
+// Load saved settings when settings view opens
+async function loadSettingsState() {
+  const data = await chrome.storage.local.get([
+    'userApiKey', 'userApiKeyProvider', 'userIntent', 'apiMode'
+  ]);
+
+  const savedProvider = data.userApiKeyProvider || '';
+  const savedKey      = data.userApiKey || '';
+  const savedIntent   = data.userIntent || 'balanced';
+
+  // API mode toggle (default to 'enhancivity' if no BYOK key, or 'byok' if key exists)
+  const savedMode = data.apiMode || (savedKey ? 'byok' : 'enhancivity');
+  setApiMode(savedMode);
+
+  // Provider dropdown
+  if (byokProviderSelect) {
+    byokProviderSelect.value = savedProvider || '';
+  }
+
+  // API key field
+  if (apiKeyInput) {
+    if (savedKey) {
+      apiKeyInput.value = maskKey(savedKey);
+      apiKeyInput.disabled = false;
+      apiKeyInput.placeholder = 'Enter new key to replace...';
+      apiKeyInput.dataset.hasKey = 'true';
+    } else if (savedProvider) {
+      apiKeyInput.value = '';
+      apiKeyInput.disabled = false;
+      apiKeyInput.placeholder = `Paste your ${savedProvider === 'openai' ? 'OpenAI' : 'Anthropic'} API key...`;
+      apiKeyInput.dataset.hasKey = 'false';
+    } else {
+      apiKeyInput.value = '';
+      apiKeyInput.disabled = true;
+      apiKeyInput.placeholder = 'Select a provider first...';
+      apiKeyInput.dataset.hasKey = 'false';
+    }
+  }
+
+  // Save/Clear button states
+  if (saveApiKeyBtn) saveApiKeyBtn.disabled = !savedProvider;
+  if (clearApiKeyBtn) clearApiKeyBtn.disabled = !savedKey;
+
+  // Status line
+  if (savedKey && savedProvider) {
+    showKeyStatus(`${savedProvider === 'openai' ? 'OpenAI' : 'Anthropic'} key connected: ${maskKey(savedKey)}`, 'success');
+  } else {
+    hideKeyStatus();
+  }
+
+  // Intent buttons
+  intentBtns.forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.intent === savedIntent);
+  });
+  updateIntentLabel(savedIntent, savedProvider || 'default');
+}
+
+// When user focuses the masked key field, clear it so they can type a new key
+apiKeyInput?.addEventListener('focus', () => {
+  if (apiKeyInput.dataset.hasKey === 'true') {
+    apiKeyInput.value = '';
+    apiKeyInput.type = 'password';
+  }
+});
+
+// When user blurs without typing, restore the masked display
+apiKeyInput?.addEventListener('blur', async () => {
+  if (apiKeyInput.value === '' && apiKeyInput.dataset.hasKey === 'true') {
+    const { userApiKey } = await chrome.storage.local.get(['userApiKey']);
+    if (userApiKey) apiKeyInput.value = maskKey(userApiKey);
+  }
+});
+
+// Provider change
+byokProviderSelect?.addEventListener('change', () => {
+  const provider = byokProviderSelect.value;
+  if (apiKeyInput) {
+    apiKeyInput.disabled = false;
+    apiKeyInput.placeholder = `Paste your ${provider === 'openai' ? 'OpenAI' : 'Anthropic'} API key...`;
+    // If there was a saved key from a different provider, clear it visually
+    apiKeyInput.value = '';
+    apiKeyInput.dataset.hasKey = 'false';
+  }
+  if (saveApiKeyBtn) saveApiKeyBtn.disabled = false;
+  hideKeyStatus();
+
+  // Update intent label for new provider
+  const activeIntent = document.querySelector('.intent-btn.active')?.dataset.intent || 'balanced';
+  updateIntentLabel(activeIntent, provider);
+});
+
+// Save key
+saveApiKeyBtn?.addEventListener('click', async () => {
+  const provider = byokProviderSelect?.value;
+  const key = apiKeyInput?.value?.trim();
+
+  if (!provider) {
+    showKeyStatus('Select a provider first.', 'error');
+    return;
+  }
+  if (!key || key.includes('••')) {
+    showKeyStatus('Enter a valid API key.', 'error');
+    return;
+  }
+
+  // Basic validation
+  if (provider === 'openai' && !key.startsWith('sk-')) {
+    showKeyStatus('OpenAI keys start with sk-', 'error');
+    return;
+  }
+
+  await chrome.storage.local.set({
+    userApiKey: key,
+    userApiKeyProvider: provider,
+  });
+
+  apiKeyInput.value = maskKey(key);
+  apiKeyInput.dataset.hasKey = 'true';
+  apiKeyInput.placeholder = 'Enter new key to replace...';
+  if (clearApiKeyBtn) clearApiKeyBtn.disabled = false;
+  if (byokBadge) byokBadge.classList.remove('hidden');
+
+  showKeyStatus(`${provider === 'openai' ? 'OpenAI' : 'Anthropic'} key saved: ${maskKey(key)}`, 'success');
+});
+
+// Clear key
+clearApiKeyBtn?.addEventListener('click', async () => {
+  await chrome.storage.local.remove(['userApiKey', 'userApiKeyProvider']);
+
+  if (apiKeyInput) {
+    apiKeyInput.value = '';
+    apiKeyInput.dataset.hasKey = 'false';
+    const provider = byokProviderSelect?.value;
+    if (provider) {
+      apiKeyInput.placeholder = `Paste your ${provider === 'openai' ? 'OpenAI' : 'Anthropic'} API key...`;
+    } else {
+      apiKeyInput.disabled = true;
+      apiKeyInput.placeholder = 'Select a provider first...';
+    }
+  }
+  if (clearApiKeyBtn) clearApiKeyBtn.disabled = true;
+  if (byokBadge) byokBadge.classList.add('hidden');
+
+  showKeyStatus('API key cleared.', 'info');
+  setTimeout(() => {
+    hideKeyStatus();
+    setApiMode('enhancivity');
+  }, 1500);
+});
+
+// API mode toggle (Enhancivity / BYOK)
+apiModeBtns.forEach(btn => {
+  btn.addEventListener('click', () => {
+    setApiMode(btn.dataset.mode);
+  });
+});
+
+// Intent buttons
+intentBtns.forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const intent = btn.dataset.intent;
+    intentBtns.forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    await chrome.storage.local.set({ userIntent: intent });
+    const provider = byokProviderSelect?.value || 'default';
+    updateIntentLabel(intent, provider);
+  });
+});
+
+// Open settings → load saved state
+settingsBtn?.addEventListener('click', () => {
+  showView('#settings-view');
+  loadSettingsState();
+});
 $('#settings-back-btn')?.addEventListener('click', () => showView('#main-view'));
 
 signOutBtn?.addEventListener('click', async () => {

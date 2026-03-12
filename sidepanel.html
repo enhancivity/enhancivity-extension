@@ -136,50 +136,59 @@
 
     <div class="settings-content">
       <div class="settings-section">
-        <h3 class="settings-section-title">API Keys (BYOK)</h3>
-        <p class="settings-section-desc">Use your own API key for 10x cheaper pricing. Keys are stored locally and never saved on our servers.</p>
+        <h3 class="settings-section-title">API Access</h3>
+        <p class="settings-section-desc">Choose how Enhancivity connects to AI models.</p>
 
-        <label class="settings-label">Provider</label>
-        <div class="settings-field">
-          <select id="byok-provider-select" class="input-field select-field">
-            <option value="" disabled selected>Select provider...</option>
-            <option value="openai">OpenAI</option>
-            <option value="anthropic">Anthropic</option>
-          </select>
+        <div id="api-mode-slider" class="intent-slider-group">
+          <div class="intent-options">
+            <button class="api-mode-btn active" data-mode="enhancivity">Enhancivity</button>
+            <button class="api-mode-btn" data-mode="byok">Bring Your Own Key</button>
+          </div>
         </div>
 
-        <label class="settings-label" id="api-key-label">API Key</label>
-        <div class="settings-field">
-          <input
-            type="password"
-            id="api-key-input"
-            class="input-field mono-field"
-            placeholder="Select a provider first..."
-            autocomplete="off"
-            disabled
-          >
+        <!-- Enhancivity-provided mode info -->
+        <div id="enhancivity-mode-info" class="api-mode-panel">
+          <div id="enhancivity-mode-status" class="api-key-status" style="color: #4ade80;">Using Enhancivity's API — billed via your credit balance.</div>
         </div>
 
-        <div id="api-key-status" class="api-key-status hidden"></div>
+        <!-- BYOK mode panel -->
+        <div id="byok-mode-panel" class="api-mode-panel hidden">
+          <p class="settings-hint" style="margin-bottom: 10px;">Use your own API key for 10x cheaper pricing. Keys are stored locally and never saved on our servers.</p>
 
-        <div class="settings-btn-row">
-          <button id="save-api-key-btn" class="btn btn-primary btn-sm" disabled>Save Key</button>
-          <button id="clear-api-key-btn" class="btn btn-ghost btn-sm">Clear Key</button>
+          <label class="settings-label">Provider</label>
+          <div class="settings-field">
+            <select id="byok-provider-select" class="input-field select-field">
+              <option value="" disabled selected>Select provider...</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+            </select>
+          </div>
+
+          <label class="settings-label" id="api-key-label">API Key</label>
+          <div class="settings-field">
+            <input
+              type="password"
+              id="api-key-input"
+              class="input-field mono-field"
+              placeholder="Select a provider first..."
+              autocomplete="off"
+              disabled
+            >
+          </div>
+
+          <div id="api-key-status" class="api-key-status hidden"></div>
+
+          <div class="settings-btn-row">
+            <button id="save-api-key-btn" class="btn btn-primary btn-sm" disabled>Save Key</button>
+            <button id="clear-api-key-btn" class="btn btn-ghost btn-sm">Clear Key</button>
+          </div>
         </div>
 
         <div id="byok-trial-info" class="byok-trial-info hidden"></div>
       </div>
 
       <div class="settings-section" id="model-section">
-        <div class="settings-section-header">
-          <h3 class="settings-section-title">Model</h3>
-          <button id="advanced-model-toggle" class="icon-btn" title="Advanced model options">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <circle cx="12" cy="12" r="3"/>
-              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
-            </svg>
-          </button>
-        </div>
+        <h3 class="settings-section-title">Model</h3>
 
         <div id="intent-slider-group" class="intent-slider-group">
           <div class="intent-options">
@@ -188,27 +197,6 @@
             <button class="intent-btn" data-intent="reasoning">Max Reasoning</button>
           </div>
           <div id="intent-model-label" class="intent-model-label"></div>
-        </div>
-
-        <div id="advanced-model-panel" class="advanced-model-panel hidden">
-          <label class="settings-label">Model from Registry</label>
-          <div class="settings-field">
-            <select id="model-select" class="input-field select-field">
-              <option value="" selected>Use intent-based (auto)</option>
-            </select>
-          </div>
-
-          <label class="settings-label">Custom Model ID</label>
-          <p class="settings-hint">For fine-tuned models (e.g. ft:gpt-4o:my-org:custom). Overrides dropdown above.</p>
-          <div class="settings-field">
-            <input
-              type="text"
-              id="custom-model-input"
-              class="input-field mono-field"
-              placeholder="ft:gpt-4o:my-org:custom..."
-              autocomplete="off"
-            >
-          </div>
         </div>
       </div>
     </div>

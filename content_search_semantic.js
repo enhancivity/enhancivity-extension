@@ -188,6 +188,14 @@
       if (el.placeholder) attrs.placeholder = el.placeholder;
       if (el.type)        attrs.type = el.type;
       if (el.value && el.value.length < 100) attrs.value = el.value;
+      // Character limit: maxlength attribute
+      const maxLen = el.getAttribute('maxlength') || el.getAttribute('maxLength');
+      if (maxLen && parseInt(maxLen, 10) > 0) attrs.maxlength = parseInt(maxLen, 10);
+    }
+    // Character limit for contentEditable / role=textbox
+    if (el.isContentEditable || el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox') {
+      const maxLen = el.getAttribute('maxlength') || el.getAttribute('maxLength');
+      if (maxLen && parseInt(maxLen, 10) > 0) attrs.maxlength = parseInt(maxLen, 10);
     }
 
     if (tag === 'A') {

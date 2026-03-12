@@ -414,22 +414,58 @@
     return false;
   }
 
-  const DANGEROUS_BUTTON_TEXT = [
-    'send', 'submit', 'pay', 'purchase', 'buy now',
-    'place order', 'confirm order', 'complete purchase',
-    'checkout', 'place your order', 'delete', 'remove',
+  // ── Dangerous button detection ──────────────────────────────
+  // Two tiers:
+  //   EXACT  — button text must be EXACTLY this (e.g., "post", "send", "submit")
+  //            This prevents blocking "Create Post", "Post Launch", etc.
+  //   PHRASE — button text must CONTAIN this phrase (multi-word = specific enough)
+  const DANGEROUS_EXACT = new Set([
+    'send', 'submit', 'post', 'publish', 'pay', 'delete', 'remove',
+  ]);
+  const DANGEROUS_PHRASE = [
+    'purchase', 'buy now', 'place order', 'confirm order',
+    'complete purchase', 'checkout', 'place your order',
   ];
-
 
   function isDangerousClick(el) {
     const text = (el.innerText || el.value || el.textContent || '').toLowerCase().trim();
-    return DANGEROUS_BUTTON_TEXT.some(d => text.includes(d));
+    // Exact match — the ENTIRE button text must be one of these single words
+    if (DANGEROUS_EXACT.has(text)) return true;
+    // Phrase match — button text contains a multi-word dangerous phrase
+    if (DANGEROUS_PHRASE.some(d => text.includes(d))) return true;
+    return false;
   }
 
   // ── Helper: Find element by semantic ID ─────────────────────
 
   function findBySid(sid) {
-    return document.querySelector(`[data-enh-sid="${sid}"]`);
+    // First try the fast path (element in light DOM)
+    const el = document.querySelector(`[data-enh-sid="${sid}"]`);
+    if (el) return el;
+
+    // If not found, search inside shadow roots (Reddit Shreddit, Salesforce, etc.)
+    function searchShadow(root) {
+      if (!root) return null;
+      const children = root.querySelectorAll('*');
+      for (const child of children) {
+        if (child.getAttribute('data-enh-sid') === sid) return child;
+        if (child.shadowRoot) {
+          const found = searchShadow(child.shadowRoot);
+          if (found) return found;
+        }
+      }
+      return null;
+    }
+
+    // Walk all shadow roots in the document
+    const allElements = document.querySelectorAll('*');
+    for (const elem of allElements) {
+      if (elem.shadowRoot) {
+        const found = searchShadow(elem.shadowRoot);
+        if (found) return found;
+      }
+    }
+    return null;
   }
 
   // ── Recovery Helper: Quick snapshot of available elements ───
@@ -480,7 +516,7 @@
 
   const EXPLORE_ACTIONS = {
 
-    click_by_sid({ target }) {
+    click_by_sid({ target, consentApproved }) {
       if (!target) return { success: false, error: 'No semantic ID provided for click' };
 
       const el = findBySid(target);
@@ -512,13 +548,24 @@
       if (isSensitiveElement(el)) {
         return { success: false, error: 'BLOCKED: Sensitive field — cannot interact', blocked: true };
       }
-      if (isDangerousClick(el)) {
-        return { success: false, error: 'BLOCKED: Dangerous button — cannot click', blocked: true };
+      // Dangerous button check — bypassed when user already approved via consent card
+      if (!consentApproved && isDangerousClick(el)) {
+        return { success: false, error: 'BLOCKED: This button performs a consequential action (submit/post/send/delete). Set needsConsent=true to request user approval first.', blocked: true };
       }
 
       // Refuse file upload inputs
       if (el.tagName === 'INPUT' && el.type === 'file') {
         return { success: false, error: 'BLOCKED: File upload — cannot interact', blocked: true };
+      }
+
+      // Check if button is disabled — don't click and report why
+      if (el.disabled || el.getAttribute('aria-disabled') === 'true' ||
+          el.classList.contains('disabled') || el.hasAttribute('disabled')) {
+        const elText = (el.innerText || el.value || el.textContent || '').trim().slice(0, 60);
+        return {
+          success: false,
+          error: `BUTTON DISABLED: "${elText}" button is currently disabled. This usually means a required field is empty (e.g., title field). Fill all required fields first, then retry clicking this button.`,
+        };
       }
 
       // Scroll into view first
@@ -554,7 +601,7 @@
       return { success: true, observation: text || '(empty element)' };
     },
 
-    type_text({ target, value }) {
+    async type_text({ target, value }) {
       if (!target) return { success: false, error: 'No semantic ID provided for type_text' };
       if (!value) return { success: false, error: 'No text value provided to type' };
 
@@ -570,12 +617,91 @@
         return { success: false, error: 'SECURITY_BLOCK: This is a login page. The agent cannot type here. Please log in manually.', blocked: true };
       }
 
-      const el = findBySid(target);
+      // ── SMART TARGET RESOLUTION ──
+      // If the SID points to a wrapper/container but there's a more specific
+      // editable element inside, drill down to it. This handles cases where:
+      // - A contentEditable parent wraps a <textarea> or <input> (Reddit Title)
+      // - A div wrapper contains the actual ProseMirror/Slate editable child
+      // - A form-group div was tagged but the real input is nested inside
+      let el = findBySid(target);
       if (!el) {
         return {
           success: false,
           error: `Element not found: ${target}. Cannot type — element may have been removed or the page changed.${getRecoverySnapshot()}`,
         };
+      }
+
+      // ── SMART TARGET RESOLUTION: Find the real editable surface ──
+      // When the SID points to a wrapper (web component, form group, div), drill
+      // down to find the actual interactive element.
+      //
+      // CRITICAL ORDER: Check contentEditable FIRST, then inputs.
+      // Rich text editors (ProseMirror, Slate, Draft.js) use contentEditable as
+      // their primary editing surface. They may ALSO contain hidden <input> elements
+      // for form submission. If we grab the hidden input, we bypass the editor's
+      // state management entirely — text appears in the DOM but the editor thinks
+      // the field is empty (Post button stays grayed out, form validation fails).
+      // By checking contentEditable first, we always target the visible editor surface.
+      const tag = el.tagName;
+
+      function findNestedEditable(root) {
+        // Search light DOM
+        let found = root.querySelector('[contenteditable="true"]');
+        if (found && found !== root) return found;
+        // Search role=textbox (custom editors may use this instead of contenteditable attr)
+        found = root.querySelector('[role="textbox"]');
+        if (found && found !== root && found.isContentEditable) return found;
+        // Search shadow root (Reddit shreddit-*, other web components)
+        if (root.shadowRoot) {
+          found = root.shadowRoot.querySelector('[contenteditable="true"]');
+          if (found) return found;
+          found = root.shadowRoot.querySelector('[role="textbox"]');
+          if (found && found.isContentEditable) return found;
+          // Recursive: search nested shadow DOMs
+          for (const child of root.shadowRoot.querySelectorAll('*')) {
+            if (child.shadowRoot) {
+              found = findNestedEditable(child);
+              if (found) return found;
+            }
+          }
+        }
+        return null;
+      }
+
+      function findNestedInput(root) {
+        // Search light DOM first
+        let found = root.querySelector('textarea, input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="file"])');
+        if (found) return found;
+        // Search shadow root
+        if (root.shadowRoot) {
+          found = root.shadowRoot.querySelector('textarea, input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="file"])');
+          if (found) return found;
+          // Recursive: search nested shadow DOMs
+          for (const child of root.shadowRoot.querySelectorAll('*')) {
+            if (child.shadowRoot) {
+              found = findNestedInput(child);
+              if (found) return found;
+            }
+          }
+        }
+        return null;
+      }
+
+      if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') {
+        // PRIORITY 1: ContentEditable (ProseMirror, Slate, Draft.js, Lexical editors)
+        // This is the visible editing surface that manages its own state.
+        const nestedEditable = findNestedEditable(el);
+        if (nestedEditable) {
+          console.log('[type_text] Found nested contentEditable (incl shadow DOM). Switching from', tag, 'to', nestedEditable.tagName, 'class:', (typeof nestedEditable.className === 'string' ? nestedEditable.className.slice(0, 60) : ''));
+          el = nestedEditable;
+        } else {
+          // PRIORITY 2: Standard inputs/textareas (only if no contentEditable found)
+          const nestedInput = findNestedInput(el);
+          if (nestedInput) {
+            console.log('[type_text] Found nested input (incl shadow DOM). Switching from', tag, 'to', nestedInput.tagName, 'type:', nestedInput.type);
+            el = nestedInput;
+          }
+        }
       }
 
       // ── HARD BLOCK LAYER 2: Never type in sensitive fields on ANY page ──
@@ -600,119 +726,581 @@
         return { success: false, error: 'BLOCKED: Cannot interact with sensitive credential fields. User must enter credentials manually.', blocked: true };
       }
 
+      // ── DIAGNOSTIC: Log element details for debugging ──
+      console.log('[type_text] TARGET ELEMENT:', {
+        tag: el.tagName,
+        id: el.id,
+        className: (typeof el.className === 'string') ? el.className.slice(0, 100) : '',
+        role: el.getAttribute('role'),
+        contenteditable: el.getAttribute('contenteditable'),
+        isContentEditable: el.isContentEditable,
+        placeholder: el.getAttribute('placeholder'),
+        type: el.getAttribute('type'),
+        name: el.getAttribute('name'),
+        ariaLabel: el.getAttribute('aria-label'),
+        sid: target,
+        value: (el.value || '').slice(0, 30),
+        innerText: (el.innerText || '').slice(0, 30),
+      });
+
+      // ── PRE-FLIGHT CHARACTER LIMIT ENFORCEMENT (Universal) ──
+      // Detect the field's character limit from: maxlength attr, nearby counter, or aria.
+      // If the text exceeds the limit, smart-truncate at a word boundary so the content
+      // is COMPLETE (not chopped mid-word). This is the safety net — the AI should
+      // already write within limits, but if it doesn't, we ensure graceful truncation.
+      let charLimit = 0;
+      const rawMaxLen = el.getAttribute('maxlength') || el.getAttribute('maxLength');
+      if (rawMaxLen && parseInt(rawMaxLen, 10) > 0) {
+        charLimit = parseInt(rawMaxLen, 10);
+      }
+      // Also check nearby counter text (Reddit "0/300", Twitter char counter, etc.)
+      if (!charLimit && typeof findNearbyCharLimit === 'function') {
+        try { charLimit = findNearbyCharLimit(el); } catch (_) {}
+      }
+
+      if (charLimit > 0 && value.length > charLimit) {
+        console.log(`[type_text] CHARACTER LIMIT: Field has limit of ${charLimit} chars, text is ${value.length} chars. Smart-truncating.`);
+        // Smart truncation: cut at the last word boundary that fits within the limit,
+        // then try to end at a sentence boundary (. ! ?) for completeness.
+        let truncated = value.slice(0, charLimit);
+        // Find the last sentence-ending punctuation within the truncated text
+        const lastSentenceEnd = Math.max(
+          truncated.lastIndexOf('. '),
+          truncated.lastIndexOf('! '),
+          truncated.lastIndexOf('? '),
+          truncated.lastIndexOf('.\n'),
+          truncated.lastIndexOf('!\n'),
+          truncated.lastIndexOf('?\n'),
+        );
+        if (lastSentenceEnd > charLimit * 0.5) {
+          // Found a sentence boundary in the second half — use it for a clean cutoff
+          truncated = truncated.slice(0, lastSentenceEnd + 1).trim();
+        } else {
+          // No good sentence boundary — cut at the last space (word boundary)
+          const lastSpace = truncated.lastIndexOf(' ');
+          if (lastSpace > charLimit * 0.7) {
+            truncated = truncated.slice(0, lastSpace).trim();
+          }
+          // If we cut mid-word and it doesn't end with punctuation, add ellipsis
+          // only if there's room (3 chars for "...")
+          if (truncated.length < charLimit - 3 && !/[.!?]$/.test(truncated)) {
+            truncated += '...';
+          }
+        }
+        console.log(`[type_text] Truncated to ${truncated.length} chars (limit: ${charLimit}). Ends: "${truncated.slice(-30)}"`);
+        value = truncated;
+      }
+
       // Focus the element
       el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       el.focus();
       el.dispatchEvent(new Event('focus', { bubbles: true }));
 
-      // Handle contentEditable elements (used by Facebook, Gmail compose, Reddit, etc.)
-      if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
-        // Ensure focus is on the exact element (Reddit/ProseMirror need click + focus)
+      // ── KEYBOARD EVENT SIMULATION HELPER (Tier 2b — Anti-Bot-Safe Sequential Loop) ──
+      // Simulates real keystrokes character by character with jitter delays.
+      // Fires: keydown → keypress → beforeinput → input → keyup per character.
+      // The 8-15ms random jitter between characters bypasses anti-bot timing filters
+      // that detect instant bulk insertion (Reddit, Facebook, Medium).
+      async function simulateKeyboardTyping(targetEl, text) {
+        console.log('[type_text] Attempting keyboard event simulation for', text.length, 'chars');
+        targetEl.focus();
+        targetEl.click();
+        // Ensure cursor is active inside contentEditable
+        if (targetEl.isContentEditable) {
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          const r = document.createRange();
+          r.selectNodeContents(targetEl);
+          r.collapse(false); // end
+          sel.addRange(r);
+        }
+
+        for (let i = 0; i < text.length; i++) {
+          const char = text[i];
+          const isNewline = char === '\n';
+          const key = isNewline ? 'Enter' : char;
+          const code = isNewline ? 'Enter' : (char.match(/[a-zA-Z]/) ? `Key${char.toUpperCase()}` : `Digit${char}`);
+          const keyCode = isNewline ? 13 : char.charCodeAt(0);
+
+          // keydown
+          targetEl.dispatchEvent(new KeyboardEvent('keydown', {
+            key, code, keyCode, charCode: keyCode,
+            which: keyCode, bubbles: true, cancelable: true, composed: true,
+          }));
+
+          // keypress (deprecated but ProseMirror and some editors still listen)
+          targetEl.dispatchEvent(new KeyboardEvent('keypress', {
+            key, code, keyCode, charCode: keyCode,
+            which: keyCode, bubbles: true, cancelable: true, composed: true,
+          }));
+
+          // beforeinput
+          targetEl.dispatchEvent(new InputEvent('beforeinput', {
+            data: isNewline ? null : char,
+            inputType: isNewline ? 'insertParagraph' : 'insertText',
+            bubbles: true, cancelable: true, composed: true,
+          }));
+
+          // input
+          targetEl.dispatchEvent(new InputEvent('input', {
+            data: isNewline ? null : char,
+            inputType: isNewline ? 'insertParagraph' : 'insertText',
+            bubbles: true, cancelable: false, composed: true,
+          }));
+
+          // keyup
+          targetEl.dispatchEvent(new KeyboardEvent('keyup', {
+            key, code, keyCode, charCode: keyCode,
+            which: keyCode, bubbles: true, cancelable: true, composed: true,
+          }));
+
+          // 8-15ms random jitter to bypass anti-bot timing detection
+          await new Promise(r => setTimeout(r, 8 + Math.floor(Math.random() * 7)));
+        }
+        console.log('[type_text] Keyboard simulation complete for', text.length, 'chars');
+      }
+
+      // ── PROSEMIRROR STATE SYNC ──
+      // After typing into a contentEditable element, ProseMirror (and similar editors)
+      // may not have updated their internal state even though text is visible in the DOM.
+      // This causes the Post/Submit button to stay grayed out.
+      // Fix: blur → refocus → type Space → Backspace to force a state reconciliation.
+      // This triggers ProseMirror's input handlers to re-read the DOM and sync state.
+      async function syncEditorState(targetEl) {
+        if (!targetEl.isContentEditable) return;
+        try {
+          // blur + refocus forces the editor to re-evaluate its content
+          targetEl.dispatchEvent(new Event('blur', { bubbles: true }));
+          await new Promise(r => setTimeout(r, 50));
+          targetEl.focus();
+          targetEl.dispatchEvent(new Event('focus', { bubbles: true }));
+          await new Promise(r => setTimeout(r, 50));
+
+          // Place cursor at the end of the text
+          const sel = window.getSelection();
+          if (sel) {
+            sel.removeAllRanges();
+            const r = document.createRange();
+            r.selectNodeContents(targetEl);
+            r.collapse(false); // collapse to end
+            sel.addRange(r);
+          }
+
+          // Type Space then Backspace — triggers beforeinput + input events that
+          // ProseMirror listens for, forcing it to reconcile its internal state
+          // with the actual DOM content. The net result is zero change to the text.
+          document.execCommand('insertText', false, ' ');
+          await new Promise(r => setTimeout(r, 30));
+          document.execCommand('delete', false, null);
+          await new Promise(r => setTimeout(r, 50));
+
+          // Also fire a synthetic input event as a final nudge
+          targetEl.dispatchEvent(new InputEvent('input', {
+            bubbles: true, inputType: 'insertText', data: '',
+          }));
+          console.log('[type_text] ProseMirror state sync complete');
+        } catch (e) {
+          console.log('[type_text] State sync failed (non-fatal):', e.message);
+        }
+      }
+
+      // ── UNIVERSAL VERIFICATION HELPER ──
+      // After any typing action, wait 500ms, re-scan DOM for the typed string.
+      // For contentEditable elements, also runs ProseMirror state sync to ensure
+      // the editor's internal state matches the visible DOM content.
+      // Returns { found: boolean, truncated: boolean, actualLength: number }
+      async function verifyTypingSuccess(targetEl, expectedText) {
+        // Run state sync BEFORE verification for contentEditable elements
+        // This ensures ProseMirror/Slate/Draft.js have reconciled their state
+        if (targetEl.isContentEditable) {
+          await syncEditorState(targetEl);
+        }
+
+        await new Promise(r => setTimeout(r, 500));
+        let actualText = '';
+
+        // Check .value for inputs
+        if (targetEl.value && targetEl.value.length > 0) {
+          actualText = targetEl.value;
+        }
+        // Check innerText/textContent for contentEditable and other elements
+        if (!actualText) {
+          actualText = (targetEl.innerText || targetEl.textContent || '').trim();
+        }
+        // Also check parent container (for canvas editors where typed content
+        // may appear in a sibling or parent node)
+        if (!actualText) {
+          const parent = targetEl.closest('[role="textbox"], [contenteditable="true"], .editor, .ProseMirror, .ql-editor') || targetEl.parentElement;
+          if (parent && parent !== targetEl) {
+            actualText = (parent.innerText || parent.textContent || '').trim();
+          }
+        }
+
+        const found = actualText.length > 0 && actualText.includes(expectedText.slice(0, 40));
+        // Detect silent truncation: browser enforced maxlength and chopped our text
+        const truncated = found && actualText.length < expectedText.length * 0.9;
+        if (truncated) {
+          console.log(`[type_text] WARNING: Text was silently truncated by browser. Expected ${expectedText.length} chars, got ${actualText.length} chars.`);
+        }
+        return { found, truncated, actualLength: actualText.length };
+      }
+
+      // ── STRATEGY: Determine whether to use native value path or contentEditable path ──
+      // IMPORTANT: If this input/textarea lives INSIDE a rich text editor container
+      // (ProseMirror, Slate, Draft.js, Lexical, Quill, CKEditor, TipTap), we MUST
+      // skip the native value path. Setting .value on a hidden input inside ProseMirror
+      // bypasses the editor's state — text appears in DOM but the editor thinks the
+      // field is empty (Post button stays grayed out, form validation fails).
+      // Instead, we find the contentEditable parent and use the contentEditable path.
+      const elTag = el.tagName;
+      const hasValueProperty = (elTag === 'INPUT' || elTag === 'TEXTAREA' ||
+        'value' in el && typeof el.value === 'string');
+
+      // Detect if element is inside a rich text editor that manages its own state
+      const richEditorParent = el.closest('.ProseMirror, .DraftEditor-root, [data-slate-editor], .ql-editor, .ck-editor__editable, .tox-edit-area, .lexical-editor, [contenteditable="true"]');
+      const isInsideRichEditor = richEditorParent && richEditorParent !== el;
+
+      if (isInsideRichEditor) {
+        console.log('[type_text] REROUTE: Element is inside a rich text editor. Switching to contentEditable path.', 'Editor class:', (typeof richEditorParent.className === 'string' ? richEditorParent.className.slice(0, 80) : ''));
+        // Switch el to the rich editor surface and fall through to contentEditable path
+        el = richEditorParent;
+      }
+
+      if (hasValueProperty && (elTag === 'INPUT' || elTag === 'TEXTAREA') && !isInsideRichEditor) {
+        // ── NATIVE VALUE PATH (inputs, textareas) ──
+        // Only used for STANDALONE inputs/textareas NOT inside a rich text editor.
+        console.log('[type_text] Using native value path for', elTag, 'SID:', target);
+
         el.click();
         el.focus();
         el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
         el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        el.dispatchEvent(new Event('focus', { bubbles: true }));
 
-        // Select all existing content using Selection API (more reliable than execCommand selectAll)
-        const sel = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        sel.removeAllRanges();
-        sel.addRange(range);
+        const nativeSetter =
+          Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set ||
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
 
-        // Try execCommand first (works on most contentEditable)
-        let typed = false;
-        try {
-          document.execCommand('delete', false, null);
-          typed = document.execCommand('insertText', false, value);
-        } catch {}
+        // Clear existing value — use native setter directly, NO el.select() (causes blue highlight)
+        if (nativeSetter) nativeSetter.call(el, '');
+        else el.value = '';
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
 
-        // Verify after execCommand
-        const afterExec = (el.innerText || el.textContent || '').trim();
-
-        // Fallback: direct text node insertion (for ProseMirror/Draft.js/React editors)
-        if (!typed || !afterExec) {
-          el.innerHTML = '';
-          // Insert as a text node (preserves editor state better than innerHTML)
-          const textNode = document.createTextNode(value);
-          el.appendChild(textNode);
-          // Move cursor to end
-          const newRange = document.createRange();
-          newRange.selectNodeContents(el);
-          newRange.collapse(false);
-          sel.removeAllRanges();
-          sel.addRange(newRange);
-        }
-
+        // Set the new value
+        if (nativeSetter) nativeSetter.call(el, value);
+        else el.value = value;
         el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
 
-        // Verify text was actually inserted
-        const actualText = (el.innerText || el.textContent || '').trim();
-        const hasContent = actualText.length > 0;
+        // Verify
+        const actualValue = el.value;
+        const valueSet = actualValue === value;
+
+        // If native setter didn't work, try execCommand then CDP
+        if (!valueSet) {
+          console.log('[type_text] Native setter failed. Trying execCommand...');
+          el.focus();
+          document.execCommand('selectAll', false, null);
+          document.execCommand('insertText', false, value);
+        }
+
+        let finalValue = el.value || (el.innerText || '').trim();
+        let finalSet = finalValue.length > 0;
+
+        // If still empty, try keyboard simulation fallback
+        if (!finalSet) {
+          console.log('[type_text] Native + execCommand failed. Trying keyboard simulation...');
+          el.focus();
+          el.click();
+          await simulateKeyboardTyping(el, value);
+          await new Promise(r => setTimeout(r, 300));
+          finalValue = el.value || (el.innerText || '').trim();
+          finalSet = finalValue.length > 0;
+        }
+
+        // If still empty, try CDP as final fallback
+        if (!finalSet) {
+          console.log('[type_text] Native + execCommand + keyboard failed. Trying CDP...');
+          try {
+            const cdpResult = await new Promise((resolve) => {
+              chrome.runtime.sendMessage(
+                { type: 'cdp_insert_text', text: value },
+                (response) => resolve(response || { success: false })
+              );
+            });
+            if (cdpResult?.success) await new Promise(r => setTimeout(r, 200));
+            finalValue = el.value || (el.innerText || '').trim();
+            finalSet = finalValue.length > 0;
+          } catch (e) {
+            console.log('[type_text] CDP fallback failed:', e.message);
+          }
+        }
+
+        // Universal verification: 500ms wait + re-scan + truncation detection
+        let truncationWarning = '';
+        if (!finalSet) {
+          const verifyResult = await verifyTypingSuccess(el, value);
+          finalSet = verifyResult.found;
+          if (verifyResult.truncated) {
+            truncationWarning = ` WARNING: Browser truncated text to ${verifyResult.actualLength} chars (field has character limit). Content may be incomplete.`;
+          }
+        }
 
         const origOutline = el.style.outline;
-        el.style.outline = '2px solid #6366f1';
+        el.style.outline = finalSet ? '2px solid #6366f1' : '2px solid #ef4444';
         setTimeout(() => { el.style.outline = origOutline; }, 1500);
 
         return {
-          success: hasContent,
-          observation: hasContent
-            ? `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()}`
-            : `WARNING: Attempted to type into contentEditable ${el.tagName.toLowerCase()} but verification shows the field is empty. The editor may have rejected the input. Try click_element on the field first, then type_text again.`,
+          success: finalSet,
+          observation: finalSet
+            ? `Typed "${value.slice(0, 80)}" into ${elTag.toLowerCase()}${el.placeholder ? ` (placeholder: "${el.placeholder}")` : ''}${truncationWarning}`
+            : `FAILED to type into ${elTag.toLowerCase()}. The field rejected all input methods (native setter, execCommand, keyboard simulation, CDP). Try click_element first to activate it, then retry type_text.`,
         };
       }
 
-      // Use native setter to bypass React/Vue/Angular controlled input tracking.
-      // Frameworks like React override the .value setter — setting el.value directly
-      // doesn't trigger their internal state update. The native setter + synthetic
-      // InputEvent trick forces the framework to recognize the change.
+      // ── CONTENTEDITABLE PATH (divs, spans, custom elements) ──
+      // Handle contentEditable elements (used by Facebook, Gmail compose, Reddit body, etc.)
+      // 5-Tier cascade with universal verification after each tier:
+      //   Tier 1: execCommand('insertText') — works on plain contentEditable, Lexical, some Slate
+      //   Tier 2: ClipboardEvent paste — works on ProseMirror (Reddit, Notion, TipTap)
+      //   Tier 2b: Sequential keyboard loop with jitter — bypasses anti-bot filters
+      //   Tier 3: CDP Input.insertText — trusted browser-level events for canvas editors
+      //   Tier 3b: CDP dispatchKeyEvent — Word Online, Google Docs (canvas + hidden input)
+      if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
+        console.log('[type_text] ContentEditable detected. Tag:', el.tagName, 'SID:', target);
 
-      // Click + focus first (ensures React state tracks the interaction)
-      el.click();
-      el.focus();
-      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-      el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-      el.dispatchEvent(new Event('focus', { bubbles: true }));
+        // ── FORCE FOCUS: Click + mousedown/up + focus to guarantee cursor activation ──
+        // Some editors (ProseMirror, Slate) ignore .focus() alone — they need a real click
+        // sequence to place the cursor inside the editable region.
+        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+        el.click();
+        el.focus();
+        el.dispatchEvent(new Event('focus', { bubbles: true }));
 
-      const nativeSetter =
-        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set ||
-        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+        // ── CLEAR EXISTING CONTENT ──
+        // Use element-scoped Range, NOT selectAll (which selects entire page)
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        const existingText = (el.innerText || el.textContent || '').trim();
+        if (existingText) {
+          const clearRange = document.createRange();
+          clearRange.selectNodeContents(el);
+          sel.addRange(clearRange);
+          document.execCommand('delete', false, null);
+          sel.removeAllRanges();
+        }
 
-      // Clear existing value: use select-all + delete keyboard events first (most robust),
-      // then fallback to native setter
-      el.select?.(); // Select all text in input
-      el.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', ctrlKey: true, bubbles: true }));
-      if (nativeSetter) {
-        nativeSetter.call(el, '');
-      } else {
-        el.value = '';
+        // ── PLACE CURSOR at start (collapsed — ready for insertion) ──
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(true);
+        sel.addRange(range);
+
+        // ═══════════════════════════════════════════════════════════
+        // TIER 1: execCommand('insertText')
+        // Works on: plain contentEditable, Lexical, some Slate, Draft.js
+        // ═══════════════════════════════════════════════════════════
+        console.log('[type_text] TIER 1: execCommand insertText');
+        let typed = false;
+        try {
+          typed = document.execCommand('insertText', false, value);
+          console.log('[type_text] Tier 1 execCommand returned:', typed);
+        } catch (e) {
+          console.log('[type_text] Tier 1 execCommand threw:', e.message);
+        }
+
+        // ── VERIFY TIER 1 ──
+        // verifyTypingSuccess returns { found, truncated, actualLength }
+        let vResult = await verifyTypingSuccess(el, value);
+        if (vResult.found) {
+          console.log('[type_text] TIER 1 SUCCESS — text verified in DOM');
+          const truncWarn = vResult.truncated ? ` WARNING: Browser truncated text to ${vResult.actualLength} chars (field has character limit).` : '';
+          const origOutline = el.style.outline;
+          el.style.outline = '2px solid #6366f1';
+          setTimeout(() => { el.style.outline = origOutline; }, 2000);
+          return {
+            success: true,
+            observation: `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (execCommand)${truncWarn}`,
+          };
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // TIER 2: ClipboardEvent paste
+        // Works on: ProseMirror (Reddit body, Notion, TipTap), Quill
+        // ProseMirror intercepts paste events and reads clipboardData
+        // ═══════════════════════════════════════════════════════════
+        console.log('[type_text] TIER 2: ClipboardEvent paste (Tier 1 failed verification)');
+        try {
+          // Re-focus and place cursor — essential for ProseMirror
+          el.focus();
+          el.click();
+          sel.removeAllRanges();
+          const r2 = document.createRange();
+          r2.selectNodeContents(el);
+          r2.collapse(false);
+          sel.addRange(r2);
+
+          const dt = new DataTransfer();
+          dt.setData('text/plain', value);
+          dt.setData('text/html', value.replace(/\n/g, '<br>'));
+          const pasteEvent = new ClipboardEvent('paste', {
+            bubbles: true,
+            cancelable: true,
+            clipboardData: dt,
+          });
+          el.dispatchEvent(pasteEvent);
+          console.log('[type_text] Tier 2 ClipboardEvent paste dispatched');
+        } catch (e) {
+          console.log('[type_text] Tier 2 ClipboardEvent failed:', e.message);
+        }
+
+        // ── VERIFY TIER 2 ──
+        vResult = await verifyTypingSuccess(el, value);
+        if (vResult.found) {
+          console.log('[type_text] TIER 2 SUCCESS — text verified after ClipboardEvent paste');
+          const truncWarn = vResult.truncated ? ` WARNING: Browser truncated text to ${vResult.actualLength} chars (field has character limit).` : '';
+          const origOutline = el.style.outline;
+          el.style.outline = '2px solid #6366f1';
+          setTimeout(() => { el.style.outline = origOutline; }, 2000);
+          return {
+            success: true,
+            observation: `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (ClipboardEvent paste)${truncWarn}`,
+          };
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // TIER 2b: Sequential keyboard loop with jitter
+        // Works on: Reddit title (ProseMirror input), Facebook, Medium,
+        // any editor that listens for real keydown/keypress/keyup sequences.
+        // Fires full event chain per character with 8-15ms random delay.
+        // ═══════════════════════════════════════════════════════════
+        console.log('[type_text] TIER 2b: Sequential keyboard simulation (Tiers 1-2 failed)');
+        try {
+          // Re-focus, re-click, ensure cursor is inside the contentEditable
+          el.focus();
+          el.click();
+          el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+          el.dispatchEvent(new Event('focus', { bubbles: true }));
+          await simulateKeyboardTyping(el, value);
+        } catch (e) {
+          console.log('[type_text] Tier 2b keyboard simulation failed:', e.message);
+        }
+
+        // ── VERIFY TIER 2b ──
+        vResult = await verifyTypingSuccess(el, value);
+        if (vResult.found) {
+          console.log('[type_text] TIER 2b SUCCESS — text verified after keyboard simulation');
+          const truncWarn = vResult.truncated ? ` WARNING: Browser truncated text to ${vResult.actualLength} chars (field has character limit).` : '';
+          const origOutline = el.style.outline;
+          el.style.outline = '2px solid #6366f1';
+          setTimeout(() => { el.style.outline = origOutline; }, 2000);
+          return {
+            success: true,
+            observation: `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (keyboard simulation)${truncWarn}`,
+          };
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // TIER 3: CDP Input.insertText via background.js
+        // Works on: Most canvas-based editors, heavily sandboxed iframes
+        // Generates TRUSTED input events at browser level (like Puppeteer)
+        // IMPORTANT: Focus + click the element first so CDP targets it
+        // ═══════════════════════════════════════════════════════════
+        console.log('[type_text] TIER 3: CDP Input.insertText (all DOM methods failed)');
+        try {
+          // Force-focus the element before CDP — click its center to activate it
+          el.focus();
+          el.click();
+          el.dispatchEvent(new Event('focus', { bubbles: true }));
+          // Send element coordinates so CDP can click the exact element
+          const rect = el.getBoundingClientRect();
+          const cdpResult = await new Promise((resolve) => {
+            chrome.runtime.sendMessage(
+              { type: 'cdp_insert_text', text: value, elementRect: { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) } },
+              (response) => resolve(response || { success: false, error: 'No response' })
+            );
+          });
+          console.log('[type_text] Tier 3 CDP result:', cdpResult);
+        } catch (e) {
+          console.log('[type_text] Tier 3 CDP failed:', e.message);
+        }
+
+        // ── VERIFY TIER 3 ──
+        vResult = await verifyTypingSuccess(el, value);
+        if (vResult.found) {
+          console.log('[type_text] TIER 3 SUCCESS — text verified after CDP Input.insertText');
+          const truncWarn = vResult.truncated ? ` WARNING: Browser truncated text to ${vResult.actualLength} chars (field has character limit).` : '';
+          const origOutline = el.style.outline;
+          el.style.outline = '2px solid #6366f1';
+          setTimeout(() => { el.style.outline = origOutline; }, 2000);
+          return {
+            success: true,
+            observation: `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (CDP insertText)${truncWarn}`,
+          };
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // TIER 3b: CDP dispatchKeyEvent (character-by-character)
+        // Works on: Word Online, Google Docs — canvas editors with hidden
+        // input layers that ignore insertText but respond to individual
+        // key events. Includes Enter/Backspace initialization for Word's
+        // text buffer activation.
+        // ═══════════════════════════════════════════════════════════
+        console.log('[type_text] TIER 3b: CDP dispatchKeyEvent (canvas/hidden-input editors)');
+        try {
+          // Force-focus before CDP key dispatch
+          el.focus();
+          el.click();
+          el.dispatchEvent(new Event('focus', { bubbles: true }));
+          const rect3b = el.getBoundingClientRect();
+          const cdpKeyResult = await new Promise((resolve) => {
+            chrome.runtime.sendMessage(
+              { type: 'cdp_type_keys', text: value, initializeBuffer: true, elementRect: { x: Math.round(rect3b.left + rect3b.width / 2), y: Math.round(rect3b.top + rect3b.height / 2) } },
+              (response) => resolve(response || { success: false, error: 'No response' })
+            );
+          });
+          console.log('[type_text] Tier 3b CDP key result:', cdpKeyResult);
+        } catch (e) {
+          console.log('[type_text] Tier 3b CDP dispatchKeyEvent failed:', e.message);
+        }
+
+        // ── VERIFY TIER 3b ──
+        vResult = await verifyTypingSuccess(el, value);
+
+        // ── FINAL RESULT ──
+        const origOutline = el.style.outline;
+        el.style.outline = vResult.found ? '2px solid #6366f1' : '2px solid #ef4444';
+        setTimeout(() => { el.style.outline = origOutline; }, 2000);
+
+        if (!vResult.found) {
+          console.log('[type_text] ALL 5 TIERS FAILED for contentEditable. Element:', el.tagName, 'id:', el.id, 'class:', (el.className || '').slice(0, 80));
+        }
+
+        const truncWarn = vResult.truncated ? ` WARNING: Browser truncated text to ${vResult.actualLength} chars (field has character limit).` : '';
+        return {
+          success: vResult.found,
+          observation: vResult.found
+            ? `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (CDP dispatchKeyEvent)${truncWarn}`
+            : `FAILED: Could not type into this ${el.tagName.toLowerCase()} element. All 5 tiers tried: execCommand, ClipboardEvent paste, keyboard simulation, CDP insertText, CDP dispatchKeyEvent. This editor may require manual text entry. The content was: "${value.slice(0, 120)}"`,
+        };
       }
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
 
-      // Set the new value
-      if (nativeSetter) {
-        nativeSetter.call(el, value);
-      } else {
+      // ── FALLBACK: Element is not INPUT/TEXTAREA and not contentEditable ──
+      // This shouldn't happen often. Try setting .value if it exists, else report failure.
+      console.log('[type_text] Element is neither input/textarea nor contentEditable. Tag:', el.tagName, 'SID:', target);
+      if ('value' in el) {
         el.value = value;
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
       }
-      // Dispatch full event sequence that React/frameworks expect
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      el.dispatchEvent(new Event('blur', { bubbles: true }));
-
-      // Verify the value was actually set (React can reject it)
-      const actualValue = el.value;
-      const valueSet = actualValue === value;
-
-      // Highlight briefly
-      const origOutline = el.style.outline;
-      el.style.outline = '2px solid #6366f1';
-      setTimeout(() => { el.style.outline = origOutline; }, 1500);
-
+      const fbValue = el.value || (el.innerText || '').trim();
       return {
-        success: true,
-        observation: `Typed "${value.slice(0, 80)}" into ${el.tagName.toLowerCase()}${el.placeholder ? ` (placeholder: "${el.placeholder}")` : ''}${!valueSet ? ` [WARNING: field shows "${actualValue.slice(0, 40)}" — React may have rejected the value. Try click_element on the field first, then type_text again, or use fill_field instead.]` : ''}`,
+        success: fbValue.length > 0,
+        observation: fbValue.length > 0
+          ? `Typed "${value.slice(0, 80)}" into ${el.tagName.toLowerCase()}`
+          : `FAILED: Element ${el.tagName.toLowerCase()} (id="${el.id || ''}", sid="${target}") is not a recognized input type. Look for a different element in the semantic map.`,
       };
     },
 
@@ -984,6 +1572,36 @@
         if (node.isContentEditable || node.getAttribute('contenteditable') === 'true') return 'input';
         // Detect elements with aria-haspopup (custom dropdowns)
         if (node.getAttribute('aria-haspopup') === 'listbox' || node.getAttribute('aria-haspopup') === 'menu') return 'input';
+
+        // ── UNIVERSAL EDITOR DETECTION ──
+        // Rich text editors (ProseMirror, Slate, Draft.js, Lexical, CKEditor, TinyMCE,
+        // Quill, etc.) wrap contentEditable inside container divs with recognizable
+        // class names. The actual contentEditable child will be caught by the tree walk,
+        // but sometimes the wrapper itself needs to be classified so its children get
+        // walked. Also catches editors that set contenteditable dynamically on focus.
+        const cls = (node.className && typeof node.className === 'string') ? node.className.toLowerCase() : '';
+        if (cls) {
+          const editorPatterns = ['prosemirror', 'ql-editor', 'ce-block', 'slate-editor',
+            'drafteditor', 'draft-editor', 'lexical', 'ckeditor', 'tox-edit-area',
+            'tinymce', 'editable', 'composer', 'note-editable', 'ck-editor__editable',
+            'public-drafteditor-content', 'notranslate'];
+          if (editorPatterns.some(p => cls.includes(p))) {
+            // Verify it's actually editable (not just a wrapper label)
+            if (node.isContentEditable || node.getAttribute('contenteditable') === 'true' ||
+                node.querySelector('[contenteditable="true"]')) {
+              return 'input';
+            }
+          }
+        }
+
+        // Detect data-* attributes common in rich text editors
+        if (node.getAttribute('data-contents') === 'true' || // Draft.js
+            node.getAttribute('data-slate-editor') === 'true' || // Slate
+            node.getAttribute('data-lexical-editor') === 'true' || // Lexical
+            node.getAttribute('data-placeholder')) { // Many editors use data-placeholder
+          return 'input';
+        }
+
         // Gmail/email clients: detect action buttons by aria-label, data-tooltip, or title
         const ariaLabel = (node.getAttribute('aria-label') || '').toLowerCase();
         const dataTooltip = (node.getAttribute('data-tooltip') || '').toLowerCase();
@@ -1004,7 +1622,81 @@
         // If no meaningful text, try icon meaning
         if (!text || text.length < 2) {
           const iconMeaning = getIconMeaning(node);
-          return iconMeaning ? `[${iconMeaning}]` : '';
+          if (iconMeaning) return `[${iconMeaning}]`;
+
+          // ── UNIVERSAL INPUT DETECTION ──
+          // Empty form fields (inputs, textareas, contentEditable) MUST appear in
+          // the semantic map even when they have no visible text. Without this,
+          // the agent cannot type into blank fields on Reddit, Word Online, Notion,
+          // Google Docs, customer chat panels, or ANY website with empty inputs.
+          // Generate a descriptive fallback label from available attributes.
+          const tag = node.tagName;
+          const isFormField = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+          const isEditable = node.isContentEditable || node.getAttribute('contenteditable') === 'true';
+          const role = node.getAttribute('role');
+          const isRoleInput = role === 'textbox' || role === 'searchbox' || role === 'combobox';
+
+          if (isFormField || isEditable || isRoleInput) {
+            // Build a label from whatever attributes exist
+            const name = node.getAttribute('name');
+            const id = node.getAttribute('id');
+            const type = node.getAttribute('type');
+            const placeholder = node.getAttribute('placeholder');
+            const ariaLabel = node.getAttribute('aria-label');
+
+            // Check for associated <label> element
+            let labelText = '';
+            if (id) {
+              const labelEl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+              if (labelEl) labelText = (labelEl.innerText || labelEl.textContent || '').trim().slice(0, 60);
+            }
+            if (!labelText) {
+              const parentLabel = node.closest('label');
+              if (parentLabel) labelText = (parentLabel.innerText || parentLabel.textContent || '').trim().slice(0, 60);
+            }
+
+            // Check CSS pseudo-element placeholder (Reddit uses ::placeholder via CSS)
+            let cssPlaceholder = '';
+            try {
+              const before = window.getComputedStyle(node, '::before').content;
+              const after = window.getComputedStyle(node, '::after').content;
+              const pseudo = before !== 'none' ? before : (after !== 'none' ? after : '');
+              if (pseudo && pseudo !== '""' && pseudo !== "''") {
+                cssPlaceholder = pseudo.replace(/^["']|["']$/g, '').trim();
+              }
+            } catch {}
+
+            // Check for nearby heading/label text (within 2 levels up)
+            let nearbyLabel = '';
+            if (!labelText && !ariaLabel && !placeholder && !cssPlaceholder) {
+              const parent = node.parentElement;
+              if (parent) {
+                const siblings = parent.children;
+                for (const sib of siblings) {
+                  if (sib === node) continue;
+                  const sibTag = sib.tagName;
+                  if (sibTag === 'LABEL' || sibTag === 'SPAN' || sibTag === 'H1' || sibTag === 'H2' || sibTag === 'H3' || sibTag === 'H4' || sibTag === 'P') {
+                    const sibText = (sib.innerText || sib.textContent || '').trim();
+                    if (sibText && sibText.length < 60) {
+                      nearbyLabel = sibText;
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+
+            const label = ariaLabel || placeholder || labelText || cssPlaceholder || nearbyLabel ||
+              (name ? `${name} field` : '') ||
+              (id ? `${id} field` : '') ||
+              (isEditable ? `[editable area]` : '') ||
+              (isRoleInput ? `[text input]` : '') ||
+              (type ? `[${type} input]` : `[${tag.toLowerCase()} field]`);
+
+            if (label) return `[empty] ${label}`.slice(0, 120);
+          }
+
+          return '';
         }
 
         // Append icon meaning if element has one and text doesn't already describe it
@@ -1113,6 +1805,68 @@
         return count;
       }
 
+      // ── findNearbyCharLimit: Detect character limit from nearby counter text ──
+      // Scans siblings, parent's children, and aria-describedby targets for patterns
+      // like "0/300", "245 / 280", "3000 characters remaining", "Max 100 characters".
+      // Works universally across Reddit, Twitter, LinkedIn, Facebook, etc.
+      function findNearbyCharLimit(inputNode) {
+        // Pattern 1: "X/Y" or "X / Y" where Y is the max (Reddit "0/300", Twitter style)
+        const counterRegex = /(\d{1,5})\s*\/\s*(\d{1,5})/;
+        // Pattern 2: "N characters remaining" or "N chars left" or "N remaining"
+        const remainingRegex = /(\d{1,5})\s*(?:characters?|chars?)\s*(?:remaining|left)/i;
+        // Pattern 3: "Max N characters" or "Maximum N chars" or "Limit: N"
+        const maxRegex = /(?:max(?:imum)?|limit)\s*:?\s*(\d{1,5})\s*(?:characters?|chars?)?/i;
+        // Pattern 4: "N of M characters" (LinkedIn style)
+        const ofRegex = /(\d{1,5})\s+of\s+(\d{1,5})\s*(?:characters?|chars?)?/i;
+
+        function extractLimit(text) {
+          let m;
+          m = text.match(counterRegex);
+          if (m) return parseInt(m[2], 10);
+          m = text.match(ofRegex);
+          if (m) return parseInt(m[2], 10);
+          m = text.match(maxRegex);
+          if (m) return parseInt(m[1], 10);
+          m = text.match(remainingRegex);
+          // For "remaining" pattern, the number is what's left, not the max.
+          // We can't determine max from remaining alone, so skip.
+          return 0;
+        }
+
+        // Search strategy: check nearby elements (siblings, parent children, aria references)
+        const searchTargets = [];
+
+        // Siblings of the input
+        if (inputNode.parentElement) {
+          for (const sib of inputNode.parentElement.children) {
+            if (sib === inputNode) continue;
+            searchTargets.push(sib);
+          }
+        }
+        // Parent's siblings (counter might be at the same level as the input's wrapper)
+        if (inputNode.parentElement?.parentElement) {
+          for (const uncle of inputNode.parentElement.parentElement.children) {
+            if (uncle === inputNode.parentElement) continue;
+            searchTargets.push(uncle);
+          }
+        }
+        // aria-describedby target
+        const describedBy = inputNode.getAttribute('aria-describedby');
+        if (describedBy) {
+          const descEl = document.getElementById(describedBy);
+          if (descEl) searchTargets.push(descEl);
+        }
+
+        for (const el of searchTargets) {
+          const elText = (el.innerText || el.textContent || '').trim();
+          if (elText.length > 0 && elText.length < 50) {
+            const limit = extractLimit(elText);
+            if (limit > 0 && limit <= 100000) return limit;
+          }
+        }
+        return 0;
+      }
+
       // Build rich element metadata (shared by walkContainer and walkPage)
       function buildElementEntry(node, type, text, isModal) {
         const sid = `${type.slice(0, 4)}-${counter++}`;
@@ -1132,6 +1886,35 @@
         if (node.getAttribute('role')) attrs.role = node.getAttribute('role');
         const iconMeaning = getIconMeaning(node);
         if (iconMeaning) attrs.iconMeaning = iconMeaning;
+
+        // ── CHARACTER LIMIT DETECTION (Universal) ──
+        // Extract maxlength from the element itself OR from nearby counter text.
+        // This tells the AI how long the content can be so it writes COMPLETE
+        // content that fits within the limit — not truncated, but crafted to fit.
+        const nodeTag = node.tagName;
+        if (nodeTag === 'INPUT' || nodeTag === 'TEXTAREA' || node.isContentEditable || node.getAttribute('contenteditable') === 'true' || node.getAttribute('role') === 'textbox') {
+          // Method 1: HTML maxlength attribute (most reliable)
+          const maxLen = node.getAttribute('maxlength') || node.getAttribute('maxLength');
+          if (maxLen && parseInt(maxLen, 10) > 0) {
+            attrs.maxlength = parseInt(maxLen, 10);
+          }
+          // Method 2: aria-valuemax (some custom inputs)
+          if (!attrs.maxlength) {
+            const ariaMax = node.getAttribute('aria-valuemax');
+            if (ariaMax && parseInt(ariaMax, 10) > 0) {
+              attrs.maxlength = parseInt(ariaMax, 10);
+            }
+          }
+          // Method 3: Scan nearby sibling/parent for counter text like "0/300", "245/280"
+          // These are universal patterns — Reddit shows "0/300", Twitter shows char count,
+          // LinkedIn shows remaining chars, etc.
+          if (!attrs.maxlength) {
+            const counterLimit = findNearbyCharLimit(node);
+            if (counterLimit > 0) {
+              attrs.maxlength = counterLimit;
+            }
+          }
+        }
 
         const parentText = node.parentElement
           ? (node.parentElement.innerText || '').trim().slice(0, 80)
@@ -1259,6 +2042,10 @@
             elements.push(buildElementEntry(node, type, text, prefix === '[MODAL] '));
           }
 
+          // Walk shadow DOM children (Shreddit/Reddit, Salesforce Lightning, etc.)
+          if (node.shadowRoot) {
+            for (const child of node.shadowRoot.children) walk(child);
+          }
           for (const child of node.children) walk(child);
         }
 
@@ -1290,6 +2077,10 @@
             elements.push(buildElementEntry(node, type, text, false));
           }
 
+          // Walk shadow DOM children (Shreddit/Reddit, Salesforce Lightning, etc.)
+          if (node.shadowRoot) {
+            for (const child of node.shadowRoot.children) walkPage(child);
+          }
           for (const child of node.children) walkPage(child);
         }
 
@@ -1339,6 +2130,36 @@
       return new Promise(resolve =>
         setTimeout(() => resolve({ success: true, observation: `Waited ${ms}ms.` }), ms)
       );
+    },
+
+    // ── DOM Fingerprint ────────────────────────────────────────
+    // Lightweight structural hash for DOM stability detection.
+    // Returns a fast fingerprint (element count, tag distribution,
+    // text length) — NOT a full snapshot. Used by background.js
+    // waitForDomStable() to detect when page stops changing.
+    dom_fingerprint() {
+      const body = document.body;
+      if (!body) return { success: true, fingerprint: 'nobody' };
+
+      const allEls = body.querySelectorAll('*');
+      const elCount = allEls.length;
+      const textLen = (body.innerText || '').length;
+
+      // Count interactive elements (buttons, links, inputs) — these
+      // are what matters for agent actions. Cheap to compute.
+      let interactive = 0;
+      let imgCount = 0;
+      for (let i = 0; i < allEls.length; i++) {
+        const tag = allEls[i].tagName;
+        if (tag === 'BUTTON' || tag === 'A' || tag === 'INPUT' ||
+            tag === 'SELECT' || tag === 'TEXTAREA') interactive++;
+        if (tag === 'IMG') imgCount++;
+      }
+
+      // Combine into a single string — two identical fingerprints
+      // means the DOM structure hasn't changed between polls
+      const fp = `${elCount}:${interactive}:${imgCount}:${textLen}`;
+      return { success: true, fingerprint: fp };
     },
 
     // ── Precise Element Resolver ─────────────────────────────
@@ -1482,7 +2303,7 @@
   chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     if (request.type !== 'explore_action') return;
 
-    const { actionType, target, value } = request;
+    const { actionType, target, value, consentApproved } = request;
 
     // Dedicated auth gate check — called by background.js before any action
     if (actionType === 'auth_check') {
@@ -1515,6 +2336,7 @@
       'scrape_page':   'extract_visible_text',
       'wait':          'wait',
       'take_snapshot': 'take_snapshot',
+      'dom_fingerprint': 'dom_fingerprint',
       'resolve_element': 'resolve_element',
     };
 
@@ -1548,7 +2370,7 @@
       return true;
     }
 
-    const result = handler({ target, value });
+    const result = handler({ target, value, consentApproved });
 
     // Handle async actions (wait)
     if (result instanceof Promise) {

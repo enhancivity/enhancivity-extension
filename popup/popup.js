@@ -1690,8 +1690,6 @@ async function initSettingsView() {
   const trialInfo       = document.getElementById('byok-trial-info');
   const intentBtns      = document.querySelectorAll('.intent-btn');
   const intentModelLabel = document.getElementById('intent-model-label');
-  const advancedToggle  = document.getElementById('advanced-model-toggle');
-  const advancedPanel   = document.getElementById('advanced-model-panel');
   const modelSelect     = document.getElementById('model-select');
   const customModelInput = document.getElementById('custom-model-input');
 
@@ -1772,12 +1770,8 @@ async function initSettingsView() {
   });
   updateIntentLabel();
 
-  // ── Advanced model panel ────────────────────────────────────
-  advancedToggle.onclick = () => {
-    advancedPanel.classList.toggle('hidden');
-  };
-
   function populateModelDropdown(provider) {
+    if (!modelSelect) return;
     // Clear existing options (keep the first "auto" option)
     while (modelSelect.options.length > 1) modelSelect.remove(1);
     const providerModels = modelRegistry.filter(m => m.provider === provider);
@@ -1791,15 +1785,19 @@ async function initSettingsView() {
     if (savedSelectedModel) modelSelect.value = savedSelectedModel;
   }
 
-  modelSelect.onchange = () => {
-    chrome.storage.local.set({ userSelectedModel: modelSelect.value });
-  };
+  if (modelSelect) {
+    modelSelect.onchange = () => {
+      chrome.storage.local.set({ userSelectedModel: modelSelect.value });
+    };
+  }
 
   // Restore custom model
-  customModelInput.value = savedCustomModel;
-  customModelInput.oninput = () => {
-    chrome.storage.local.set({ userCustomModel: customModelInput.value.trim() });
-  };
+  if (customModelInput) {
+    customModelInput.value = savedCustomModel;
+    customModelInput.oninput = () => {
+      chrome.storage.local.set({ userCustomModel: customModelInput.value.trim() });
+    };
+  }
 
   // Populate dropdown if provider already selected
   if (savedProvider) populateModelDropdown(savedProvider);
@@ -1869,8 +1867,8 @@ async function initSettingsView() {
     keyInput.placeholder = 'Select a provider first...';
     providerSelect.value = '';
     saveBtn.disabled = true;
-    customModelInput.value = '';
-    modelSelect.selectedIndex = 0;
+    if (customModelInput) customModelInput.value = '';
+    if (modelSelect) modelSelect.selectedIndex = 0;
     showStatus('Key removed. Standard pricing applies.', 'info');
     document.getElementById('byok-badge').classList.add('hidden');
     trialInfo.classList.add('hidden');
