@@ -12,7 +12,8 @@
     "webNavigation",
     "cookies",
     "sidePanel",
-    "debugger"
+    "debugger",
+    "clipboardWrite"
   ],
   "host_permissions": [
     "<all_urls>",

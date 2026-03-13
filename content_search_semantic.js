@@ -36,7 +36,9 @@
 
   const SKIP_ROLES = new Set([
     'navigation', 'banner', 'contentinfo', 'complementary',
-    'search', 'form', 'alert', 'alertdialog', 'dialog',
+    'alert', 'alertdialog',
+    // NOTE: 'form' and 'search' are NOT skipped — they contain the inputs we need to find.
+    // 'dialog' is NOT skipped — modals often contain form fields (login, settings, etc).
   ]);
 
   const SKIP_CLASS_PATTERN = /nav|footer|sidebar|cookie|banner|popup|modal|overlay|advert|promo|newsletter|subscribe|menu|breadcrumb/i;
@@ -51,8 +53,12 @@
     if (typeof cls === 'string' && SKIP_CLASS_PATTERN.test(cls)) return true;
     const id = el.id;
     if (id && SKIP_CLASS_PATTERN.test(id)) return true;
-    // Hidden elements (except BODY, and except elements with type="hidden" which we skip anyway)
-    if (el.offsetParent === null && el.tagName !== 'BODY' && el.tagName !== 'HTML') return true;
+    // Hidden elements (except BODY/HTML, and except elements inside shadow DOM where
+    // offsetParent is unreliable). Also exempt contenteditable and role=textbox — these
+    // are often reported as offsetParent=null due to CSS position or shadow DOM host.
+    if (el.offsetParent === null && el.tagName !== 'BODY' && el.tagName !== 'HTML'
+      && !el.isContentEditable && el.getAttribute('role') !== 'textbox'
+      && !el.getRootNode()?.host) return true;
     return false;
   }
 
@@ -78,6 +84,21 @@
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
       if (el.type === 'hidden') return null;  // skip hidden inputs
       return 'input';
+    }
+
+    // ContentEditable elements (rich text editors: ProseMirror, Slate, Draft.js, Lexical)
+    // Reddit, Notion, Medium, and many modern apps use contenteditable divs instead of textareas.
+    if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
+      // Only classify if this is the actual editor surface, not a parent container
+      // that happens to be contenteditable. Check: has role=textbox, or is a known
+      // editor class, or has no contenteditable children (is the leaf editor).
+      const role = el.getAttribute('role');
+      if (role === 'textbox') return 'input';
+      const cls = typeof el.className === 'string' ? el.className : '';
+      if (/ProseMirror|DraftEditor|ql-editor|ck-editor|lexical|slate/i.test(cls)) return 'input';
+      // If no child is also contenteditable, this is the leaf editor surface
+      const childEditable = el.querySelector('[contenteditable="true"]');
+      if (!childEditable) return 'input';
     }
 
     // Links
@@ -192,10 +213,16 @@
       const maxLen = el.getAttribute('maxlength') || el.getAttribute('maxLength');
       if (maxLen && parseInt(maxLen, 10) > 0) attrs.maxlength = parseInt(maxLen, 10);
     }
-    // Character limit for contentEditable / role=textbox
+    // ContentEditable / role=textbox: extract placeholder and character limits
     if (el.isContentEditable || el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox') {
       const maxLen = el.getAttribute('maxlength') || el.getAttribute('maxLength');
       if (maxLen && parseInt(maxLen, 10) > 0) attrs.maxlength = parseInt(maxLen, 10);
+      // Placeholder — contenteditable divs often use aria-placeholder or data-placeholder
+      const placeholder = el.getAttribute('aria-placeholder') || el.getAttribute('data-placeholder') || el.getAttribute('placeholder');
+      if (placeholder) attrs.placeholder = placeholder;
+      // Name — for form association
+      const name = el.getAttribute('name') || el.getAttribute('aria-label');
+      if (name) attrs.name = name;
     }
 
     if (tag === 'A') {
@@ -278,6 +305,15 @@
       // Walk children
       for (const child of node.children) {
         walk(child);
+      }
+
+      // Pierce shadow DOM — web components (Reddit's <shreddit-*>, Salesforce Lightning,
+      // Atlassian, etc.) render their content inside shadow roots. Without this,
+      // contenteditable editors and inputs inside shadow DOM are invisible to the scraper.
+      if (node.shadowRoot) {
+        for (const shadowChild of node.shadowRoot.children) {
+          walk(shadowChild);
+        }
       }
     }
 

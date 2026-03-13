@@ -571,6 +571,36 @@ const SEMANTIC_SCRAPER = 'content_search_semantic.js';
 // Progress HUD content script
 const HUD_SCRIPT = 'content_hud.js';
 
+// ─── Tab Readiness Helper ──────────────────────────────────
+// Chrome locks tab APIs during tab drag, tab switch animation, and other
+// transient states. This helper polls until the tab is accessible.
+// Uses chrome.tabs.get() as a lightweight probe — if it succeeds,
+// the tab is ready for scripting/messaging.
+async function waitForTabReady(tabId, maxWaitMs = 10000) {
+  const start = Date.now();
+  const pollInterval = 500; // check every 500ms
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab && tab.status !== 'unloaded') {
+        return true; // tab is accessible
+      }
+    } catch (err) {
+      const msg = err.message || '';
+      if (msg.includes('cannot be edited') || msg.includes('dragging') || msg.includes('No tab with id')) {
+        // Transient — wait and retry
+        await new Promise(r => setTimeout(r, pollInterval));
+        continue;
+      }
+      // Non-transient error — give up
+      return false;
+    }
+    await new Promise(r => setTimeout(r, pollInterval));
+  }
+  console.warn(`[waitForTabReady] Tab ${tabId} not ready after ${maxWaitMs}ms`);
+  return false; // timed out but don't throw — let caller decide
+}
+
 // ─── HUD Helpers (inject + send messages) ─────────────────
 
 async function injectHud(tabId) {
@@ -689,6 +719,71 @@ async function waitForDomStable(tabId, maxWaitMs = 3000, intervalMs = 300) {
   const remaining = deadline - Date.now();
   if (remaining > 0) {
     await new Promise(r => setTimeout(r, remaining));
+  }
+}
+
+// ── Safe Message Sender ─────────────────────────────────────
+// Wraps chrome.tabs.sendMessage with automatic re-injection + retry.
+// If the content script's message channel is dead (SPA navigation,
+// tab suspension, extension reload), this re-injects the script and
+// retries once. Returns a proper error object instead of silent null.
+//
+// `scriptFile` — which content script to re-inject on failure (default: content_explore.js)
+// `message`    — the message object to send
+// `tabId`      — target tab
+async function safeSendMessage(tabId, message, scriptFile = 'content_explore.js') {
+  const CHANNEL_DEAD_ERRORS = [
+    'Could not establish connection',
+    'Receiving end does not exist',
+    'message port closed',
+    'Message Channel Closed',
+    'Extension context invalidated',
+  ];
+
+  function isChannelDead(err) {
+    const msg = err?.message || String(err);
+    return CHANNEL_DEAD_ERRORS.some(e => msg.includes(e));
+  }
+
+  // Attempt 1: send normally
+  try {
+    const result = await chrome.tabs.sendMessage(tabId, message);
+    if (result !== undefined) return result;
+    // undefined = no listener caught it — fall through to re-inject
+  } catch (err) {
+    if (!isChannelDead(err)) throw err; // Non-channel error — bubble up
+    console.warn(`[safeSendMessage] Channel dead on tab ${tabId}: ${err.message}. Re-injecting ${scriptFile}...`);
+  }
+
+  // Re-inject the content script
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: [scriptFile],
+    });
+  } catch (injectErr) {
+    // Can't inject (chrome:// pages, PDF, etc.) — return structured error
+    return {
+      success: false,
+      error: `Cannot inject script into tab ${tabId}: ${injectErr.message}`,
+      errorType: 'INJECTION_FAILED',
+    };
+  }
+
+  // Wait for script to initialize its message listeners
+  await new Promise(r => setTimeout(r, 400));
+
+  // Attempt 2: retry after re-injection
+  try {
+    const result = await chrome.tabs.sendMessage(tabId, message);
+    if (result !== undefined) return result;
+    return { success: false, error: 'No response after re-injection', errorType: 'NO_RESPONSE' };
+  } catch (retryErr) {
+    return {
+      success: false,
+      error: `Message failed after re-injection: ${retryErr.message}`,
+      errorType: 'CHANNEL_DEAD',
+    };
   }
 }
 
@@ -899,18 +994,18 @@ async function updateExplorationProgress(step, total, description, status, phase
 }
 
 async function takePageSnapshot(tabId) {
-  try {
-    // Inject the explore content script (handles double-injection guard internally)
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ['content_explore.js'],
-    });
+  // Wait for tab to be accessible (user may be switching tabs)
+  await waitForTabReady(tabId, 8000);
 
-    // Request a snapshot
-    const result = await chrome.tabs.sendMessage(tabId, {
+  // Wait for DOM to stabilize (SPAs may still be rendering after tab load)
+  await waitForDomStable(tabId, 3000, 300);
+
+  try {
+    // Request a snapshot via safeSendMessage (auto re-injects if channel is dead)
+    const result = await safeSendMessage(tabId, {
       type: 'explore_action',
       actionType: 'take_snapshot',
-    });
+    }, 'content_explore.js');
 
     if (result?.success && result.snapshot) {
       return result.snapshot;
@@ -921,7 +1016,7 @@ async function takePageSnapshot(tabId) {
     return {
       url: tab.url || 'unknown',
       title: tab.title || 'unknown',
-      mainContent: '(Could not extract page content)',
+      mainContent: result?.error ? `(Snapshot failed: ${result.error})` : '(Could not extract page content)',
       semanticElements: [],
     };
   } catch (err) {
@@ -973,7 +1068,11 @@ function isPlaceholderUrl(url) {
   return PLACEHOLDER_URL_PATTERNS.some(p => lower.includes(p));
 }
 
-async function executeExploreAction(tabId, action, token) {
+async function executeExploreAction(tabId, action, token, _retryCount = 0) {
+  // WAIT FOR TAB: Ensure tab is accessible before any operation.
+  // This prevents "Tabs cannot be edited right now" when user is switching tabs.
+  await waitForTabReady(tabId, 8000);
+
   try {
     // AUTH GATE PRE-CHECK: Before any DOM-interactive action, verify we're not on an auth page.
     // This catches session expiry mid-task (user gets redirected to login).
@@ -1068,14 +1167,12 @@ async function executeExploreAction(tabId, action, token) {
     // resolve_element: multi-signal element resolution, returns best match SID
     if (action.type === 'resolve_element') {
       try {
-        await chrome.scripting.executeScript({ target: { tabId }, files: ['content_explore.js'] }).catch(() => {});
-        await new Promise(r => setTimeout(r, 200));
-        const result = await chrome.tabs.sendMessage(tabId, {
+        const result = await safeSendMessage(tabId, {
           type: 'explore_action',
           actionType: 'resolve_element',
           target: action.target,
           value: action.value,
-        });
+        }, 'content_explore.js');
         return result || { success: false, error: 'No response from resolve_element' };
       } catch (err) {
         return { success: false, error: `resolve_element failed: ${err.message}` };
@@ -1095,26 +1192,37 @@ async function executeExploreAction(tabId, action, token) {
       };
     }
 
-    // For all other actions, send to content script
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ['content_explore.js'],
-    });
-
-    // Brief delay to ensure message listener is registered
-    await new Promise(r => setTimeout(r, 200));
-
-    const result = await chrome.tabs.sendMessage(tabId, {
+    // For all other actions, send to content script via safeSendMessage
+    // (auto re-injects content_explore.js if channel is dead)
+    const result = await safeSendMessage(tabId, {
       type: 'explore_action',
       actionType: action.type,
       target: action.target,
       value: action.value,
       consentApproved: action.consentApproved || false,
-    });
+    }, 'content_explore.js');
 
     return result || { success: false, error: 'No response from content script' };
 
   } catch (err) {
+    // TRANSIENT CHROME API ERRORS: Retry automatically.
+    // "Tabs cannot be edited right now" happens when user is switching tabs, dragging tabs,
+    // or Chrome is in a transient animation state. These resolve on their own after a brief wait.
+    // Also handles "Could not establish connection" (content script not yet loaded after navigation).
+    const transientErrors = [
+      'cannot be edited',
+      'dragging a tab',
+      'Could not establish connection',
+      'Receiving end does not exist',
+      'message port closed',
+    ];
+    const isTransient = transientErrors.some(msg => (err.message || '').includes(msg));
+    if (isTransient && _retryCount < 3) {
+      const delay = (_retryCount + 1) * 1000; // 1s, 2s, 3s backoff
+      console.warn(`[Explore] Transient Chrome error: "${err.message}". Retrying in ${delay}ms (attempt ${_retryCount + 1}/3)...`);
+      await new Promise(r => setTimeout(r, delay));
+      return executeExploreAction(tabId, action, token, _retryCount + 1);
+    }
     return { success: false, error: err.message || 'Action execution failed' };
   }
 }
@@ -1122,8 +1230,12 @@ async function executeExploreAction(tabId, action, token) {
 // Helper: mark exploration as finished and store result for panel recovery
 async function finishExploration(result) {
   // Set result first, THEN remove active flag — so listener sees result when it checks
-  await chrome.storage.session.set({ explorationResult: { ...result, finishedAt: Date.now() } });
-  await chrome.storage.session.remove('explorationActive');
+  try {
+    await chrome.storage.session.set({ explorationResult: { ...result, finishedAt: Date.now() } });
+    await chrome.storage.session.remove('explorationActive');
+  } catch (e) {
+    console.warn('[Explore] finishExploration storage write failed:', e.message);
+  }
   return result;
 }
 
@@ -1194,19 +1306,35 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
   const totalStepsAcrossPhases = continuationContext?.totalSteps || 0;
 
   // Mark exploration as in-progress (so re-injected panel can detect it)
-  await chrome.storage.session.set({
-    explorationActive: { goal, maxSteps, tabId: currentTabId, startedAt: Date.now(), phase: currentPhase },
-  });
+  try {
+    await chrome.storage.session.set({
+      explorationActive: { goal, maxSteps, tabId: currentTabId, startedAt: Date.now(), phase: currentPhase },
+    });
+  } catch (e) {
+    console.warn('[Explore] Could not set explorationActive:', e.message);
+  }
 
   // Auto-inject panel + explore + HUD when the explore tab navigates (backup for executeExploreAction injection)
+  // Re-inject content scripts on FULL page loads (traditional navigation)
   const navListener = (details) => {
     if (details.tabId !== currentTabId || details.frameId !== 0) return;
     console.log('[Explore] webNavigation.onCompleted — re-injecting DOM scripts on', details.url);
-    // Side panel persists — only re-inject content scripts for DOM interaction
     chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: ['content_explore.js'] }).catch(() => {});
     chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: [HUD_SCRIPT] }).catch(() => {});
   };
   chrome.webNavigation.onCompleted.addListener(navListener);
+
+  // Re-inject content scripts on SPA SOFT navigations (pushState/replaceState).
+  // Reddit, Gmail, YouTube, Amazon, etc. change URLs via History API without a
+  // full page load — onCompleted never fires, so the content script goes stale.
+  // This listener catches those soft navigations and re-injects immediately.
+  const spaNavListener = (details) => {
+    if (details.tabId !== currentTabId || details.frameId !== 0) return;
+    console.log('[Explore] SPA navigation (onHistoryStateUpdated) — re-injecting DOM scripts on', details.url);
+    chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: ['content_explore.js'] }).catch(() => {});
+    chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: [HUD_SCRIPT] }).catch(() => {});
+  };
+  chrome.webNavigation.onHistoryStateUpdated.addListener(spaNavListener);
 
   // Service worker keepalive during exploration
   const keepAlive = setInterval(() => {
@@ -1223,9 +1351,13 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
     clearInterval(keepAlive);
     clearTimeout(explorationTimeout);
     chrome.webNavigation.onCompleted.removeListener(navListener);
+    chrome.webNavigation.onHistoryStateUpdated.removeListener(spaNavListener);
   }
 
   try {
+    // WAIT FOR TAB before any DOM operations (user may be on a different tab)
+    await waitForTabReady(currentTabId, 10000);
+
     // Show HUD on the page — show up to 10 step dots for readability
     const hudSteps = [];
     const hudMax = Math.min(maxSteps, 10);
@@ -1626,8 +1758,9 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
             continue;
           }
 
-          if (repeatCount >= 2) {
+          if (repeatCount >= 2 && currType !== 'type_text') {
             // Force a scrape_page on second repeat instead of letting it continue
+            // EXCEPTION: type_text is allowed to retry — the AI may click first then re-type
             console.warn(`[Explore] Step ${step}: Blocked repeated ${currType}(${currTarget}), forcing scrape_page`);
             decision.nextAction = {
               type: 'scrape_page',
@@ -1655,19 +1788,41 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
             }
           }
 
-          // Detect repeated type_text failures across ANY targets
-          // (Rich text editors reject all programmatic input — stop wasting steps)
+          // Detect repeated type_text failures — tracked PER TARGET, not globally.
+          // Failing on field A should NOT count against field B.
+          // After 2 failures on SAME target: inject hint to click first
+          // After 3 failures on SAME target: try splitting text into smaller chunks
+          // After 5 failures on SAME target: give up and present text for copy-paste
           if (currType === 'type_text') {
-            const recentTypeFailures = stepLog.filter(s =>
+            const targetId = currTarget || 'unknown';
+            const targetFailures = stepLog.filter(s =>
+              s.action?.type === 'type_text' && s.action?.target === targetId && s.result?.success === false
+            ).length;
+            const totalTypeFailures = stepLog.filter(s =>
               s.action?.type === 'type_text' && s.result?.success === false
             ).length;
-            if (recentTypeFailures >= 2) {
-              console.warn(`[Explore] Step ${step}: type_text failed ${recentTypeFailures} times — rich text editor cannot accept input. Forcing goal complete.`);
-              // Force goal complete with the text content for the user
+
+            if (targetFailures >= 5 || totalTypeFailures >= 8) {
+              // Per-target: 5 failures = this specific field is truly resistant
+              // Global: 8 failures across ALL fields = the whole page is problematic
+              const failMsg = targetFailures >= 5
+                ? `type_text failed ${targetFailures} times on "${targetId}"`
+                : `type_text failed ${totalTypeFailures} times total across fields`;
+              console.warn(`[Explore] Step ${step}: ${failMsg} — forcing goal complete with copy-paste fallback.`);
               const textValue = decision.nextAction.value || '';
               decision.isGoalComplete = true;
               decision.goalResult = `This page uses a rich text editor that blocks programmatic text input. Here is the content I prepared for you to copy and paste:\n\n${textValue || '(The text was not available — please type your content manually.)'}`;
               decision.nextAction = null;
+            } else if (targetFailures >= 3) {
+              // After 3 failures on same target: suggest trying a different element or splitting text
+              console.warn(`[Explore] Step ${step}: type_text failed ${targetFailures} times on "${targetId}" — injecting alternative-approach hint`);
+              decision.revisedStrategy = (decision.revisedStrategy || currentStrategy) +
+                ` IMPORTANT: type_text has failed ${targetFailures} times on "${targetId}". Try these alternatives: (1) use click_element to click DIRECTLY inside the editor body, wait, then retry type_text. (2) Try targeting a DIFFERENT element — look for the actual contentEditable div or ProseMirror surface instead of the container. (3) Try typing a SHORT test string first (e.g., just "test") to verify the field accepts input at all.`;
+            } else if (targetFailures >= 2) {
+              // After 2 failures: inject click-first hint
+              console.warn(`[Explore] Step ${step}: type_text failed twice on "${targetId}" — injecting click-first hint`);
+              decision.revisedStrategy = (decision.revisedStrategy || currentStrategy) +
+                ' IMPORTANT: type_text has failed twice on this target. Before retrying, use click_element on the exact target field to activate the editor cursor, wait a moment, then try type_text again with the same content.';
             }
           }
         }
@@ -2220,6 +2375,52 @@ async function handleMessage(request, sender) {
     } catch (err) {
       try { await chrome.debugger.detach({ tabId }); } catch (_) {}
       console.warn('[CDP] Input.insertText failed:', err.message);
+      return { success: false, error: err.message };
+    }
+  }
+
+  // ── CDP PASTE: Trusted Ctrl+V via DevTools Protocol ──
+  // Tier 2a: Sends a real Ctrl+V keystroke. The content script writes text to
+  // the system clipboard first, then this handler triggers a trusted paste.
+  // This is the most reliable method for ProseMirror (Reddit, Notion, TipTap)
+  // because the editor sees a real paste event with real clipboard data.
+  if (request.type === 'cdp_paste') {
+    const tabId = sender?.tab?.id;
+    if (!tabId) {
+      return { success: false, error: 'Missing tabId for CDP paste' };
+    }
+    try {
+      const target = { tabId };
+      await chrome.debugger.attach(target, '1.3');
+
+      // Click the element to ensure focus (if coordinates provided)
+      if (request.elementRect?.x && request.elementRect?.y) {
+        await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+          type: 'mousePressed', x: request.elementRect.x, y: request.elementRect.y, button: 'left', clickCount: 1,
+        });
+        await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+          type: 'mouseReleased', x: request.elementRect.x, y: request.elementRect.y, button: 'left', clickCount: 1,
+        });
+        await new Promise(r => setTimeout(r, 150));
+      }
+
+      // Send Ctrl+V (trusted keyDown + keyUp)
+      await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+        type: 'keyDown', key: 'v', code: 'KeyV', windowsVirtualKeyCode: 86,
+        nativeVirtualKeyCode: 86, modifiers: 2, // 2 = Ctrl
+      });
+      await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+        type: 'keyUp', key: 'v', code: 'KeyV', windowsVirtualKeyCode: 86,
+        nativeVirtualKeyCode: 86, modifiers: 2,
+      });
+      await new Promise(r => setTimeout(r, 200));
+
+      await chrome.debugger.detach(target);
+      console.log('[CDP] Ctrl+V paste dispatched successfully');
+      return { success: true };
+    } catch (err) {
+      try { await chrome.debugger.detach({ tabId }); } catch (_) {}
+      console.warn('[CDP] Ctrl+V paste failed:', err.message);
       return { success: false, error: err.message };
     }
   }
@@ -2913,15 +3114,31 @@ async function handleMessage(request, sender) {
     };
 
     // Run in background — don't await (prevents message channel timeout)
-    runExplorationLoop(explorePlan, tabId, token, null, initialContinuationContext)
-      .then(result => {
-        chrome.storage.session.set({ explorationResult: result }).catch(() => {});
-        console.log(`[Explore] Loop completed in background (${result.phasesUsed || 1} phase(s), ${result.stepsUsed || 0} steps). Result stored.`);
-      })
-      .catch(err => {
-        console.error('[Explore] Background loop error:', err);
-        chrome.storage.session.set({ explorationResult: { success: false, error: err.message } }).catch(() => {});
-      });
+    // Retry wrapper for transient Chrome errors ("Tabs cannot be edited right now")
+    // that can kill the loop when user switches tabs during exploration.
+    (async () => {
+      const TRANSIENT_PATTERNS = ['cannot be edited', 'dragging a tab'];
+      const MAX_LOOP_RETRIES = 2;
+      for (let loopAttempt = 0; loopAttempt <= MAX_LOOP_RETRIES; loopAttempt++) {
+        try {
+          const result = await runExplorationLoop(explorePlan, tabId, token, null, initialContinuationContext);
+          chrome.storage.session.set({ explorationResult: result }).catch(() => {});
+          console.log(`[Explore] Loop completed in background (${result.phasesUsed || 1} phase(s), ${result.stepsUsed || 0} steps). Result stored.`);
+          return; // success — exit retry loop
+        } catch (err) {
+          const isTransient = TRANSIENT_PATTERNS.some(p => (err.message || '').includes(p));
+          if (isTransient && loopAttempt < MAX_LOOP_RETRIES) {
+            const delay = (loopAttempt + 1) * 2000;
+            console.warn(`[Explore] Transient error killed loop: "${err.message}". Retrying in ${delay}ms (attempt ${loopAttempt + 1}/${MAX_LOOP_RETRIES})...`);
+            await new Promise(r => setTimeout(r, delay));
+            continue;
+          }
+          console.error('[Explore] Background loop error:', err);
+          chrome.storage.session.set({ explorationResult: { success: false, error: err.message } }).catch(() => {});
+          return;
+        }
+      }
+    })();
     return { success: true, async: true, message: 'Exploration started. Progress updates will arrive separately.' };
   }
 

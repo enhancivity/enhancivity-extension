@@ -905,7 +905,7 @@
       }
 
       // ── UNIVERSAL VERIFICATION HELPER ──
-      // After any typing action, wait 500ms, re-scan DOM for the typed string.
+      // After any typing action, wait for editor to process, re-scan DOM for the typed string.
       // For contentEditable elements, also runs ProseMirror state sync to ensure
       // the editor's internal state matches the visible DOM content.
       // Returns { found: boolean, truncated: boolean, actualLength: number }
@@ -916,7 +916,13 @@
           await syncEditorState(targetEl);
         }
 
-        await new Promise(r => setTimeout(r, 500));
+        // Wait for rich editors to process and re-render.
+        // contentEditable editors (ProseMirror, Slate) need more time than plain inputs.
+        const waitMs = targetEl.isContentEditable ? 1200 : 500;
+        await new Promise(r => setTimeout(r, waitMs));
+
+        // Use first 40 chars of expected text for matching
+        const matchStr = expectedText.slice(0, 40);
         let actualText = '';
 
         // Check .value for inputs
@@ -924,23 +930,73 @@
           actualText = targetEl.value;
         }
         // Check innerText/textContent for contentEditable and other elements
-        if (!actualText) {
-          actualText = (targetEl.innerText || targetEl.textContent || '').trim();
+        if (!actualText || !actualText.includes(matchStr)) {
+          const inner = (targetEl.innerText || targetEl.textContent || '').trim();
+          if (inner.length > actualText.length) actualText = inner;
+        }
+        // Check child nodes (ProseMirror renders inside <p>, <div>, <span> children)
+        if (!actualText.includes(matchStr)) {
+          const children = targetEl.querySelectorAll('p, div, span, [data-contents], [data-block]');
+          for (const child of children) {
+            const childText = (child.innerText || child.textContent || '').trim();
+            if (childText.includes(matchStr)) {
+              actualText = childText;
+              break;
+            }
+          }
         }
         // Also check parent container (for canvas editors where typed content
         // may appear in a sibling or parent node)
-        if (!actualText) {
+        if (!actualText.includes(matchStr)) {
           const parent = targetEl.closest('[role="textbox"], [contenteditable="true"], .editor, .ProseMirror, .ql-editor') || targetEl.parentElement;
           if (parent && parent !== targetEl) {
-            actualText = (parent.innerText || parent.textContent || '').trim();
+            const parentText = (parent.innerText || parent.textContent || '').trim();
+            if (parentText.includes(matchStr)) actualText = parentText;
+          }
+        }
+        // Check shadow DOM — Reddit's <shreddit-composer> and other web components
+        // may render the editor surface inside a shadow root
+        if (!actualText.includes(matchStr)) {
+          const shadowHosts = [targetEl, targetEl.parentElement, targetEl.closest('[contenteditable]')?.parentElement].filter(Boolean);
+          for (const host of shadowHosts) {
+            if (host.shadowRoot) {
+              const shadowText = (host.shadowRoot.textContent || '').trim();
+              if (shadowText.includes(matchStr)) {
+                actualText = shadowText;
+                break;
+              }
+              // Also check contentEditable children inside shadow DOM
+              const shadowEditable = host.shadowRoot.querySelector('[contenteditable="true"], .ProseMirror, [role="textbox"]');
+              if (shadowEditable) {
+                const seText = (shadowEditable.innerText || shadowEditable.textContent || '').trim();
+                if (seText.includes(matchStr)) {
+                  actualText = seText;
+                  break;
+                }
+              }
+            }
+          }
+        }
+        // Check nearby siblings — some editors render typed text in a sibling element
+        if (!actualText.includes(matchStr) && targetEl.parentElement) {
+          for (const sibling of targetEl.parentElement.children) {
+            if (sibling === targetEl) continue;
+            const sibText = (sibling.innerText || sibling.textContent || '').trim();
+            if (sibText.includes(matchStr)) {
+              actualText = sibText;
+              break;
+            }
           }
         }
 
-        const found = actualText.length > 0 && actualText.includes(expectedText.slice(0, 40));
+        const found = actualText.length > 0 && actualText.includes(matchStr);
         // Detect silent truncation: browser enforced maxlength and chopped our text
         const truncated = found && actualText.length < expectedText.length * 0.9;
         if (truncated) {
           console.log(`[type_text] WARNING: Text was silently truncated by browser. Expected ${expectedText.length} chars, got ${actualText.length} chars.`);
+        }
+        if (!found) {
+          console.log(`[type_text] Verification FAILED. Expected match for "${matchStr}". Actual text (first 120 chars): "${actualText.slice(0, 120)}"`);
         }
         return { found, truncated, actualLength: actualText.length };
       }
@@ -1023,10 +1079,20 @@
           console.log('[type_text] Native + execCommand + keyboard failed. Trying CDP...');
           try {
             const cdpResult = await new Promise((resolve) => {
-              chrome.runtime.sendMessage(
-                { type: 'cdp_insert_text', text: value },
-                (response) => resolve(response || { success: false })
-              );
+              try {
+                chrome.runtime.sendMessage(
+                  { type: 'cdp_insert_text', text: value },
+                  (response) => {
+                    if (chrome.runtime.lastError) {
+                      resolve({ success: false, error: chrome.runtime.lastError.message });
+                    } else {
+                      resolve(response || { success: false });
+                    }
+                  }
+                );
+              } catch (sendErr) {
+                resolve({ success: false, error: sendErr.message });
+              }
             });
             if (cdpResult?.success) await new Promise(r => setTimeout(r, 200));
             finalValue = el.value || (el.innerText || '').trim();
@@ -1126,31 +1192,68 @@
         }
 
         // ═══════════════════════════════════════════════════════════
-        // TIER 2: ClipboardEvent paste
+        // TIER 2: ClipboardEvent paste (enhanced for ProseMirror)
         // Works on: ProseMirror (Reddit body, Notion, TipTap), Quill
-        // ProseMirror intercepts paste events and reads clipboardData
+        // NOTE: Chrome ignores clipboardData in ClipboardEvent constructor —
+        // we must use Object.defineProperty to force it onto the event.
+        // Also fires beforeinput(insertFromPaste) which modern ProseMirror
+        // versions (2024+) listen to instead of/alongside paste events.
         // ═══════════════════════════════════════════════════════════
         console.log('[type_text] TIER 2: ClipboardEvent paste (Tier 1 failed verification)');
         try {
           // Re-focus and place cursor — essential for ProseMirror
           el.focus();
           el.click();
+          el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+          el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
           sel.removeAllRanges();
           const r2 = document.createRange();
           r2.selectNodeContents(el);
           r2.collapse(false);
           sel.addRange(r2);
 
+          // Build a DataTransfer with both plain text and HTML
           const dt = new DataTransfer();
           dt.setData('text/plain', value);
-          dt.setData('text/html', value.replace(/\n/g, '<br>'));
+          dt.setData('text/html', `<p>${value.replace(/\n/g, '</p><p>')}</p>`);
+
+          // Create the paste event and FORCE clipboardData onto it
+          // (Chrome's ClipboardEvent constructor silently drops the clipboardData param)
           const pasteEvent = new ClipboardEvent('paste', {
             bubbles: true,
             cancelable: true,
-            clipboardData: dt,
+          });
+          Object.defineProperty(pasteEvent, 'clipboardData', {
+            value: dt,
+            writable: false,
+            configurable: true,
           });
           el.dispatchEvent(pasteEvent);
-          console.log('[type_text] Tier 2 ClipboardEvent paste dispatched');
+          console.log('[type_text] Tier 2 ClipboardEvent paste dispatched (with forced clipboardData)');
+
+          // Also fire beforeinput with insertFromPaste — modern ProseMirror (2024+)
+          // and Lexical use InputEvent-based paste handling
+          await new Promise(r => setTimeout(r, 50));
+          try {
+            el.dispatchEvent(new InputEvent('beforeinput', {
+              inputType: 'insertFromPaste',
+              data: value,
+              dataTransfer: dt,
+              bubbles: true,
+              cancelable: true,
+              composed: true,
+            }));
+            el.dispatchEvent(new InputEvent('input', {
+              inputType: 'insertFromPaste',
+              data: value,
+              bubbles: true,
+              cancelable: false,
+              composed: true,
+            }));
+            console.log('[type_text] Tier 2 also fired beforeinput/input insertFromPaste');
+          } catch (e2) {
+            console.log('[type_text] Tier 2 InputEvent insertFromPaste failed (non-fatal):', e2.message);
+          }
         } catch (e) {
           console.log('[type_text] Tier 2 ClipboardEvent failed:', e.message);
         }
@@ -1170,12 +1273,82 @@
         }
 
         // ═══════════════════════════════════════════════════════════
+        // TIER 2a: CDP Clipboard Paste (real Ctrl+V via DevTools Protocol)
+        // Works on: ProseMirror, Slate, any editor that accepts real paste.
+        // Writes text to system clipboard, then sends trusted Ctrl+V keystroke
+        // via CDP — this is indistinguishable from a real user paste action.
+        // ═══════════════════════════════════════════════════════════
+        console.log('[type_text] TIER 2a: CDP clipboard paste (Tier 2 synthetic paste failed)');
+        try {
+          // Write to clipboard — try navigator.clipboard first, fall back to execCommand
+          let clipboardWritten = false;
+          try {
+            await navigator.clipboard.writeText(value);
+            clipboardWritten = true;
+            console.log('[type_text] Tier 2a: navigator.clipboard.writeText succeeded');
+          } catch (clipErr) {
+            console.log('[type_text] Tier 2a: navigator.clipboard failed, trying execCommand copy fallback:', clipErr.message);
+            // Fallback: create a hidden textarea, select its content, execCommand('copy')
+            const tempTA = document.createElement('textarea');
+            tempTA.value = value;
+            tempTA.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0';
+            document.body.appendChild(tempTA);
+            tempTA.select();
+            clipboardWritten = document.execCommand('copy');
+            document.body.removeChild(tempTA);
+            console.log('[type_text] Tier 2a: execCommand copy fallback result:', clipboardWritten);
+          }
+          if (!clipboardWritten) throw new Error('Could not write to clipboard');
+
+          // Re-focus the element
+          el.focus();
+          el.click();
+          await new Promise(r => setTimeout(r, 100));
+
+          // Ask background.js to send trusted Ctrl+V via CDP
+          const rect2a = el.getBoundingClientRect();
+          const cdpPasteResult = await new Promise((resolve) => {
+            try {
+              chrome.runtime.sendMessage(
+                { type: 'cdp_paste', elementRect: { x: Math.round(rect2a.left + rect2a.width / 2), y: Math.round(rect2a.top + rect2a.height / 2) } },
+                (response) => {
+                  if (chrome.runtime.lastError) {
+                    resolve({ success: false, error: chrome.runtime.lastError.message });
+                  } else {
+                    resolve(response || { success: false, error: 'No response' });
+                  }
+                }
+              );
+            } catch (sendErr) {
+              resolve({ success: false, error: sendErr.message });
+            }
+          });
+          console.log('[type_text] Tier 2a CDP paste result:', cdpPasteResult);
+        } catch (e) {
+          console.log('[type_text] Tier 2a CDP clipboard paste failed:', e.message);
+        }
+
+        // ── VERIFY TIER 2a ──
+        vResult = await verifyTypingSuccess(el, value);
+        if (vResult.found) {
+          console.log('[type_text] TIER 2a SUCCESS — text verified after CDP Ctrl+V paste');
+          const truncWarn = vResult.truncated ? ` WARNING: Browser truncated text to ${vResult.actualLength} chars (field has character limit).` : '';
+          const origOutline = el.style.outline;
+          el.style.outline = '2px solid #6366f1';
+          setTimeout(() => { el.style.outline = origOutline; }, 2000);
+          return {
+            success: true,
+            observation: `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (CDP clipboard paste)${truncWarn}`,
+          };
+        }
+
+        // ═══════════════════════════════════════════════════════════
         // TIER 2b: Sequential keyboard loop with jitter
         // Works on: Reddit title (ProseMirror input), Facebook, Medium,
         // any editor that listens for real keydown/keypress/keyup sequences.
         // Fires full event chain per character with 8-15ms random delay.
         // ═══════════════════════════════════════════════════════════
-        console.log('[type_text] TIER 2b: Sequential keyboard simulation (Tiers 1-2 failed)');
+        console.log('[type_text] TIER 2b: Sequential keyboard simulation (Tiers 1-2a failed)');
         try {
           // Re-focus, re-click, ensure cursor is inside the contentEditable
           el.focus();
@@ -1217,10 +1390,20 @@
           // Send element coordinates so CDP can click the exact element
           const rect = el.getBoundingClientRect();
           const cdpResult = await new Promise((resolve) => {
-            chrome.runtime.sendMessage(
-              { type: 'cdp_insert_text', text: value, elementRect: { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) } },
-              (response) => resolve(response || { success: false, error: 'No response' })
-            );
+            try {
+              chrome.runtime.sendMessage(
+                { type: 'cdp_insert_text', text: value, elementRect: { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) } },
+                (response) => {
+                  if (chrome.runtime.lastError) {
+                    resolve({ success: false, error: chrome.runtime.lastError.message });
+                  } else {
+                    resolve(response || { success: false, error: 'No response' });
+                  }
+                }
+              );
+            } catch (sendErr) {
+              resolve({ success: false, error: sendErr.message });
+            }
           });
           console.log('[type_text] Tier 3 CDP result:', cdpResult);
         } catch (e) {
@@ -1256,10 +1439,20 @@
           el.dispatchEvent(new Event('focus', { bubbles: true }));
           const rect3b = el.getBoundingClientRect();
           const cdpKeyResult = await new Promise((resolve) => {
-            chrome.runtime.sendMessage(
-              { type: 'cdp_type_keys', text: value, initializeBuffer: true, elementRect: { x: Math.round(rect3b.left + rect3b.width / 2), y: Math.round(rect3b.top + rect3b.height / 2) } },
-              (response) => resolve(response || { success: false, error: 'No response' })
-            );
+            try {
+              chrome.runtime.sendMessage(
+                { type: 'cdp_type_keys', text: value, initializeBuffer: true, elementRect: { x: Math.round(rect3b.left + rect3b.width / 2), y: Math.round(rect3b.top + rect3b.height / 2) } },
+                (response) => {
+                  if (chrome.runtime.lastError) {
+                    resolve({ success: false, error: chrome.runtime.lastError.message });
+                  } else {
+                    resolve(response || { success: false, error: 'No response' });
+                  }
+                }
+              );
+            } catch (sendErr) {
+              resolve({ success: false, error: sendErr.message });
+            }
           });
           console.log('[type_text] Tier 3b CDP key result:', cdpKeyResult);
         } catch (e) {
@@ -2372,9 +2565,17 @@
 
     const result = handler({ target, value, consentApproved });
 
-    // Handle async actions (wait)
+    // Handle async actions (type_text, wait, etc.)
     if (result instanceof Promise) {
-      result.then(sendResponse);
+      result
+        .then(sendResponse)
+        .catch((err) => {
+          console.error(`[content_explore] Async handler "${actionType}" threw:`, err);
+          sendResponse({
+            success: false,
+            error: `Handler "${actionType}" crashed: ${err.message || String(err)}`,
+          });
+        });
       return true;
     }
 
