@@ -787,6 +787,41 @@ async function safeSendMessage(tabId, message, scriptFile = 'content_explore.js'
   }
 }
 
+/**
+ * Proactive readiness check: pings content_explore.js on a tab.
+ * If the script isn't alive, injects it and verifies.
+ * Returns true if the script is ready, false if injection failed.
+ */
+async function ensureContentScriptReady(tabId) {
+  // Step 1: Ping the existing script
+  try {
+    const pong = await chrome.tabs.sendMessage(tabId, { type: 'explore_ping' });
+    if (pong?.alive) return true;
+  } catch {
+    // No listener — script not injected or channel dead
+  }
+
+  // Step 2: Inject content_explore.js
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content_explore.js'],
+    });
+  } catch (injectErr) {
+    console.warn(`[ensureContentScriptReady] Cannot inject into tab ${tabId}: ${injectErr.message}`);
+    return false;
+  }
+
+  // Step 3: Wait for script to initialize, then verify
+  await new Promise(r => setTimeout(r, 400));
+  try {
+    const pong = await chrome.tabs.sendMessage(tabId, { type: 'explore_ping' });
+    return !!pong?.alive;
+  } catch {
+    return false;
+  }
+}
+
 async function updateOrchestrationProgress(phase, detail) {
   await chrome.storage.local.set({
     orchestrationProgress: { phase, detail, timestamp: Date.now() }
@@ -1073,6 +1108,12 @@ async function executeExploreAction(tabId, action, token, _retryCount = 0) {
   // This prevents "Tabs cannot be edited right now" when user is switching tabs.
   await waitForTabReady(tabId, 8000);
 
+  // PROACTIVE READINESS: Ensure content_explore.js is alive before sending commands.
+  // This eliminates "Receiving end does not exist" errors at the source.
+  if (action.type !== 'navigate') {
+    await ensureContentScriptReady(tabId);
+  }
+
   try {
     // AUTH GATE PRE-CHECK: Before any DOM-interactive action, verify we're not on an auth page.
     // This catches session expiry mid-task (user gets redirected to login).
@@ -1179,10 +1220,25 @@ async function executeExploreAction(tabId, action, token, _retryCount = 0) {
       }
     }
 
-    // fill_field: delegate to Ghost-Driver's semantic form filler
+    // fill_field: route through content_explore.js type_text (supports Shadow DOM, rich editors)
+    // The old stageAction/Ghost-Driver path fails on Shadow DOM sites (Reddit, etc.)
     if (action.type === 'fill_field') {
+      if (!action.target && !action.value) {
+        return { success: false, error: 'No fill target or value provided' };
+      }
+      // If we have a semantic ID target, use type_text via content_explore.js directly
+      if (action.target) {
+        const result = await safeSendMessage(tabId, {
+          type: 'explore_action',
+          actionType: 'type_text',
+          target: action.target,
+          value: action.value || '',
+          consentApproved: action.consentApproved || false,
+        }, 'content_explore.js');
+        return result || { success: false, error: 'No response from type_text' };
+      }
+      // Fallback: no target SID — use old stageAction path
       const goal = action.value || action.description || '';
-      if (!goal) return { success: false, error: 'No fill description provided' };
       const result = await stageAction(tabId, goal, 'forms', token);
       return {
         success: result?.success || false,
@@ -2876,6 +2932,7 @@ async function handleMessage(request, sender) {
           pageContext.selectedText = scraped.selectedText;
           pageContext.siteType = scraped.siteType;
           pageContext.meta = scraped.meta;
+          if (scraped.formFields) pageContext.formFields = scraped.formFields;
         }
       } catch { /* Some pages block injection — proceed without */ }
     }
@@ -3399,8 +3456,8 @@ async function handleMessage(request, sender) {
   }
 
   // ── GHOST DRIVE TASK: Delegated from Command Center dashboard ──
-  // When user clicks "Delegate" on the dashboard, we inject/show the floating panel
-  // on the SAME dashboard tab and auto-fill it with the task prompt.
+  // When user clicks "Delegate" on the dashboard, open the Side Panel and auto-fill
+  // it with the task prompt.
   if (request.type === 'ghost_drive_task') {
     const payload = request.payload || {};
     const { taskId, taskTitle } = payload;

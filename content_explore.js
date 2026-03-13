@@ -2209,6 +2209,19 @@
           finalText += ` [CURRENT VALUE: "${currentValue}"]`;
         }
 
+        // Detect disabled state
+        const isDisabled = node.disabled ||
+          node.getAttribute('aria-disabled') === 'true' ||
+          node.hasAttribute('disabled') ||
+          node.classList.contains('disabled');
+
+        // Detect if this element is editable (helps AI choose type_text targets)
+        const isEditableElement = node.isContentEditable ||
+          node.getAttribute('contenteditable') === 'true' ||
+          node.getAttribute('role') === 'textbox' ||
+          node.getAttribute('role') === 'searchbox' ||
+          node.tagName === 'INPUT' || node.tagName === 'TEXTAREA';
+
         return {
           sid, type, text: finalText, attrs,
           context: parentText,
@@ -2217,6 +2230,8 @@
           depth: domDepth,                 // DOM depth for structural grouping
           duplicates: similarCount,        // count of siblings with identical text
           currentValue: currentValue,      // raw value for programmatic access
+          isEditable: isEditableElement || false,
+          isDisabled: isDisabled || false,
         };
       }
 
@@ -2494,6 +2509,12 @@
   // ── Message Listener ────────────────────────────────────────
 
   chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+    // Ping/pong readiness check — background.js uses this to verify script is alive before sending commands
+    if (request.type === 'explore_ping') {
+      sendResponse({ alive: true, url: window.location.href });
+      return true;
+    }
+
     if (request.type !== 'explore_action') return;
 
     const { actionType, target, value, consentApproved } = request;

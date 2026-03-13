@@ -168,6 +168,67 @@
     return { description: description.slice(0, 300), headings };
   }
 
+  // ── Form Field Detection ─────────────────────────────────
+  // Lightweight scan: tells the AI whether the page has interactive fields
+  // so it can choose EXPLORE/FILL_FORM instead of treating it as read-only.
+
+  function detectFormFields() {
+    const fields = [];
+    const MAX_FIELDS = 15;
+
+    // Standard inputs
+    const inputs = document.querySelectorAll(
+      'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="image"]):not([type="reset"]), ' +
+      'textarea, select, [contenteditable="true"], [role="textbox"]'
+    );
+
+    for (const el of inputs) {
+      if (fields.length >= MAX_FIELDS) break;
+      if (el.offsetParent === null && el.tagName !== 'BODY') continue; // skip hidden
+
+      const tag = el.tagName.toLowerCase();
+      const type = el.getAttribute('type') || (tag === 'textarea' ? 'textarea' : tag === 'select' ? 'select' : 'text');
+      const label =
+        el.getAttribute('aria-label') ||
+        el.getAttribute('placeholder') ||
+        el.getAttribute('name') ||
+        el.closest('label')?.textContent?.trim()?.slice(0, 60) ||
+        '';
+      const required = el.hasAttribute('required') || el.getAttribute('aria-required') === 'true';
+      const maxlength = el.getAttribute('maxlength') ? parseInt(el.getAttribute('maxlength')) : null;
+      const currentValue = (tag === 'select')
+        ? (el.options?.[el.selectedIndex]?.text || '')
+        : (el.value || el.textContent || '').slice(0, 100);
+
+      fields.push({
+        type,
+        label: label.slice(0, 80),
+        required,
+        maxlength,
+        hasValue: currentValue.length > 0,
+      });
+    }
+
+    // Buttons (submit, post, save, etc.)
+    const buttons = document.querySelectorAll('button, input[type="submit"], [role="button"]');
+    const actionButtons = [];
+    for (const btn of buttons) {
+      if (actionButtons.length >= 5) break;
+      if (btn.offsetParent === null) continue;
+      const text = (btn.textContent || btn.value || btn.getAttribute('aria-label') || '').trim().slice(0, 40);
+      if (text && /post|submit|save|send|publish|create|draft|reply|comment/i.test(text)) {
+        actionButtons.push(text);
+      }
+    }
+
+    return {
+      count: fields.length,
+      fields: fields.length > 0 ? fields : null,
+      actionButtons: actionButtons.length > 0 ? actionButtons : null,
+      hasForm: fields.length > 0,
+    };
+  }
+
   // ── Main Execution ───────────────────────────────────────
 
   const siteType = detectSiteType();
@@ -175,6 +236,7 @@
   const rawContent = findMainContent();
   const mainContent = truncate(cleanText(rawContent), MAX_CONTENT, siteType);
   const meta = extractMeta();
+  const formFields = detectFormFields();
 
   return {
     pageTitle: document.title || '',
@@ -183,5 +245,6 @@
     selectedText: selectedText.slice(0, MAX_SELECTED),
     mainContent: mainContent || '',
     meta,
+    formFields,
   };
 })();
