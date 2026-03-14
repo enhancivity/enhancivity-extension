@@ -31,7 +31,7 @@
 
   // ── Constants ────────────────────────────────────────────────
 
-  const PIPELINE_TIMEOUT_MS = 20000;
+  const PIPELINE_TIMEOUT_MS = 30000;
 
   const PLACEHOLDERS = {
     gmail:   'Analyze this email...',

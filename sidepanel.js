@@ -9,7 +9,7 @@
 
 // ── Constants ────────────────────────────────────────────────
 
-const PIPELINE_TIMEOUT_MS = 20000;
+const PIPELINE_TIMEOUT_MS = 30000;
 
 const PLACEHOLDERS = {
   gmail:   'Analyze this email...',
@@ -61,6 +61,7 @@ const memoryInd    = $('#memory-indicator');
 const settingsBtn  = $('#settings-btn');
 const byokBadge    = $('#byok-badge');
 const signOutBtn   = $('#sign-out-btn');
+const newChatBtn   = $('#new-chat-btn');
 
 // ── Truncation helper ────────────────────────────────────────
 
@@ -2442,6 +2443,17 @@ settingsBtn?.addEventListener('click', () => {
 });
 $('#settings-back-btn')?.addEventListener('click', () => showView('#main-view'));
 
+newChatBtn?.addEventListener('click', async () => {
+  conversationMessages = [];
+  resultsArea.innerHTML = '';
+  resultsArea.classList.add('hidden');
+  if (greeting) greeting.style.display = '';
+  mainError.textContent = '';
+  loadingBar.classList.add('hidden');
+  try { await chrome.storage.session.remove(convKey()); } catch {}
+  promptInput.focus();
+});
+
 signOutBtn?.addEventListener('click', async () => {
   await chrome.storage.local.clear();
   conversationMessages = [];
@@ -2452,6 +2464,12 @@ signOutBtn?.addEventListener('click', async () => {
 // ── Message Listener (from background.js) ────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Ping: lets dashboard_bridge confirm the side panel listener is alive
+  if (message.type === 'enh_sidepanel_ping') {
+    sendResponse({ alive: true });
+    return true;
+  }
+
   if (message.type === 'enh_delegate_autofill') {
     const { taskTitle, taskDescription, priority, dueDate, tags } = message.payload || {};
     if (!taskTitle) { sendResponse({ ok: false }); return true; }

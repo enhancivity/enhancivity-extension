@@ -12,7 +12,7 @@
 
   console.log('[Bridge] Dashboard bridge loading on:', window.location.href);
 
-  // ─── Helper: ensure side panel is open ──
+  // ─── Helper: ensure side panel is open & listener ready ──
   async function ensureSidePanelOpen() {
     console.log('[Bridge] Requesting side panel open from background...');
     try {
@@ -20,13 +20,39 @@
       console.log('[Bridge] Side panel open response:', response);
       if (!response?.success) return false;
 
-      // Wait for side panel to initialize
-      await new Promise(r => setTimeout(r, 600));
+      // Poll until side panel's message listener is alive (up to 3s)
+      for (let attempt = 0; attempt < 6; attempt++) {
+        await new Promise(r => setTimeout(r, 500));
+        try {
+          const ping = await chrome.runtime.sendMessage({ type: 'enh_sidepanel_ping' });
+          if (ping?.alive) {
+            console.log('[Bridge] Side panel confirmed alive after', (attempt + 1) * 500, 'ms');
+            return true;
+          }
+        } catch { /* not ready yet */ }
+      }
+
+      // Fallback: panel opened but ping never answered — proceed anyway
+      console.warn('[Bridge] Side panel opened but ping not answered — proceeding with delay');
       return true;
     } catch (err) {
       console.error('[Bridge] Side panel open failed:', err.message);
       return false;
     }
+  }
+
+  // ─── Helper: show toast notification on dashboard page ──
+  function showDashboardToast(message, type = 'error') {
+    const existing = document.getElementById('enh-bridge-toast');
+    if (existing) existing.remove();
+
+    const toast = document.createElement('div');
+    toast.id = 'enh-bridge-toast';
+    toast.textContent = message;
+    const bgColor = type === 'error' ? 'rgba(239, 68, 68, 0.9)' : 'rgba(99, 102, 241, 0.9)';
+    toast.style.cssText = `position:fixed;bottom:24px;right:24px;z-index:99999;padding:12px 20px;border-radius:10px;background:${bgColor};color:#fff;font-size:13px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;backdrop-filter:blur(8px);box-shadow:0 4px 12px rgba(0,0,0,0.3);transition:opacity 0.3s;`;
+    document.body.appendChild(toast);
+    setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 4000);
   }
 
   // ─── Dashboard → Extension ──────────────────────────────
@@ -69,15 +95,26 @@
 
       if (!panelReady) {
         console.error('[Bridge] Could not open side panel — delegation aborted');
+        showDashboardToast('Could not open Enhancivity panel. Make sure the extension is installed and try again.');
         return;
       }
 
       // Send auto-fill to side panel via chrome.runtime.sendMessage
       console.log('[Bridge] Sending auto-fill to side panel via runtime message');
-      chrome.runtime.sendMessage({
-        type: 'enh_delegate_autofill',
-        payload,
-      }).catch(err => console.error('[Bridge] Auto-fill send failed:', err.message));
+      try {
+        const fillRes = await chrome.runtime.sendMessage({
+          type: 'enh_delegate_autofill',
+          payload,
+        });
+        if (fillRes?.ok) {
+          showDashboardToast('Task sent to Enhancivity — check the side panel', 'info');
+        } else {
+          showDashboardToast('Side panel is open but could not auto-fill. Try typing the task manually.');
+        }
+      } catch (err) {
+        console.error('[Bridge] Auto-fill send failed:', err.message);
+        showDashboardToast('Could not send task to side panel. Try again.');
+      }
     }
 
     // ── BRIEFING_ACTION: Briefing dynamic action button ──
@@ -101,16 +138,25 @@
 
       if (!panelReady) {
         console.error('[Bridge] Could not open side panel — briefing action aborted');
+        showDashboardToast('Could not open Enhancivity panel. Make sure the extension is installed and try again.');
         return;
       }
 
       // Send briefing action to side panel via chrome.runtime.sendMessage
       console.log('[Bridge] Sending briefing action to side panel via runtime message');
-      chrome.runtime.sendMessage({
-        type: 'ENHANCIVITY_BRIEFING_ACTION',
-        source: BRIDGE_SOURCE,
-        payload,
-      }).catch(err => console.error('[Bridge] Briefing action send failed:', err.message));
+      try {
+        const actionRes = await chrome.runtime.sendMessage({
+          type: 'ENHANCIVITY_BRIEFING_ACTION',
+          source: BRIDGE_SOURCE,
+          payload,
+        });
+        if (!actionRes?.ok) {
+          showDashboardToast('Side panel is open but action could not be sent. Try again.');
+        }
+      } catch (err) {
+        console.error('[Bridge] Briefing action send failed:', err.message);
+        showDashboardToast('Could not send action to side panel. Try again.');
+      }
     }
   });
 

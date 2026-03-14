@@ -40,10 +40,13 @@
 
   // Extended sensitive field patterns — checked against name, id, placeholder, aria-label
   const SENSITIVE_FIELD_PATTERNS = [
-    'password', 'passwd', 'pass', 'secret', 'credential',
-    'pin', 'ssn', 'cvv', 'cvc', 'card-number', 'credit-card',
+    'password', 'passwd', 'secret', 'credential',
+    'ssn', 'cvv', 'cvc', 'card-number', 'credit-card',
     'cardnumber', 'securitycode', 'security-code',
   ];
+  // NOTE: 'pass' removed — too broad, matches "passport", "bypass", "payment_pass", etc.
+  // NOTE: 'pin' removed — too broad, matches "pinned", "opinion", "shopping", etc.
+  // 'password' and 'passwd' still catch actual password fields.
 
   // Auth form action URL patterns — inputs inside these forms are sensitive
   const AUTH_FORM_ACTION_PATTERNS = [
@@ -548,6 +551,19 @@
       if (isSensitiveElement(el)) {
         return { success: false, error: 'BLOCKED: Sensitive field — cannot interact', blocked: true };
       }
+
+      // ANTI-EXPORT GUARD: Block clicks on Export/Download buttons and redirect AI to scrape_table
+      const elText = (el.innerText || el.value || el.textContent || '').toLowerCase().trim();
+      const EXPORT_EXACT = new Set(['export', 'download', 'download csv', 'export csv', 'export to csv', 'download xlsx']);
+      const EXPORT_PHRASE = ['export data', 'export all', 'download report', 'export report'];
+      if (!consentApproved && (EXPORT_EXACT.has(elText) || EXPORT_PHRASE.some(p => elText.includes(p)))) {
+        return {
+          success: false,
+          error: 'ANTI-EXPORT: Do NOT click Export/Download buttons — downloaded files cannot be read by the agent. Instead, use scrape_table to read the data directly from the visible table on the page. If there is pagination, scrape each page. The user asked to extract/transfer data, not download a file.',
+          blocked: true,
+        };
+      }
+
       // Dangerous button check — bypassed when user already approved via consent card
       if (!consentApproved && isDangerousClick(el)) {
         return { success: false, error: 'BLOCKED: This button performs a consequential action (submit/post/send/delete). Set needsConsent=true to request user approval first.', blocked: true };
@@ -576,13 +592,24 @@
       el.style.outline = '2px solid #6366f1';
       setTimeout(() => { el.style.outline = origOutline; }, 1500);
 
+      // Capture DOM state before click to detect dropdown/menu appearance
+      const MENU_SELECTORS = '[role="menu"], [role="listbox"], [role="dialog"], [aria-expanded="true"], [class*="dropdown"], [class*="popover"], [class*="menu-panel"], [class*="Popover"], [class*="Dropdown"], [class*="flyout"], [class*="Flyout"]';
+      const visibleElementsBefore = document.querySelectorAll(MENU_SELECTORS).length;
+
       el.click();
 
       // Read what's nearby after click for observation
       const parentText = (el.parentElement?.innerText || '').trim().slice(0, 300);
+
+      // Quick synchronous check — did a menu appear immediately?
+      const visibleElementsAfter = document.querySelectorAll(MENU_SELECTORS).length;
+      const menuAppeared = visibleElementsAfter > visibleElementsBefore;
+      const menuHint = menuAppeared ? ' A dropdown/menu appeared after clicking.' : '';
+
       return {
         success: true,
-        observation: `Clicked "${(el.innerText || el.textContent || '').trim().slice(0, 100)}". Nearby text: ${parentText}`,
+        observation: `Clicked "${(el.innerText || el.textContent || '').trim().slice(0, 100)}".${menuHint} Nearby text: ${parentText}`,
+        menuAppeared,
       };
     },
 
@@ -597,7 +624,7 @@
         };
       }
 
-      const text = (el.innerText || el.textContent || '').trim().slice(0, 3000);
+      const text = (el.innerText || el.textContent || '').trim().slice(0, 5000);
       return { success: true, observation: text || '(empty element)' };
     },
 
@@ -1033,26 +1060,34 @@
         el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
         el.dispatchEvent(new Event('focus', { bubbles: true }));
 
-        const nativeSetter =
-          Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set ||
-          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+        // Native setter — wrapped in try/catch because it throws "Illegal invocation"
+        // on Shadow DOM inputs (Reddit shreddit-*, Salesforce lightning-input, Angular Material, etc.)
+        // If it throws, we fall through to execCommand → keyboard simulation → CDP.
+        let valueSet = false;
+        try {
+          const nativeSetter =
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set ||
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
 
-        // Clear existing value — use native setter directly, NO el.select() (causes blue highlight)
-        if (nativeSetter) nativeSetter.call(el, '');
-        else el.value = '';
-        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+          // Clear existing value — use native setter directly, NO el.select() (causes blue highlight)
+          if (nativeSetter) nativeSetter.call(el, '');
+          else el.value = '';
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
 
-        // Set the new value
-        if (nativeSetter) nativeSetter.call(el, value);
-        else el.value = value;
-        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
+          // Set the new value
+          if (nativeSetter) nativeSetter.call(el, value);
+          else el.value = value;
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
 
-        // Verify
-        const actualValue = el.value;
-        const valueSet = actualValue === value;
+          // Verify
+          valueSet = el.value === value;
+        } catch (nativeErr) {
+          console.log('[type_text] Native setter threw (Shadow DOM input?):', nativeErr.message, '— falling through to execCommand/keyboard/CDP');
+          valueSet = false;
+        }
 
-        // If native setter didn't work, try execCommand then CDP
+        // If native setter didn't work or threw, try execCommand then CDP
         if (!valueSet) {
           console.log('[type_text] Native setter failed. Trying execCommand...');
           el.focus();
@@ -1615,6 +1650,172 @@
       });
     },
 
+    // ── PRESS KEY: Press a single navigation/control key on focused element ──
+    async press_key({ value }) {
+      if (!value || typeof value !== 'string') {
+        return { success: false, error: 'No key name provided. Use value: "Tab", "Enter", "Escape", "ArrowDown", etc.' };
+      }
+
+      const KEY_MAP = {
+        'Tab':        { key: 'Tab',        code: 'Tab',        keyCode: 9 },
+        'Enter':      { key: 'Enter',      code: 'Enter',      keyCode: 13 },
+        'Escape':     { key: 'Escape',     code: 'Escape',     keyCode: 27 },
+        'ArrowDown':  { key: 'ArrowDown',  code: 'ArrowDown',  keyCode: 40 },
+        'ArrowUp':    { key: 'ArrowUp',    code: 'ArrowUp',    keyCode: 38 },
+        'ArrowLeft':  { key: 'ArrowLeft',  code: 'ArrowLeft',  keyCode: 37 },
+        'ArrowRight': { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
+        'Backspace':  { key: 'Backspace',  code: 'Backspace',  keyCode: 8 },
+        'Delete':     { key: 'Delete',     code: 'Delete',     keyCode: 46 },
+        'Home':       { key: 'Home',       code: 'Home',       keyCode: 36 },
+        'End':        { key: 'End',        code: 'End',        keyCode: 35 },
+      };
+
+      const keyInfo = KEY_MAP[value];
+      if (!keyInfo) {
+        return {
+          success: false,
+          error: `Unknown key: "${value}". Allowed keys: ${Object.keys(KEY_MAP).join(', ')}`,
+        };
+      }
+
+      const focusedBefore = document.activeElement;
+
+      // ── Tier 1: DOM KeyboardEvent dispatch ──
+      const target = document.activeElement || document.body;
+      const eventInit = {
+        key: keyInfo.key,
+        code: keyInfo.code,
+        keyCode: keyInfo.keyCode,
+        which: keyInfo.keyCode,
+        bubbles: true,
+        cancelable: true,
+      };
+
+      target.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+      target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+
+      // Wait briefly for the app to process the key
+      await new Promise(r => setTimeout(r, 80));
+
+      // ── Tier 2: CDP fallback for canvas editors (Excel Online, Google Sheets) ──
+      // Detect if the key press had no visible effect (focus didn't change for Tab,
+      // or we're on a canvas-heavy page)
+      const focusedAfter = document.activeElement;
+      const hasCanvas = !!document.querySelector('canvas');
+      const focusUnchanged = focusedBefore === focusedAfter;
+      const needsCDP = hasCanvas && focusUnchanged && (value === 'Tab' || value === 'Enter' || value.startsWith('Arrow'));
+
+      if (needsCDP) {
+        try {
+          const cdpResult = await new Promise((resolve) => {
+            chrome.runtime.sendMessage({
+              type: 'cdp_press_key',
+              key: keyInfo.key,
+              code: keyInfo.code,
+              keyCode: keyInfo.keyCode,
+            }, (response) => {
+              resolve(response || { success: false, error: 'No response from CDP handler' });
+            });
+          });
+
+          if (cdpResult.success) {
+            return { success: true, observation: `Pressed ${value} key (via CDP — canvas editor detected)` };
+          }
+          // CDP also failed — report DOM result anyway
+          console.warn('[press_key] CDP fallback also failed:', cdpResult.error);
+        } catch (cdpErr) {
+          console.warn('[press_key] CDP fallback error:', cdpErr.message);
+        }
+      }
+
+      return { success: true, observation: `Pressed ${value} key` };
+    },
+
+    // ═══════════════════════════════════════════════════════════
+    // paste_tsv: Bulk-paste TSV data into spreadsheets via clipboard + CDP Ctrl+V
+    // Writes TSV to system clipboard, then triggers trusted Ctrl+V via CDP.
+    // Google Sheets, Excel Online, LibreOffice Online auto-distribute TSV across cells.
+    // ═══════════════════════════════════════════════════════════
+    async paste_tsv({ value }) {
+      if (!value || typeof value !== 'string' || !value.trim()) {
+        return { success: false, error: 'paste_tsv requires TSV data in the value field. Save data to extractedData first, then use value "__USE_SCRATCHPAD__".' };
+      }
+
+      const tsvData = value.trim();
+      const rows = tsvData.split('\n');
+      const colCount = rows.length > 0 ? rows[0].split('\t').length : 0;
+      const rowCount = rows.length;
+
+      // Cap at 64KB to prevent memory issues
+      if (tsvData.length > 64000) {
+        return { success: false, error: `TSV data too large (${tsvData.length} chars, max 64000). Reduce the dataset or split into batches.` };
+      }
+
+      // Write TSV to system clipboard
+      let clipboardWritten = false;
+      try {
+        await navigator.clipboard.writeText(tsvData);
+        clipboardWritten = true;
+        console.log('[paste_tsv] navigator.clipboard.writeText succeeded');
+      } catch (clipErr) {
+        console.log('[paste_tsv] navigator.clipboard failed, trying execCommand copy fallback:', clipErr.message);
+        const tempTA = document.createElement('textarea');
+        tempTA.value = tsvData;
+        tempTA.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0';
+        document.body.appendChild(tempTA);
+        tempTA.select();
+        clipboardWritten = document.execCommand('copy');
+        document.body.removeChild(tempTA);
+        console.log('[paste_tsv] execCommand copy fallback result:', clipboardWritten);
+      }
+
+      if (!clipboardWritten) {
+        return { success: false, error: 'Could not write TSV data to clipboard. Clipboard API and execCommand both failed.' };
+      }
+
+      // Find the active/focused element to get coordinates for CDP click
+      const activeEl = document.activeElement;
+      let rect = { x: 300, y: 300 }; // default center-ish if no focused element
+      if (activeEl && activeEl !== document.body) {
+        const elRect = activeEl.getBoundingClientRect();
+        rect = {
+          x: Math.round(elRect.left + elRect.width / 2),
+          y: Math.round(elRect.top + elRect.height / 2),
+        };
+      }
+
+      // Ask background.js to send trusted Ctrl+V via CDP (reuses existing cdp_paste handler)
+      const cdpResult = await new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage(
+            { type: 'cdp_paste', elementRect: rect },
+            (response) => {
+              if (chrome.runtime.lastError) {
+                resolve({ success: false, error: chrome.runtime.lastError.message });
+              } else {
+                resolve(response || { success: false, error: 'No response from CDP paste' });
+              }
+            }
+          );
+        } catch (sendErr) {
+          resolve({ success: false, error: sendErr.message });
+        }
+      });
+
+      if (!cdpResult.success) {
+        return {
+          success: false,
+          error: `Clipboard written but CDP Ctrl+V failed: ${cdpResult.error}. The data is in the clipboard — user can manually press Ctrl+V to paste.`,
+        };
+      }
+
+      console.log(`[paste_tsv] Successfully pasted ${rowCount} rows × ${colCount} columns`);
+      return {
+        success: true,
+        observation: `Pasted ${rowCount} rows × ${colCount} columns of TSV data into the spreadsheet via clipboard Ctrl+V. Use scrape_page to verify the data landed correctly.`,
+      };
+    },
+
     scroll_to_sid({ target }) {
       if (!target) return { success: false, error: 'No semantic ID provided for scroll' };
 
@@ -1685,10 +1886,128 @@
       };
     },
 
+    // ── Bulk Table Scraper: reads ALL visible table/grid data in one action ──
+    scrape_table({ value }) {
+      const maxChars = parseInt(value) || 32000;
+      const tables = [];
+
+      // Strategy 1: HTML <table> elements
+      const htmlTables = document.querySelectorAll('table');
+      for (const table of htmlTables) {
+        // Skip hidden/tiny tables (nav bars, layout tables)
+        if (table.offsetWidth < 100 || table.offsetHeight < 30) continue;
+        if (table.closest('nav, footer, header')) continue;
+
+        const rows = [];
+        const trElements = table.querySelectorAll('tr');
+        for (const tr of trElements) {
+          const cells = tr.querySelectorAll('th, td');
+          if (cells.length === 0) continue;
+          const row = [];
+          for (const cell of cells) {
+            // Get clean text, collapse whitespace
+            const text = (cell.innerText || cell.textContent || '').trim().replace(/\s+/g, ' ');
+            row.push(text);
+          }
+          rows.push(row.join('\t'));
+        }
+        if (rows.length > 0) {
+          tables.push(rows.join('\n'));
+        }
+      }
+
+      // Strategy 2: ARIA grid/table roles (Notion, Airtable, custom grids)
+      if (tables.length === 0) {
+        const grids = document.querySelectorAll('[role="grid"], [role="table"], [role="treegrid"]');
+        for (const grid of grids) {
+          if (grid.offsetWidth < 100 || grid.offsetHeight < 30) continue;
+          const rows = [];
+          const rowElements = grid.querySelectorAll('[role="row"]');
+          for (const rowEl of rowElements) {
+            const cells = rowEl.querySelectorAll('[role="gridcell"], [role="cell"], [role="columnheader"], [role="rowheader"]');
+            if (cells.length === 0) continue;
+            const row = [];
+            for (const cell of cells) {
+              const text = (cell.innerText || cell.textContent || '').trim().replace(/\s+/g, ' ');
+              row.push(text);
+            }
+            rows.push(row.join('\t'));
+          }
+          if (rows.length > 0) {
+            tables.push(rows.join('\n'));
+          }
+        }
+      }
+
+      // Strategy 3: Notion-specific database views (collection views with .notion-table-view)
+      if (tables.length === 0) {
+        const notionViews = document.querySelectorAll('.notion-table-view, .notion-collection_view-block, .notion-list-view, .notion-board-view');
+        for (const view of notionViews) {
+          const rows = [];
+          // Notion uses nested divs as rows with specific data attributes
+          const rowDivs = view.querySelectorAll('[data-block-id]');
+          const seenBlocks = new Set();
+          for (const div of rowDivs) {
+            const blockId = div.getAttribute('data-block-id');
+            if (seenBlocks.has(blockId)) continue;
+            seenBlocks.add(blockId);
+            // Each Notion row has cell divs inside
+            const cellDivs = div.querySelectorAll('.notion-table-view-cell, [data-content-editable-leaf], .notion-page-block');
+            if (cellDivs.length === 0) continue;
+            const row = [];
+            for (const cell of cellDivs) {
+              const text = (cell.innerText || cell.textContent || '').trim().replace(/\s+/g, ' ');
+              if (text) row.push(text);
+            }
+            if (row.length > 0) rows.push(row.join('\t'));
+          }
+          if (rows.length > 0) {
+            tables.push(rows.join('\n'));
+          }
+        }
+      }
+
+      // Strategy 4: Generic repeating-row pattern (lists, cards with consistent structure)
+      if (tables.length === 0) {
+        // Look for repeated list-like structures
+        const listContainers = document.querySelectorAll('[role="list"], [role="listbox"], ul, ol');
+        for (const list of listContainers) {
+          if (list.offsetWidth < 100 || list.offsetHeight < 30) continue;
+          if (list.closest('nav, footer, header, [role="navigation"]')) continue;
+          const items = list.querySelectorAll('[role="listitem"], [role="option"], li');
+          if (items.length < 2) continue; // Need at least 2 items to be a data list
+          const rows = [];
+          for (const item of items) {
+            const text = (item.innerText || item.textContent || '').trim().replace(/\s+/g, ' ');
+            if (text && text.length > 1) rows.push(text);
+          }
+          if (rows.length >= 2) {
+            tables.push(rows.join('\n'));
+          }
+        }
+      }
+
+      if (tables.length === 0) {
+        return {
+          success: false,
+          observation: 'No tables, grids, or structured data found on this page. Try scrape_page or read_element instead.',
+        };
+      }
+
+      // Combine all tables with separators, cap at maxChars
+      const combined = tables.join('\n---TABLE_BREAK---\n').slice(0, maxChars);
+      const rowCount = combined.split('\n').filter(l => l.trim() && l !== '---TABLE_BREAK---').length;
+
+      return {
+        success: true,
+        observation: `Scraped ${tables.length} table(s), ${rowCount} total rows:\n${combined}`,
+      };
+    },
+
     take_snapshot() {
       // Build a compact semantic map
-      // Increased to 80 to capture form fields on complex pages (Facebook Ads, etc.)
-      const MAX_ELEMENTS = 80;
+      // Increased to 100 to capture dropdown/menu items that appear after clicks
+      const MAX_ELEMENTS = 100;
       const elements = [];
       let counter = 0;
 
@@ -1697,30 +2016,42 @@
       // patterns (class names, aria-labels, SVG classes) to meanings.
       const ICON_MEANINGS = {
         'settings': 'Settings', 'gear': 'Settings', 'cog': 'Settings', 'config': 'Settings',
+        'preferences': 'Settings', 'options': 'Settings', 'sliders': 'Settings', 'wrench': 'Settings', 'tool': 'Settings',
         'profile': 'Profile/Account', 'person': 'Profile/Account', 'user': 'Profile/Account',
-        'avatar': 'Profile/Account', 'account': 'Profile/Account',
+        'avatar': 'Profile/Account', 'account': 'Profile/Account', 'my-account': 'Profile/Account',
+        'user-circle': 'Profile/Account', 'user-menu': 'Profile/Account', 'portrait': 'Profile/Account',
         'notification': 'Notifications', 'bell': 'Notifications', 'alert': 'Notifications',
-        'search': 'Search', 'magnify': 'Search', 'find': 'Search',
+        'search': 'Search', 'magnify': 'Search', 'find': 'Search', 'magnifying': 'Search',
         'edit': 'Edit', 'pencil': 'Edit', 'pen': 'Edit', 'compose': 'Edit/Compose',
         'delete': 'Delete', 'trash': 'Delete', 'remove': 'Delete', 'bin': 'Delete',
         'close': 'Close', 'dismiss': 'Close', 'x-mark': 'Close',
-        'menu': 'Menu', 'hamburger': 'Menu', 'nav': 'Menu',
-        'home': 'Home', 'house': 'Home',
+        'menu': 'Menu', 'hamburger': 'Menu', 'nav': 'Menu', 'dots': 'More Options',
+        'more': 'More Options', 'ellipsis': 'More Options', 'kebab': 'More Options', 'meatball': 'More Options',
+        'three-dot': 'More Options', 'overflow': 'More Options',
+        'home': 'Home', 'house': 'Home', 'dashboard': 'Dashboard',
         'mail': 'Email/Mail', 'envelope': 'Email/Mail', 'inbox': 'Email/Mail',
         'share': 'Share', 'export': 'Share/Export',
         'download': 'Download', 'save': 'Save',
-        'upload': 'Upload', 'attach': 'Attach',
+        'upload': 'Upload', 'attach': 'Attach', 'paperclip': 'Attach',
         'cart': 'Shopping Cart', 'basket': 'Shopping Cart', 'bag': 'Shopping Cart',
-        'help': 'Help', 'question': 'Help', 'support': 'Help',
-        'logout': 'Log Out', 'signout': 'Log Out', 'sign-out': 'Log Out',
+        'help': 'Help', 'question': 'Help', 'support': 'Help', 'info': 'Info',
+        'logout': 'Log Out', 'signout': 'Log Out', 'sign-out': 'Log Out', 'log-out': 'Log Out',
         'back': 'Go Back', 'arrow-left': 'Go Back', 'previous': 'Go Back',
         'forward': 'Go Forward', 'arrow-right': 'Go Forward', 'next': 'Go Forward',
         'refresh': 'Refresh', 'reload': 'Refresh',
-        'filter': 'Filter', 'sort': 'Sort',
+        'filter': 'Filter', 'sort': 'Sort', 'funnel': 'Filter',
         'add': 'Add/Create', 'plus': 'Add/Create', 'new': 'Add/Create',
         'calendar': 'Calendar/Schedule', 'date': 'Calendar/Schedule',
-        'chart': 'Analytics/Charts', 'graph': 'Analytics/Charts', 'stats': 'Analytics/Charts',
+        'chart': 'Analytics/Charts', 'graph': 'Analytics/Charts', 'stats': 'Analytics/Charts', 'usage': 'Usage/Analytics',
         'lock': 'Security/Privacy', 'shield': 'Security/Privacy', 'privacy': 'Security/Privacy',
+        'expand': 'Expand', 'collapse': 'Collapse', 'chevron': 'Expand/Collapse',
+        'copy': 'Copy', 'clipboard': 'Copy', 'duplicate': 'Duplicate',
+        'pin': 'Pin', 'bookmark': 'Bookmark', 'star': 'Favorite',
+        'eye': 'View/Visibility', 'visibility': 'View/Visibility', 'preview': 'Preview',
+        'sidebar': 'Sidebar', 'panel': 'Panel', 'layout': 'Layout',
+        'billing': 'Billing', 'credit-card': 'Billing', 'payment': 'Payment',
+        'team': 'Team/Members', 'group': 'Team/Members', 'people': 'Team/Members',
+        'link': 'Link', 'chain': 'Link', 'external': 'External Link',
       };
 
       function getIconMeaning(node) {
@@ -1729,15 +2060,26 @@
         if (node.className && typeof node.className === 'string') searchStrings.push(node.className.toLowerCase());
         if (node.getAttribute('aria-label')) searchStrings.push(node.getAttribute('aria-label').toLowerCase());
         if (node.getAttribute('title')) searchStrings.push(node.getAttribute('title').toLowerCase());
-        // Check data- attributes
+        // Check data- attributes (data-testid, data-icon, data-label, etc.)
         for (const attr of node.attributes || []) {
           if (attr.name.startsWith('data-') && attr.value) searchStrings.push(attr.value.toLowerCase());
         }
-        // Check child SVG and icon element class names
-        const iconChildren = node.querySelectorAll('svg, [class*="icon"], [class*="Icon"], i');
+        // Check child SVG and icon element class names, plus <use> href (sprite icons)
+        const iconChildren = node.querySelectorAll('svg, [class*="icon"], [class*="Icon"], i, img');
         for (const child of iconChildren) {
           if (child.className && typeof child.className === 'string') searchStrings.push(child.className.toLowerCase());
           if (child.getAttribute && child.getAttribute('aria-label')) searchStrings.push(child.getAttribute('aria-label').toLowerCase());
+          // SVG <use> elements reference sprite icons via href/xlink:href
+          const useEls = child.tagName === 'SVG' ? child.querySelectorAll('use') : [];
+          for (const use of useEls) {
+            const href = use.getAttribute('href') || use.getAttribute('xlink:href') || '';
+            if (href) searchStrings.push(href.toLowerCase());
+          }
+          // Check data-testid on icon children (common in React apps)
+          const testId = child.getAttribute && child.getAttribute('data-testid');
+          if (testId) searchStrings.push(testId.toLowerCase());
+          // Check img alt text
+          if (child.tagName === 'IMG' && child.alt) searchStrings.push(child.alt.toLowerCase());
         }
 
         const combined = searchStrings.join(' ');
@@ -1803,7 +2145,7 @@
           return 'button';
         }
         // Detect clickable elements with tabindex and role
-        if (role === 'link' || role === 'tab' || role === 'menuitem') return 'button';
+        if (role === 'link' || role === 'tab' || role === 'menuitem' || role === 'option' || role === 'menuitemradio' || role === 'menuitemcheckbox' || role === 'treeitem') return 'button';
         return null;
       }
 
@@ -1889,6 +2231,45 @@
             if (label) return `[empty] ${label}`.slice(0, 120);
           }
 
+          // ── CLICKABLE ELEMENT FALLBACK ──
+          // Buttons/links with no text AND no icon meaning must still appear in the
+          // semantic map — they could be icon-only menu triggers, avatar buttons, etc.
+          // Generate a descriptive fallback from element attributes and structure.
+          {
+            const elTag = node.tagName;
+            const elRole = node.getAttribute('role');
+            const isClickable = elTag === 'BUTTON' || elTag === 'A' || elRole === 'button' ||
+              elRole === 'link' || elRole === 'tab' || elRole === 'menuitem' ||
+              node.getAttribute('tabindex') === '0';
+
+            if (isClickable) {
+              // Try to describe the button from its children (e.g., <img>, <span>, etc.)
+              const childImg = node.querySelector('img');
+              if (childImg && childImg.alt) return `[${childImg.alt}]`;
+
+              // Check if it contains an SVG (icon button with unknown icon)
+              const hasSvg = node.querySelector('svg');
+              const hasImg = node.querySelector('img');
+
+              // Build a fallback label
+              const elAriaLabel = node.getAttribute('aria-label');
+              if (elAriaLabel) return elAriaLabel;
+
+              const elId = node.getAttribute('id');
+              const elName = node.getAttribute('name');
+              const testId = node.getAttribute('data-testid');
+
+              const fallbackLabel = testId ? `[${testId}]` :
+                elId ? `[${elId} button]` :
+                elName ? `[${elName} button]` :
+                hasSvg ? '[icon button]' :
+                hasImg ? '[image button]' :
+                `[unlabeled ${elTag.toLowerCase()}]`;
+
+              return fallbackLabel;
+            }
+          }
+
           return '';
         }
 
@@ -1908,6 +2289,9 @@
           '[role="dialog"]',
           '[role="alertdialog"]',
           '[aria-modal="true"]',
+          '[role="menu"]',
+          '[role="listbox"]',
+          '[role="tooltip"][aria-expanded="true"]',
           '.modal:not(.modal-hidden):not([style*="display: none"])',
           '.dialog:not([style*="display: none"])',
           '.overlay:not([style*="display: none"])',
@@ -1917,8 +2301,21 @@
           '[class*="Dialog"]:not([style*="display: none"])',
           '[class*="popup"]:not([style*="display: none"])',
           '[class*="Popup"]:not([style*="display: none"])',
+          '[class*="popover"]:not([style*="display: none"])',
+          '[class*="Popover"]:not([style*="display: none"])',
+          '[class*="dropdown"]:not([style*="display: none"])',
+          '[class*="Dropdown"]:not([style*="display: none"])',
+          '[class*="drop-down"]:not([style*="display: none"])',
+          '[class*="menu-panel"]:not([style*="display: none"])',
+          '[class*="MenuPanel"]:not([style*="display: none"])',
+          '[class*="context-menu"]:not([style*="display: none"])',
           '[class*="drawer"]:not([style*="display: none"])',
           '[class*="Drawer"]:not([style*="display: none"])',
+          '[class*="flyout"]:not([style*="display: none"])',
+          '[class*="Flyout"]:not([style*="display: none"])',
+          // Expanded dropdown triggers often have adjacent visible menus
+          '[aria-expanded="true"] + [role="menu"]',
+          '[aria-expanded="true"] + [role="listbox"]',
         ];
 
         const modals = [];
@@ -1929,7 +2326,8 @@
               // Skip if already found, hidden, or too small to be a real modal
               if (seen.has(el)) continue;
               const rect = el.getBoundingClientRect();
-              if (rect.width < 100 || rect.height < 50) continue;
+              // Dropdown menus can be narrow — use smaller thresholds
+              if (rect.width < 40 || rect.height < 30) continue;
               if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') continue;
               seen.add(el);
               modals.push(el);
@@ -2222,6 +2620,23 @@
           node.getAttribute('role') === 'searchbox' ||
           node.tagName === 'INPUT' || node.tagName === 'TEXTAREA';
 
+        // ── Lightweight Positional Data ──
+        // Compute a human-readable screen region (e.g., "top-right", "bottom-left", "center")
+        // so the AI can distinguish a profile icon in the top-right from sidebar nav items.
+        let pos = null;
+        try {
+          const rect = node.getBoundingClientRect();
+          const vw = window.innerWidth || document.documentElement.clientWidth;
+          const vh = window.innerHeight || document.documentElement.clientHeight;
+          if (rect.width > 0 && rect.height > 0) {
+            const cx = rect.left + rect.width / 2;
+            const cy = rect.top + rect.height / 2;
+            const hZone = cx < vw * 0.3 ? 'left' : cx > vw * 0.7 ? 'right' : 'center';
+            const vZone = cy < vh * 0.25 ? 'top' : cy > vh * 0.75 ? 'bottom' : 'middle';
+            pos = vZone === 'middle' ? (hZone === 'center' ? 'center' : `middle-${hZone}`) : `${vZone}-${hZone}`;
+          }
+        } catch {}
+
         return {
           sid, type, text: finalText, attrs,
           context: parentText,
@@ -2232,6 +2647,7 @@
           currentValue: currentValue,      // raw value for programmatic access
           isEditable: isEditableElement || false,
           isDisabled: isDisabled || false,
+          pos,                             // screen region: "top-right", "bottom-left", etc.
         };
       }
 
@@ -2548,15 +2964,18 @@
       'scroll':        'scroll_page',
       'scroll_to':     'scroll_to_sid',
       'scrape_page':   'extract_visible_text',
+      'scrape_table':  'scrape_table',
       'wait':          'wait',
       'take_snapshot': 'take_snapshot',
       'dom_fingerprint': 'dom_fingerprint',
       'resolve_element': 'resolve_element',
+      'press_key':       'press_key',
+      'paste_tsv':       'paste_tsv',
     };
 
     // SECURITY: Block fill_field and type_text entirely on login/auth pages
     // Triple-check: AuthGateDetector + URL patterns + password field presence + auth domains
-    if (actionType === 'fill_field' || actionType === 'type_text' || actionType === 'select_option') {
+    if (actionType === 'fill_field' || actionType === 'type_text' || actionType === 'select_option' || actionType === 'press_key' || actionType === 'paste_tsv') {
       const authCheck = AuthGateDetector.detect();
       const currentUrl = window.location.href.toLowerCase();
       const hardLoginPatterns = ['signin', 'sign-in', 'login', 'log-in', '/auth/', '/oauth/', '/sso/', '/ap/signin', '/accounts/login', '/servicelogin', '/session/new', '/password', '/users/sign_in', '/account/login', '/authenticate', '/uc/login', '/id/signin', '/idp/login'];

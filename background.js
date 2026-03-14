@@ -722,15 +722,83 @@ async function waitForDomStable(tabId, maxWaitMs = 3000, intervalMs = 300) {
   }
 }
 
+// ── Response Timeout ────────────────────────────────────────
+// Wraps chrome.tabs.sendMessage in Promise.race against a timeout.
+// Prevents orphaned async handlers (type_text, press_key, wait) from
+// hanging forever when a SPA re-render kills the content script mid-execution.
+const RESPONSE_TIMEOUT_MS = 15000; // 15s — covers type_text 3-tier cascade + wait action
+
+async function sendWithTimeout(tabId, message, timeoutMs = RESPONSE_TIMEOUT_MS) {
+  return Promise.race([
+    chrome.tabs.sendMessage(tabId, message),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('RESPONSE_TIMEOUT')), timeoutMs)
+    ),
+  ]);
+}
+
+// ── Ping-Confirmed Readiness ────────────────────────────────
+// Replaces fixed 400ms waits. Polls explore_ping every 100ms until
+// the content script confirms { alive: true } or maxWaitMs expires.
+// On stable sites (Facebook), first ping returns instantly (faster than 400ms).
+// On aggressive SPAs (Reddit), waits up to 3s for React hydration.
+async function waitForPing(tabId, maxWaitMs = 3000, intervalMs = 100) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const pong = await chrome.tabs.sendMessage(tabId, { type: 'explore_ping' });
+      if (pong?.alive) return true;
+    } catch {
+      // Script not ready yet — keep polling
+    }
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return false;
+}
+
+// ── Injection Guard ─────────────────────────────────────────
+// Prevents redundant chrome.scripting.executeScript calls when multiple
+// callers (SPA nav listener + ensureContentScriptReady) try to inject
+// into the same tab concurrently. Second caller awaits the first's result.
+const _pendingInjections = new Map(); // tabId → Promise<boolean>
+
+async function injectAndConfirm(tabId, scriptFile = 'content_explore.js') {
+  const existing = _pendingInjections.get(tabId);
+  if (existing) {
+    console.log(`[safeSendMessage] Injection already in-flight for tab ${tabId}, awaiting...`);
+    return existing;
+  }
+
+  const injectionPromise = (async () => {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: [scriptFile],
+      });
+    } catch (injectErr) {
+      console.warn(`[safeSendMessage] Cannot inject ${scriptFile} into tab ${tabId}: ${injectErr.message}`);
+      return false;
+    }
+    const ready = await waitForPing(tabId, 3000, 100);
+    if (!ready) {
+      console.warn(`[safeSendMessage] ${scriptFile} injected but never responded to ping on tab ${tabId}`);
+    }
+    return ready;
+  })();
+
+  _pendingInjections.set(tabId, injectionPromise);
+  try {
+    return await injectionPromise;
+  } finally {
+    _pendingInjections.delete(tabId);
+  }
+}
+
 // ── Safe Message Sender ─────────────────────────────────────
-// Wraps chrome.tabs.sendMessage with automatic re-injection + retry.
-// If the content script's message channel is dead (SPA navigation,
-// tab suspension, extension reload), this re-injects the script and
-// retries once. Returns a proper error object instead of silent null.
-//
-// `scriptFile` — which content script to re-inject on failure (default: content_explore.js)
-// `message`    — the message object to send
-// `tabId`      — target tab
+// Wraps chrome.tabs.sendMessage with timeout protection, automatic
+// re-injection via injectAndConfirm (ping-confirmed readiness), and retry.
+// If the content script's async handler dies mid-execution (orphaned promise),
+// the timeout fires, triggers re-injection, and re-dispatches the same action.
 async function safeSendMessage(tabId, message, scriptFile = 'content_explore.js') {
   const CHANNEL_DEAD_ERRORS = [
     'Could not establish connection',
@@ -745,40 +813,48 @@ async function safeSendMessage(tabId, message, scriptFile = 'content_explore.js'
     return CHANNEL_DEAD_ERRORS.some(e => msg.includes(e));
   }
 
-  // Attempt 1: send normally
+  function isTimeout(err) {
+    return (err?.message || '').includes('RESPONSE_TIMEOUT');
+  }
+
+  // Attempt 1: send with timeout protection (prevents orphaned async handler hangs)
   try {
-    const result = await chrome.tabs.sendMessage(tabId, message);
+    const result = await sendWithTimeout(tabId, message);
     if (result !== undefined) return result;
     // undefined = no listener caught it — fall through to re-inject
   } catch (err) {
-    if (!isChannelDead(err)) throw err; // Non-channel error — bubble up
-    console.warn(`[safeSendMessage] Channel dead on tab ${tabId}: ${err.message}. Re-injecting ${scriptFile}...`);
+    if (isTimeout(err)) {
+      console.warn(`[safeSendMessage] Response timeout on tab ${tabId} for ${message.actionType || message.type}. Re-injecting...`);
+    } else if (isChannelDead(err)) {
+      console.warn(`[safeSendMessage] Channel dead on tab ${tabId}: ${err.message}. Re-injecting ${scriptFile}...`);
+    } else {
+      throw err; // Non-channel, non-timeout error — bubble up
+    }
   }
 
-  // Re-inject the content script
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: [scriptFile],
-    });
-  } catch (injectErr) {
-    // Can't inject (chrome:// pages, PDF, etc.) — return structured error
+  // Re-inject with ping-confirmed readiness (replaces fixed 400ms wait)
+  const ready = await injectAndConfirm(tabId, scriptFile);
+  if (!ready) {
     return {
       success: false,
-      error: `Cannot inject script into tab ${tabId}: ${injectErr.message}`,
+      error: `Cannot inject or confirm ${scriptFile} on tab ${tabId}`,
       errorType: 'INJECTION_FAILED',
     };
   }
 
-  // Wait for script to initialize its message listeners
-  await new Promise(r => setTimeout(r, 400));
-
-  // Attempt 2: retry after re-injection
+  // Attempt 2: retry with timeout protection
   try {
-    const result = await chrome.tabs.sendMessage(tabId, message);
+    const result = await sendWithTimeout(tabId, message);
     if (result !== undefined) return result;
     return { success: false, error: 'No response after re-injection', errorType: 'NO_RESPONSE' };
   } catch (retryErr) {
+    if (isTimeout(retryErr)) {
+      return {
+        success: false,
+        error: `Response timeout after re-injection (tab ${tabId}, action: ${message.actionType || message.type})`,
+        errorType: 'RESPONSE_TIMEOUT',
+      };
+    }
     return {
       success: false,
       error: `Message failed after re-injection: ${retryErr.message}`,
@@ -789,43 +865,254 @@ async function safeSendMessage(tabId, message, scriptFile = 'content_explore.js'
 
 /**
  * Proactive readiness check: pings content_explore.js on a tab.
- * If the script isn't alive, injects it and verifies.
+ * If the script isn't alive, injects it via injectAndConfirm (ping-confirmed).
  * Returns true if the script is ready, false if injection failed.
  */
 async function ensureContentScriptReady(tabId) {
-  // Step 1: Ping the existing script
+  // Step 1: Ping the existing script (with short timeout — ping should be instant)
   try {
-    const pong = await chrome.tabs.sendMessage(tabId, { type: 'explore_ping' });
+    const pong = await sendWithTimeout(tabId, { type: 'explore_ping' }, 2000);
     if (pong?.alive) return true;
   } catch {
-    // No listener — script not injected or channel dead
+    // No listener, timeout, or channel dead — need injection
   }
 
-  // Step 2: Inject content_explore.js
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ['content_explore.js'],
-    });
-  } catch (injectErr) {
-    console.warn(`[ensureContentScriptReady] Cannot inject into tab ${tabId}: ${injectErr.message}`);
-    return false;
-  }
-
-  // Step 3: Wait for script to initialize, then verify
-  await new Promise(r => setTimeout(r, 400));
-  try {
-    const pong = await chrome.tabs.sendMessage(tabId, { type: 'explore_ping' });
-    return !!pong?.alive;
-  } catch {
-    return false;
-  }
+  // Step 2: Inject and confirm via ping loop (replaces fixed 400ms wait)
+  return injectAndConfirm(tabId, 'content_explore.js');
 }
 
 async function updateOrchestrationProgress(phase, detail) {
   await chrome.storage.local.set({
     orchestrationProgress: { phase, detail, timestamp: Date.now() }
   });
+}
+
+// ── Self-Healing: Homepage Probe ─────────────────────────────
+// When a skill-based search fails repeatedly, this function:
+//   1. Opens the site's homepage in a hidden tab
+//   2. Injects the semantic scraper to find search-related elements
+//   3. Discovers the real search URL from form actions or search inputs
+//   4. Sends the verified URL to the backend to overwrite the broken skill
+//
+// Runs asynchronously (fire-and-forget) so it never blocks the current search.
+// The NEXT search on this site will use the healed URL.
+
+async function probeAndHealSkill(skillId, domain, token) {
+  const TAG = `[SELF-HEAL] ${domain}`;
+  let probeTab = null;
+
+  try {
+    console.log(`${TAG} Starting homepage probe...`);
+    const homepageUrl = `https://www.${domain}`;
+
+    // Open hidden tab to the homepage
+    probeTab = await chrome.tabs.create({ url: homepageUrl, active: false });
+    await waitForTabLoad(probeTab.id, 12000);
+
+    // Inject a lightweight probe script that finds search-related DOM elements
+    const probeResult = await chrome.scripting.executeScript({
+      target: { tabId: probeTab.id },
+      func: () => {
+        // ── Discovery Strategy (runs in page context) ──
+        // Look for search forms, search inputs, and search-related links
+        // to discover the site's actual search URL pattern.
+
+        const discoveries = [];
+
+        // Strategy 1: Find <form> elements with search-related attributes
+        const forms = document.querySelectorAll('form');
+        for (const form of forms) {
+          const action = form.getAttribute('action') || '';
+          const role = form.getAttribute('role') || '';
+          const id = (form.id || '').toLowerCase();
+          const cls = (form.className || '').toLowerCase();
+
+          const isSearchForm = role === 'search'
+            || id.includes('search') || cls.includes('search')
+            || action.includes('search') || action.includes('/s?')
+            || action.includes('/s/')
+            || id.includes('query') || cls.includes('query');
+
+          if (isSearchForm && action) {
+            // Find the search input name within this form
+            const inputs = form.querySelectorAll('input[type="text"], input[type="search"], input:not([type])');
+            for (const inp of inputs) {
+              const name = inp.getAttribute('name');
+              if (name) {
+                discoveries.push({
+                  method: 'probe_form_action',
+                  formAction: action,
+                  paramName: name,
+                  formRole: role,
+                  formId: form.id || '',
+                });
+              }
+            }
+          }
+        }
+
+        // Strategy 2: Find standalone search inputs (not inside a form with action)
+        const searchInputs = document.querySelectorAll(
+          'input[type="search"], input[name*="search"], input[name*="query"], input[name="q"], input[name="k"], input[name="keyword"], input[name="keywords"], input[aria-label*="search" i], input[placeholder*="search" i]'
+        );
+        for (const inp of searchInputs) {
+          const name = inp.getAttribute('name');
+          const form = inp.closest('form');
+          const formAction = form?.getAttribute('action') || '';
+          if (name) {
+            discoveries.push({
+              method: formAction ? 'probe_search_input' : 'probe_input_no_form',
+              formAction,
+              paramName: name,
+              inputType: inp.type || 'text',
+              placeholder: (inp.placeholder || '').substring(0, 50),
+            });
+          }
+        }
+
+        // Strategy 3: Find search-related links in the page (e.g., "search?q=" in href)
+        const links = document.querySelectorAll('a[href*="search"], a[href*="/s?"], a[href*="query="]');
+        for (const link of links) {
+          const href = link.getAttribute('href') || '';
+          if (href.includes('=')) {
+            discoveries.push({
+              method: 'probe_link_pattern',
+              href: href.substring(0, 200),
+              text: (link.textContent || '').trim().substring(0, 50),
+            });
+          }
+        }
+
+        // Return final URL of the page (in case of redirects) + discoveries
+        return {
+          finalUrl: window.location.href,
+          origin: window.location.origin,
+          discoveries,
+        };
+      },
+    });
+
+    const probe = probeResult?.[0]?.result;
+    if (!probe || !probe.discoveries || probe.discoveries.length === 0) {
+      console.log(`${TAG} No search elements found on homepage. Probe failed gracefully.`);
+      return false;
+    }
+
+    console.log(`${TAG} Found ${probe.discoveries.length} search-related elements`);
+
+    // Pick the best discovery and build a verified search URL template
+    let verifiedUrl = null;
+    let method = 'probe_unknown';
+
+    for (const d of probe.discoveries) {
+      if (d.method === 'probe_form_action' && d.formAction && d.paramName) {
+        // Best signal: a form with role="search" or search-related action
+        let base = d.formAction;
+        // Handle relative URLs
+        if (base.startsWith('/')) {
+          base = probe.origin + base;
+        } else if (!base.startsWith('http')) {
+          base = probe.origin + '/' + base;
+        }
+        // Build template: replace or append the query parameter
+        const url = new URL(base);
+        url.searchParams.set(d.paramName, '{query}');
+        verifiedUrl = decodeURIComponent(url.toString());
+        method = d.method;
+        break;
+      }
+
+      if (d.method === 'probe_search_input' && d.formAction && d.paramName) {
+        let base = d.formAction;
+        if (base.startsWith('/')) base = probe.origin + base;
+        else if (!base.startsWith('http')) base = probe.origin + '/' + base;
+        const url = new URL(base);
+        url.searchParams.set(d.paramName, '{query}');
+        verifiedUrl = decodeURIComponent(url.toString());
+        method = d.method;
+        break;
+      }
+    }
+
+    // Fallback: if we found inputs with names but no form action, try common patterns
+    if (!verifiedUrl) {
+      const inputDiscovery = probe.discoveries.find(d => d.paramName);
+      if (inputDiscovery) {
+        verifiedUrl = `${probe.origin}/search?${inputDiscovery.paramName}={query}`;
+        method = 'probe_fallback_input';
+      }
+    }
+
+    if (!verifiedUrl) {
+      console.log(`${TAG} Could not construct verified URL from discoveries. Probe inconclusive.`);
+      return false;
+    }
+
+    console.log(`${TAG} Discovered verified URL: ${verifiedUrl} (method: ${method})`);
+
+    // Send the verified URL to the backend to overwrite the broken skill
+    const regenRes = await fetch(`${API_BASE}/api/skills/regenerate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ skillId, verifiedSearchUrl: verifiedUrl, method }),
+    });
+
+    if (!regenRes.ok) {
+      const err = await regenRes.json().catch(() => ({}));
+      console.warn(`${TAG} Backend rejected regeneration:`, err.error);
+      return false;
+    }
+
+    const result = await regenRes.json();
+    console.log(`${TAG} SELF-HEALED! New URL: ${result.skill?.searchUrl} (confidence: ${result.skill?.confidence})`);
+    return true;
+
+  } catch (err) {
+    console.warn(`${TAG} Probe failed (non-fatal):`, err.message);
+    return false;
+  } finally {
+    // Always clean up the probe tab
+    if (probeTab?.id) {
+      await chrome.tabs.remove(probeTab.id).catch(() => {});
+    }
+  }
+}
+
+/**
+ * Check if a failed skill should be self-healed, and trigger probe if yes.
+ * Fire-and-forget — never blocks the caller.
+ *
+ * @param {string} skillId - The skill that just failed
+ * @param {string} domain - Domain for logging
+ * @param {string} token - Auth token for API calls
+ */
+function triggerSelfHealingCheck(skillId, domain, token) {
+  // Entire flow is async and non-blocking
+  (async () => {
+    try {
+      const checkRes = await fetch(`${API_BASE}/api/skills/should-regenerate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ skillId }),
+      });
+
+      if (!checkRes.ok) return;
+      const check = await checkRes.json();
+
+      if (!check.shouldRegenerate) {
+        console.log(`[SELF-HEAL] ${domain}: no regen needed (${check.reason})`);
+        return;
+      }
+
+      console.log(`[SELF-HEAL] ${domain}: regeneration triggered (${check.reason})`);
+      const healed = await probeAndHealSkill(skillId, check.domain || domain, token);
+      if (healed) {
+        console.log(`[SELF-HEAL] ${domain}: healed successfully — next search will use verified URL`);
+      }
+    } catch (err) {
+      console.warn(`[SELF-HEAL] ${domain}: check failed (non-fatal):`, err.message);
+    }
+  })();
 }
 
 // --- Semantic Search Tab: inject semantic scraper → parse-intent API ---
@@ -897,6 +1184,8 @@ async function spawnSearchTab(site, query, category, token) {
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
           body: JSON.stringify({ skillId, success: false }),
         }).catch(() => {});
+        // Self-healing: check if this skill needs regeneration (fire-and-forget)
+        triggerSelfHealingCheck(skillId, site, token);
       }
       return { site, results: [], error: 'Semantic map empty' };
     }
@@ -935,11 +1224,16 @@ async function spawnSearchTab(site, query, category, token) {
 
     // Record outcome for Skill Engine (only for skill-based searches)
     if (skillId) {
+      const searchSucceeded = results.length > 0;
       fetch(`${API_BASE}/api/skills/record-outcome`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ skillId, success: results.length > 0 }),
+        body: JSON.stringify({ skillId, success: searchSucceeded }),
       }).catch(err => console.warn(`[Ghost-Driver] Failed to record skill outcome:`, err.message));
+      // Self-healing: if search returned 0 results, check if skill needs regeneration
+      if (!searchSucceeded) {
+        triggerSelfHealingCheck(skillId, site, token);
+      }
     }
 
     return { site, results, trustScore, trustRationale };
@@ -952,6 +1246,8 @@ async function spawnSearchTab(site, query, category, token) {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ skillId, success: false }),
       }).catch(() => {});
+      // Self-healing: check if this skill needs regeneration (fire-and-forget)
+      triggerSelfHealingCheck(skillId, site, token);
     }
     return { site, results: [], error: err.message };
   } finally {
@@ -1361,6 +1657,13 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
   const originalPrompt = continuationContext?.originalPrompt || null;
   const totalStepsAcrossPhases = continuationContext?.totalSteps || 0;
 
+  // Data Scratchpad: persists extracted data across steps AND phases.
+  // The AI writes to this via `extractedData` field in its response.
+  // This survives history compression (always injected in full) and phase transitions.
+  // Increased to 64KB to support large data transfer tasks (Notion → Excel, etc.)
+  const DATA_BUFFER_MAX = 64000;
+  let dataBuffer = continuationContext?.dataBuffer || '';
+
   // Mark exploration as in-progress (so re-injected panel can detect it)
   try {
     await chrome.storage.session.set({
@@ -1375,7 +1678,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
   const navListener = (details) => {
     if (details.tabId !== currentTabId || details.frameId !== 0) return;
     console.log('[Explore] webNavigation.onCompleted — re-injecting DOM scripts on', details.url);
-    chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: ['content_explore.js'] }).catch(() => {});
+    injectAndConfirm(currentTabId, 'content_explore.js').catch(() => {});
     chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: [HUD_SCRIPT] }).catch(() => {});
   };
   chrome.webNavigation.onCompleted.addListener(navListener);
@@ -1387,7 +1690,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
   const spaNavListener = (details) => {
     if (details.tabId !== currentTabId || details.frameId !== 0) return;
     console.log('[Explore] SPA navigation (onHistoryStateUpdated) — re-injecting DOM scripts on', details.url);
-    chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: ['content_explore.js'] }).catch(() => {});
+    injectAndConfirm(currentTabId, 'content_explore.js').catch(() => {});
     chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: [HUD_SCRIPT] }).catch(() => {});
   };
   chrome.webNavigation.onHistoryStateUpdated.addListener(spaNavListener);
@@ -1536,8 +1839,8 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
 
     // Main exploration loop
     for (let step = startStep; step <= maxSteps; step++) {
-      // Frustration failsafe: 3 consecutive failures → stop
-      if (consecutiveFailures >= 3) {
+      // Frustration failsafe: 5 consecutive failures → stop (increased from 3 to handle transient rate limits)
+      if (consecutiveFailures >= 5) {
         await hudUpdate(currentTabId, `explore-${step}`, 'error', 'Too many failures — stopping');
         break;
       }
@@ -1711,25 +2014,38 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           currentPageState: snapshot,
           previousPhases: previousPhases.length > 0 ? previousPhases : undefined,
           originalPrompt: originalPrompt || undefined,
+          dataBuffer: dataBuffer || undefined,
           ...byokPayload(exploreByokConfig),
         };
 
-        // Retry logic for network resilience (up to 2 retries on transient failures)
+        // Retry logic for network resilience + rate limit handling (up to 3 retries)
         let thinkRes = null;
         let lastFetchErr = null;
-        for (let attempt = 0; attempt < 3; attempt++) {
+        for (let attempt = 0; attempt < 4; attempt++) {
           try {
             thinkRes = await fetch(exploreStepUrl, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
               body: JSON.stringify(stepPayload),
             });
+
+            // Handle HTTP 429 (rate limit) with exponential backoff
+            if (thinkRes.status === 429) {
+              const retryAfter = parseInt(thinkRes.headers.get('Retry-After') || '0', 10);
+              const backoffMs = retryAfter > 0 ? retryAfter * 1000 : Math.min((attempt + 1) * 5000, 20000);
+              console.warn(`[Explore] Step ${step}: rate limited (429), waiting ${backoffMs}ms before retry ${attempt + 1}/3...`);
+              await hudUpdate(currentTabId, `explore-${step}`, 'running', `Rate limited — waiting ${Math.round(backoffMs / 1000)}s...`);
+              await new Promise(r => setTimeout(r, backoffMs));
+              thinkRes = null; // Reset to retry
+              continue;
+            }
+
             lastFetchErr = null;
             break; // Success — exit retry loop
           } catch (fetchErr) {
             lastFetchErr = fetchErr;
             const isTransient = (fetchErr.message || '').match(/Failed to fetch|NetworkError|ERR_CONNECTION|ECONNRESET|ETIMEDOUT/);
-            if (isTransient && attempt < 2) {
+            if (isTransient && attempt < 3) {
               console.warn(`[Explore] Step ${step}: fetch attempt ${attempt + 1} failed (${fetchErr.message}), retrying in ${(attempt + 1) * 2}s...`);
               await new Promise(r => setTimeout(r, (attempt + 1) * 2000));
             } else {
@@ -1739,6 +2055,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         }
 
         if (lastFetchErr) throw lastFetchErr;
+        if (!thinkRes) throw new Error('Rate limit exceeded after 4 attempts');
 
         if (!thinkRes.ok) {
           const err = await thinkRes.json().catch(() => ({}));
@@ -1746,28 +2063,60 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
             await hudUpdate(currentTabId, `explore-${step}`, 'error', 'Insufficient credits');
             break;
           }
-          throw new Error(err.error || `explore-step failed (HTTP ${thinkRes.status})`);
+          // Detect rate limit errors passed through from backend
+          const errMsg = err.error || `explore-step failed (HTTP ${thinkRes.status})`;
+          if (errMsg.toLowerCase().includes('too many') || errMsg.toLowerCase().includes('rate limit') || thinkRes.status === 429) {
+            console.warn(`[Explore] Step ${step}: backend rate limit error, waiting 10s...`);
+            await hudUpdate(currentTabId, `explore-${step}`, 'running', 'Rate limited — waiting 10s...');
+            await new Promise(r => setTimeout(r, 10000));
+            // Don't throw — mark as rate-limit failure so failsafe doesn't count it
+            consecutiveFailures = Math.max(0, consecutiveFailures - 1); // Undo the increment that will happen
+            throw new Error(`__RATE_LIMITED__: ${errMsg}`);
+          }
+          throw new Error(errMsg);
         }
 
         decision = await thinkRes.json();
         creditsUsed += 0.3;
         console.log(`[Explore] Step ${step}: FULL decision object:`, JSON.stringify(decision, null, 2));
         console.log(`[Explore] Step ${step}: AI decided action=${decision.nextAction?.type}, desc="${decision.nextAction?.description}", goalComplete=${decision.isGoalComplete}`);
+
+        // ── Data Scratchpad: capture extractedData from AI response ──
+        if (decision.extractedData && typeof decision.extractedData === 'string') {
+          const newData = decision.extractedData.trim();
+          if (newData) {
+            // Append new data (AI is instructed to append, but guard against duplicates)
+            if (dataBuffer && !dataBuffer.includes(newData.slice(0, 100))) {
+              dataBuffer = (dataBuffer + '\n' + newData).slice(0, DATA_BUFFER_MAX);
+            } else if (!dataBuffer) {
+              dataBuffer = newData.slice(0, DATA_BUFFER_MAX);
+            }
+            console.log(`[Explore] Step ${step}: Data buffer updated (${dataBuffer.length} chars)`);
+          }
+        }
       } catch (err) {
         const errMsg = err.message || 'Unknown error';
         const isNetworkError = errMsg.includes('Failed to fetch') || errMsg.includes('NetworkError') || errMsg.includes('ERR_CONNECTION');
+        const isRateLimited = errMsg.includes('__RATE_LIMITED__') || errMsg.toLowerCase().includes('too many') || errMsg.toLowerCase().includes('rate limit');
         const userMsg = isNetworkError
           ? `Backend unreachable (${API_BASE}) — is the server running? (retried 3 times)`
-          : `AI error: ${errMsg}`;
+          : isRateLimited
+            ? 'Rate limited — will retry shortly'
+            : `AI error: ${errMsg}`;
         console.error(`[Explore] Think step ${step} failed:`, errMsg);
-        consecutiveFailures++;
+        // Rate limit errors do NOT count toward frustration failsafe
+        if (!isRateLimited) {
+          consecutiveFailures++;
+        } else {
+          console.log(`[Explore] Step ${step}: rate limit error — NOT counting toward failure threshold`);
+        }
         stepLog.push({
           step,
           action: { type: 'think', description: 'AI decision' },
-          result: { success: false },
+          result: { success: false, isRateLimited },
           observation: `Think failed: ${userMsg}`,
         });
-        await hudUpdate(currentTabId, `explore-${step}`, 'error', userMsg);
+        await hudUpdate(currentTabId, `explore-${step}`, isRateLimited ? 'running' : 'error', userMsg);
         await updateExplorationProgress(step, maxSteps, userMsg, 'running');
         continue;
       }
@@ -1778,7 +2127,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         const currTarget = decision.nextAction.target;
 
         // Skip loop detection for non-interactive actions
-        if (currType !== 'scrape_page' && currType !== 'scroll' && currType !== 'wait' && currType !== 'resolve_element') {
+        if (currType !== 'scrape_page' && currType !== 'scrape_table' && currType !== 'scroll' && currType !== 'wait' && currType !== 'resolve_element' && currType !== 'paste_tsv') {
           // Count consecutive repeats of the exact same action+target
           let repeatCount = 0;
           for (let ri = stepLog.length - 1; ri >= 0; ri--) {
@@ -2013,6 +2362,13 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         continue;
       }
 
+      // ── Scratchpad substitution: inject full dataBuffer for paste_tsv ──
+      if (decision.nextAction?.type === 'paste_tsv' &&
+          (!decision.nextAction?.value || decision.nextAction?.value === '__USE_SCRATCHPAD__')) {
+        decision.nextAction.value = dataBuffer || '';
+        console.log(`[Explore] Step ${step}: paste_tsv — substituted scratchpad data (${(dataBuffer || '').length} chars)`);
+      }
+
       const actionDesc = decision.nextAction.description || decision.nextAction.type || 'Action';
       await hudUpdate(currentTabId, `explore-${step}`, 'processing', actionDesc);
       await updateExplorationProgress(step, maxSteps, actionDesc, 'running');
@@ -2064,14 +2420,21 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         await updateExplorationProgress(step, maxSteps, `Failed: ${actionResult.error || actionDesc}`, 'running');
       }
 
-      // Brief pause between steps for page rendering
-      await new Promise(r => setTimeout(r, 500));
+      // Dynamic pause between steps — use DOM stability detection for clicks
+      const wasClick = decision.nextAction?.type === 'click_element';
+      if (wasClick && actionResult.success) {
+        // After a click, wait for DOM to stabilize (dropdowns/menus may render with animation)
+        await waitForDomStable(currentTabId, 2500, 300);
+      } else {
+        // Non-click actions: brief fixed pause
+        await new Promise(r => setTimeout(r, 800));
+      }
     }
 
     // Max steps reached or stopped
     cleanupLoop();
 
-    const stoppedDueToFailures = consecutiveFailures >= 3;
+    const stoppedDueToFailures = consecutiveFailures >= 5;
 
     // ── AUTO-CONTINUATION: if goal not complete and phases remain, auto-continue ──
     if (!stoppedDueToFailures && currentPhase < MAX_PHASES) {
@@ -2104,6 +2467,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         previousPhases: newPreviousPhases,
         originalPrompt: originalPrompt || goal,
         totalSteps: newTotalSteps,
+        dataBuffer: dataBuffer || undefined,
       };
 
       // Brief pause between phases
@@ -2608,6 +2972,38 @@ async function handleMessage(request, sender) {
     } catch (err) {
       try { await chrome.debugger.detach({ tabId }); } catch (_) {}
       console.warn('[CDP-KEYS] dispatchKeyEvent failed:', err.message);
+      return { success: false, error: err.message };
+    }
+  }
+
+  // ── CDP PRESS KEY: Press a single navigation/control key via Chrome DevTools Protocol ──
+  // Used as fallback by content_explore.js press_key handler for canvas-based editors
+  // (Excel Online, Google Sheets) where DOM KeyboardEvent dispatch is ignored.
+  if (request.type === 'cdp_press_key') {
+    const tabId = sender?.tab?.id;
+    if (!tabId || !request.key) {
+      return { success: false, error: 'Missing tabId or key for CDP key press' };
+    }
+    try {
+      const target = { tabId };
+      await chrome.debugger.attach(target, '1.3');
+
+      const keyCode = request.keyCode || 0;
+      await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+        type: 'keyDown', key: request.key, code: request.code || request.key,
+        windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode,
+      });
+      await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', {
+        type: 'keyUp', key: request.key, code: request.code || request.key,
+        windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode,
+      });
+
+      await chrome.debugger.detach(target);
+      console.log(`[CDP-PRESS-KEY] Pressed ${request.key} on tab ${tabId}`);
+      return { success: true };
+    } catch (err) {
+      try { await chrome.debugger.detach({ tabId }); } catch (_) {}
+      console.warn('[CDP-PRESS-KEY] Failed:', err.message);
       return { success: false, error: err.message };
     }
   }
