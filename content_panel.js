@@ -116,9 +116,41 @@
 
   function extractSiteHint(prompt) {
     const lower = prompt.toLowerCase();
-    const sites = ['amazon', 'ebay', 'etsy', 'google', 'expedia', 'kayak', 'skyscanner'];
-    const mentioned = sites.filter(s => lower.includes(s));
-    if (mentioned.length > 0) return { explicitSites: mentioned, onlyThese: true };
+
+    // Broad list of well-known sites (covers shopping, travel, jobs, freelance, real estate, cars, general)
+    const knownSites = [
+      'amazon', 'ebay', 'etsy', 'walmart', 'target', 'bestbuy', 'best buy', 'costco', 'newegg',
+      'aliexpress', 'wayfair', 'overstock', 'zappos', 'nordstrom', 'macys', 'ikea', 'homedepot', 'home depot',
+      'google', 'bing', 'duckduckgo',
+      'expedia', 'kayak', 'skyscanner', 'booking', 'airbnb', 'hotels', 'priceline', 'tripadvisor',
+      'indeed', 'linkedin', 'glassdoor', 'ziprecruiter', 'monster',
+      'fiverr', 'upwork', 'freelancer', 'toptal',
+      'zillow', 'rightmove', 'redfin', 'realtor',
+      'autotrader', 'cargurus', 'carmax',
+      'youtube', 'reddit', 'twitter', 'facebook', 'instagram', 'tiktok', 'pinterest',
+      'github', 'stackoverflow', 'stack overflow',
+      'netflix', 'spotify', 'hulu', 'disney',
+      'craigslist', 'mercari', 'poshmark', 'depop', 'vinted'
+    ];
+
+    const mentioned = knownSites.filter(s => {
+      if (s.includes(' ')) return lower.includes(s);
+      const re = new RegExp(`\\b${s}\\b`);
+      return re.test(lower);
+    });
+
+    const domainPattern = /\b([a-z0-9][-a-z0-9]*)\.(com|co\.uk|de|fr|ca|com\.au|net|org|io)\b/g;
+    let match;
+    while ((match = domainPattern.exec(lower)) !== null) {
+      const domain = match[1];
+      if (!['www', 'http', 'https', 'mail', 'api', 'service'].includes(domain) && !mentioned.includes(domain)) {
+        mentioned.push(domain);
+      }
+    }
+
+    const deduped = [...new Set(mentioned.map(s => s.replace(/\s+/g, '')))];
+
+    if (deduped.length > 0) return { explicitSites: deduped, onlyThese: true };
     return null;
   }
 

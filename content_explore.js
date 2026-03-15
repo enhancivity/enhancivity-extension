@@ -515,6 +515,22 @@
       : '\nNo interactable elements found on this page.';
   }
 
+  // ── Page Type Classifier (URL-based, no DOM/DB needed) ────────
+  // Ported from siteMapService.js detectPageType() for snapshot enrichment.
+  function detectPageType(url) {
+    if (!url) return 'other';
+    const path = url.replace(/^https?:\/\/[^/]+/, '').toLowerCase();
+    if (!path || path === '/' || path === '/index.html' || path === '/home') return 'homepage';
+    if (/[?&](q|query|search|keyword|k|s|term|searchTerm|_nkw)=/i.test(url)) return 'search_results';
+    if (/\/(search|results|find|browse|s\?)/.test(path)) return 'search_results';
+    if (/\/(product|item|dp|listing|gp\/product|ip)\//i.test(path)) return 'product_detail';
+    if (/\/(p|pd|products)\/[a-z0-9-]+/i.test(path)) return 'product_detail';
+    if (/\/(checkout|cart|basket|bag|order|payment)/i.test(path)) return 'checkout';
+    if (/\/(account|profile|settings|preferences|dashboard|my-)/i.test(path)) return 'account';
+    if (/\/(login|signin|sign-in|auth|sso|oauth)/i.test(path)) return 'auth';
+    return 'other';
+  }
+
   // ── Exploration Actions ─────────────────────────────────────
 
   const EXPLORE_ACTIONS = {
@@ -552,16 +568,21 @@
         return { success: false, error: 'BLOCKED: Sensitive field — cannot interact', blocked: true };
       }
 
-      // ANTI-EXPORT GUARD: Block clicks on Export/Download buttons and redirect AI to scrape_table
+      // ANTI-EXPORT GUARD: Block clicks on Export/Download buttons and redirect AI to scrape_table.
+      // Uses contains-match because button innerText may include icon text, hidden spans, etc.
+      // Only applies to button-like elements (not navigation links to pages named "Export").
       const elText = (el.innerText || el.value || el.textContent || '').toLowerCase().trim();
-      const EXPORT_EXACT = new Set(['export', 'download', 'download csv', 'export csv', 'export to csv', 'download xlsx']);
-      const EXPORT_PHRASE = ['export data', 'export all', 'download report', 'export report'];
-      if (!consentApproved && (EXPORT_EXACT.has(elText) || EXPORT_PHRASE.some(p => elText.includes(p)))) {
-        return {
-          success: false,
-          error: 'ANTI-EXPORT: Do NOT click Export/Download buttons — downloaded files cannot be read by the agent. Instead, use scrape_table to read the data directly from the visible table on the page. If there is pagination, scrape each page. The user asked to extract/transfer data, not download a file.',
-          blocked: true,
-        };
+      const isButtonLike = el.tagName === 'BUTTON' || el.getAttribute('role') === 'button' ||
+        el.type === 'submit' || el.classList.contains('btn') || el.closest('button');
+      if (!consentApproved && isButtonLike) {
+        const EXPORT_WORDS = ['export', 'download csv', 'download xlsx', 'download report', 'export csv', 'export data', 'export all'];
+        if (EXPORT_WORDS.some(w => elText.includes(w)) || elText === 'download') {
+          return {
+            success: false,
+            error: 'ANTI-EXPORT: Do NOT click Export/Download buttons — downloaded files cannot be read by the agent. Instead, close this dialog (click Cancel or press Escape) and use scrape_table to read the data directly from the visible table. If there is pagination, scrape each page.',
+            blocked: true,
+          };
+        }
       }
 
       // Dangerous button check — bypassed when user already approved via consent card
@@ -2259,12 +2280,68 @@
               const elName = node.getAttribute('name');
               const testId = node.getAttribute('data-testid');
 
-              const fallbackLabel = testId ? `[${testId}]` :
-                elId ? `[${elId} button]` :
-                elName ? `[${elName} button]` :
-                hasSvg ? '[icon button]' :
-                hasImg ? '[image button]' :
-                `[unlabeled ${elTag.toLowerCase()}]`;
+              // ── POSITIONAL DISAMBIGUATION ──
+              // When multiple icon buttons have no text, give the AI spatial
+              // and structural cues so it can distinguish them.
+              // Format: [icon button, bottom-left, nav, 2nd of 4]
+              const posHints = [];
+
+              // 1. Screen region from bounding rect
+              try {
+                const rect = node.getBoundingClientRect();
+                const vw = window.innerWidth || document.documentElement.clientWidth;
+                const vh = window.innerHeight || document.documentElement.clientHeight;
+                if (rect.width > 0 && rect.height > 0) {
+                  const cx = rect.left + rect.width / 2;
+                  const cy = rect.top + rect.height / 2;
+                  const hZone = cx < vw * 0.3 ? 'left' : cx > vw * 0.7 ? 'right' : 'center';
+                  const vZone = cy < vh * 0.25 ? 'top' : cy > vh * 0.75 ? 'bottom' : 'middle';
+                  posHints.push(vZone === 'middle' ? hZone : `${vZone}-${hZone}`);
+                }
+              } catch {}
+
+              // 2. Landmark ancestor (header, nav, sidebar, footer, main, aside)
+              try {
+                const landmark = node.closest('header, nav, footer, main, aside, [role="navigation"], [role="banner"], [role="complementary"], [role="contentinfo"]');
+                if (landmark) {
+                  const lTag = landmark.tagName.toLowerCase();
+                  const lRole = landmark.getAttribute('role');
+                  const landmarkName = lRole === 'navigation' ? 'nav' :
+                    lRole === 'banner' ? 'header' :
+                    lRole === 'complementary' ? 'sidebar' :
+                    lRole === 'contentinfo' ? 'footer' :
+                    (lTag === 'aside' ? 'sidebar' : lTag);
+                  posHints.push(landmarkName);
+                }
+              } catch {}
+
+              // 3. Sibling index — "2nd of 4" icon buttons in the same parent
+              try {
+                const parent = node.parentElement;
+                if (parent) {
+                  const siblings = Array.from(parent.children).filter(sib => {
+                    if (sib.tagName !== 'BUTTON' && sib.tagName !== 'A' &&
+                        sib.getAttribute('role') !== 'button') return false;
+                    const sibText = (sib.innerText || sib.textContent || sib.getAttribute('aria-label') || '').trim();
+                    return !sibText || sibText.length < 2; // only count unlabeled siblings
+                  });
+                  if (siblings.length > 1) {
+                    const idx = siblings.indexOf(node) + 1;
+                    if (idx > 0) posHints.push(`${idx} of ${siblings.length}`);
+                  }
+                }
+              } catch {}
+
+              const baseLabel = testId ? testId :
+                elId ? `${elId} button` :
+                elName ? `${elName} button` :
+                hasSvg ? 'icon button' :
+                hasImg ? 'image button' :
+                `unlabeled ${elTag.toLowerCase()}`;
+
+              const fallbackLabel = posHints.length > 0
+                ? `[${baseLabel}, ${posHints.join(', ')}]`
+                : `[${baseLabel}]`;
 
               return fallbackLabel;
             }
@@ -2623,7 +2700,11 @@
         // ── Lightweight Positional Data ──
         // Compute a human-readable screen region (e.g., "top-right", "bottom-left", "center")
         // so the AI can distinguish a profile icon in the top-right from sidebar nav items.
+        // Also compute normalized percentage coordinates (xPct, yPct) for screen-size-independent
+        // fingerprinting. These are 0.0-1.0 values relative to viewport dimensions.
         let pos = null;
+        let xPct = null;
+        let yPct = null;
         try {
           const rect = node.getBoundingClientRect();
           const vw = window.innerWidth || document.documentElement.clientWidth;
@@ -2634,6 +2715,9 @@
             const hZone = cx < vw * 0.3 ? 'left' : cx > vw * 0.7 ? 'right' : 'center';
             const vZone = cy < vh * 0.25 ? 'top' : cy > vh * 0.75 ? 'bottom' : 'middle';
             pos = vZone === 'middle' ? (hZone === 'center' ? 'center' : `middle-${hZone}`) : `${vZone}-${hZone}`;
+            // Normalized coordinates for SiteMap fingerprinting (screen-size independent)
+            xPct = Math.round(cx / vw * 1000) / 1000;
+            yPct = Math.round(cy / vh * 1000) / 1000;
           }
         } catch {}
 
@@ -2648,6 +2732,8 @@
           isEditable: isEditableElement || false,
           isDisabled: isDisabled || false,
           pos,                             // screen region: "top-right", "bottom-left", etc.
+          xPct,                            // normalized X (0.0-1.0) for fingerprinting
+          yPct,                            // normalized Y (0.0-1.0) for fingerprinting
         };
       }
 
@@ -2729,6 +2815,24 @@
       // Auth gate detection — uses the comprehensive AuthGateDetector
       const authGate = AuthGateDetector.detect();
 
+      // ── Platform Detection (for SiteMap fingerprinting) ──
+      // Detects CMS/platform so one fingerprint can cover millions of sites.
+      const platformHints = {};
+      try {
+        // Collect script sources (for Shopify, WordPress, Wix detection)
+        const scriptEls = document.querySelectorAll('script[src]');
+        platformHints.scripts = Array.from(scriptEls).slice(0, 20).map(s => s.src || '');
+        // Collect meta tags (generator, platform identifiers)
+        const metaEls = document.querySelectorAll('meta[name], meta[property], meta[content]');
+        platformHints.metaTags = Array.from(metaEls).slice(0, 20).map(m =>
+          `${m.getAttribute('name') || m.getAttribute('property') || ''}=${(m.getAttribute('content') || '').slice(0, 100)}`
+        );
+        // Check for common platform CSS classes on body/html
+        const bodyClasses = (document.body?.className || '').slice(0, 300);
+        const htmlClasses = (document.documentElement?.className || '').slice(0, 300);
+        platformHints.cssClasses = [bodyClasses, htmlClasses].filter(Boolean);
+      } catch {}
+
       return {
         success: true,
         observation: 'Page snapshot taken.',
@@ -2745,6 +2849,11 @@
             signalCount: authGate.signalCount,
           } : null,
           accountContext: accountContext.activeAccount ? accountContext : null,
+          pageType: detectPageType(location.href),
+          // SiteMap fingerprinting data
+          viewportWidth: window.innerWidth || document.documentElement.clientWidth,
+          viewportHeight: window.innerHeight || document.documentElement.clientHeight,
+          platformHints,
         },
       };
     },

@@ -19,18 +19,28 @@ chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONT
 // --- URL Allowlist for Navigate Actions (v1 safety) ---
 
 const ALLOWED_DOMAINS = [
-  // Shopping
-  'amazon.com', 'ebay.com', 'etsy.com', 'walmart.com', 'target.com', 'bestbuy.com',
-  // Travel
-  'expedia.com', 'kayak.com', 'skyscanner.net', 'booking.com', 'airbnb.com', 'hotels.com',
+  // Shopping (+ regional TLDs)
+  'amazon.com', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.ca', 'amazon.com.au',
+  'amazon.it', 'amazon.es', 'amazon.co.jp', 'amazon.in', 'amazon.com.br', 'amazon.nl',
+  'amazon.sg', 'amazon.se', 'amazon.pl', 'amazon.com.mx', 'amazon.ae', 'amazon.sa',
+  'ebay.com', 'ebay.co.uk', 'ebay.de', 'ebay.fr', 'ebay.ca', 'ebay.com.au', 'ebay.it', 'ebay.es',
+  'etsy.com', 'walmart.com', 'target.com', 'bestbuy.com', 'costco.com', 'newegg.com',
+  'aliexpress.com', 'wayfair.com', 'overstock.com', 'zappos.com', 'nordstrom.com', 'macys.com',
+  'ikea.com', 'homedepot.com',
+  // Travel (+ regional TLDs)
+  'expedia.com', 'expedia.de', 'expedia.co.uk', 'expedia.fr',
+  'kayak.com', 'kayak.de', 'kayak.co.uk', 'kayak.fr',
+  'skyscanner.net', 'skyscanner.de', 'skyscanner.com',
+  'booking.com', 'airbnb.com', 'hotels.com', 'priceline.com', 'tripadvisor.com',
   // Jobs
-  'indeed.com', 'linkedin.com', 'glassdoor.com', 'monster.com', 'ziprecruiter.com',
+  'indeed.com', 'indeed.de', 'indeed.co.uk', 'indeed.fr',
+  'linkedin.com', 'glassdoor.com', 'glassdoor.de', 'monster.com', 'ziprecruiter.com',
   // Freelance
   'fiverr.com', 'upwork.com',
   // Real estate
-  'zillow.com', 'rightmove.co.uk',
+  'zillow.com', 'rightmove.co.uk', 'redfin.com', 'realtor.com',
   // Cars
-  'autotrader.com', 'cargurus.com',
+  'autotrader.com', 'cargurus.com', 'carmax.com',
   // Productivity & communication
   'mail.google.com', 'slack.com', 'notion.so', 'trello.com', 'asana.com',
   'docs.google.com', 'drive.google.com', 'calendar.google.com',
@@ -41,7 +51,9 @@ const ALLOWED_DOMAINS = [
   // Dev & infra
   'platform.openai.com', 'openai.com', 'vercel.com', 'netlify.com', 'aws.amazon.com',
   // Search
-  'google.com', 'bing.com',
+  'google.com', 'google.de', 'google.co.uk', 'google.fr', 'bing.com',
+  // Social & marketplace
+  'craigslist.org', 'mercari.com', 'poshmark.com', 'depop.com', 'vinted.com', 'vinted.de', 'vinted.fr',
   // Enhancivity
   'enhancivity.com',
 ];
@@ -394,6 +406,13 @@ function watchForLoginCompletion(tabId, resumeStateKey, token) {
 
       const snapshot = await takePageSnapshot(tabId);
 
+      if (snapshot._tabClosed) {
+        console.warn('[AuthBridge] Tab closed during login watch — aborting auto-resume');
+        watcherCleanedUp = true;
+        chrome.webNavigation.onCompleted.removeListener(loginWatcher);
+        return;
+      }
+
       if (!snapshot.isLoginPage) {
         // User logged in successfully — auto-resume
         watcherCleanedUp = true;
@@ -519,6 +538,49 @@ chrome.runtime.onStartup.addListener(async () => {
   if (token) await refreshMemory(token).catch(() => {});
 });
 
+// ── SiteMap Seed: load initial site fingerprints on first install ──
+// Runs once per seed version. Sends the static JSON bundle to the backend
+// so the SiteMap DB has structure for the Top 100 sites from day one.
+async function seedSiteMapIfNeeded() {
+  try {
+    const SEED_VERSION = '1.0.0';
+    const { siteMapSeedVersion } = await chrome.storage.local.get(['siteMapSeedVersion']);
+    if (siteMapSeedVersion === SEED_VERSION) return; // Already seeded this version
+
+    const { token } = await chrome.storage.local.get(['token']);
+    if (!token) return; // Not logged in yet — will retry on next startup
+
+    // Fetch the seed bundle from the extension package
+    const seedUrl = chrome.runtime.getURL('data/sitemap_seed_v1.json');
+    const seedRes = await fetch(seedUrl);
+    if (!seedRes.ok) { console.warn('[SiteMap] Seed file not found'); return; }
+    const seedData = await seedRes.json();
+
+    // Combine entries and platform templates
+    const allEntries = [...(seedData.entries || []), ...(seedData.platformTemplates || [])];
+    if (allEntries.length === 0) return;
+
+    const res = await fetch(`${API_BASE}/api/sitemap/seed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ entries: allEntries, version: SEED_VERSION }),
+    });
+
+    if (res.ok) {
+      const result = await res.json();
+      console.log(`[SiteMap] Seed v${SEED_VERSION} completed:`, result);
+      await chrome.storage.local.set({ siteMapSeedVersion: SEED_VERSION });
+    } else {
+      console.warn('[SiteMap] Seed API call failed:', res.status);
+    }
+  } catch (e) {
+    console.warn('[SiteMap] Seed failed (non-blocking):', e.message);
+  }
+}
+
+// Trigger seed check on startup (non-blocking)
+setTimeout(seedSiteMapIfNeeded, 5000);
+
 // --- Orchestration Engine: Universal Ghost-Driver ---
 
 const SEARCH_URLS = {
@@ -576,29 +638,38 @@ const HUD_SCRIPT = 'content_hud.js';
 // transient states. This helper polls until the tab is accessible.
 // Uses chrome.tabs.get() as a lightweight probe — if it succeeds,
 // the tab is ready for scripting/messaging.
-async function waitForTabReady(tabId, maxWaitMs = 10000) {
+async function waitForTabReady(tabId, maxWaitMs = 10000, { requireComplete = false } = {}) {
   const start = Date.now();
   const pollInterval = 500; // check every 500ms
   while (Date.now() - start < maxWaitMs) {
     try {
       const tab = await chrome.tabs.get(tabId);
-      if (tab && tab.status !== 'unloaded') {
-        return true; // tab is accessible
+      if (requireComplete) {
+        // Strict mode: wait for tab.status === 'complete' (use after navigation-triggering clicks)
+        if (tab && tab.status === 'complete') return { ready: true };
+      } else {
+        // Default: tab exists and is not discarded
+        if (tab && tab.status !== 'unloaded') return { ready: true };
       }
     } catch (err) {
       const msg = err.message || '';
-      if (msg.includes('cannot be edited') || msg.includes('dragging') || msg.includes('No tab with id')) {
+      // "No tab with id" = tab was closed — this is FATAL, not transient
+      if (msg.includes('No tab with id')) {
+        console.warn(`[waitForTabReady] Tab ${tabId} no longer exists (closed).`);
+        return { ready: false, reason: 'TAB_CLOSED' };
+      }
+      if (msg.includes('cannot be edited') || msg.includes('dragging')) {
         // Transient — wait and retry
         await new Promise(r => setTimeout(r, pollInterval));
         continue;
       }
       // Non-transient error — give up
-      return false;
+      return { ready: false, reason: 'TAB_ERROR' };
     }
     await new Promise(r => setTimeout(r, pollInterval));
   }
   console.warn(`[waitForTabReady] Tab ${tabId} not ready after ${maxWaitMs}ms`);
-  return false; // timed out but don't throw — let caller decide
+  return { ready: false, reason: 'TIMEOUT' };
 }
 
 // ─── HUD Helpers (inject + send messages) ─────────────────
@@ -1125,6 +1196,33 @@ async function spawnSearchTab(site, query, category, token) {
   if (urlBuilder) {
     // Known site — use hardcoded builder (fast path)
     url = urlBuilder(query);
+
+    // ── Regional Domain Detection ──
+    // For sites with regional variants (amazon.com.be, amazon.de, ebay.co.uk, etc.),
+    // detect the user's actual regional domain from their open tabs and swap the URL.
+    // This prevents redirect loops and country-picker interstitials.
+    if (site === 'amazon' || site === 'ebay') {
+      try {
+        const regionPattern = site === 'amazon'
+          ? /amazon\.(com\.be|com\.au|co\.uk|co\.jp|de|fr|it|es|ca|com\.mx|com\.br|nl|pl|se|sg|in|sa|ae|com)/
+          : /ebay\.(com\.au|co\.uk|de|fr|it|es|ca|com)/;
+        const tabs = await chrome.tabs.query({});
+        for (const t of tabs) {
+          if (!t.url) continue;
+          const match = t.url.match(regionPattern);
+          if (match) {
+            const regionalDomain = `${site}.${match[1]}`;
+            const originalDomain = site === 'amazon' ? 'www.amazon.com' : 'www.ebay.com';
+            url = url.replace(originalDomain, `www.${regionalDomain}`);
+            console.log(`[Ghost-Driver] ${site}: regional domain detected from open tab → ${regionalDomain}`);
+            break;
+          }
+        }
+      } catch (e) {
+        // Non-blocking — fall back to default .com URL
+        console.warn(`[Ghost-Driver] ${site}: regional detection failed, using .com`);
+      }
+    }
   } else {
     // Unknown site — ask Skill Engine for a URL template
     console.log(`[Ghost-Driver] ${site}: not in SEARCH_URLS, calling Skill Engine...`);
@@ -1326,7 +1424,25 @@ async function updateExplorationProgress(step, total, description, status, phase
 
 async function takePageSnapshot(tabId) {
   // Wait for tab to be accessible (user may be switching tabs)
-  await waitForTabReady(tabId, 8000);
+  const tabStatus = await waitForTabReady(tabId, 8000);
+  if (tabStatus.reason === 'TAB_CLOSED') {
+    return {
+      url: 'unknown', title: 'unknown',
+      mainContent: '(Tab was closed)',
+      semanticElements: [],
+      _tabClosed: true,  // Signal to callers that tab is gone
+    };
+  }
+
+  // If tab is still loading (e.g., click triggered navigation), wait for full load
+  // before attempting snapshot — content script can't produce reliable results mid-load
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab && tab.status === 'loading') {
+      console.log(`[Snapshot] Tab ${tabId} still loading — waiting for complete...`);
+      await waitForTabReady(tabId, 8000, { requireComplete: true });
+    }
+  } catch {}
 
   // Wait for DOM to stabilize (SPAs may still be rendering after tab load)
   await waitForDomStable(tabId, 3000, 300);
@@ -1402,7 +1518,10 @@ function isPlaceholderUrl(url) {
 async function executeExploreAction(tabId, action, token, _retryCount = 0) {
   // WAIT FOR TAB: Ensure tab is accessible before any operation.
   // This prevents "Tabs cannot be edited right now" when user is switching tabs.
-  await waitForTabReady(tabId, 8000);
+  const tabStatus = await waitForTabReady(tabId, 8000);
+  if (tabStatus.reason === 'TAB_CLOSED') {
+    return { success: false, error: `Target tab ${tabId} was closed.`, errorType: 'TAB_CLOSED' };
+  }
 
   // PROACTIVE READINESS: Ensure content_explore.js is alive before sending commands.
   // This eliminates "Receiving end does not exist" errors at the source.
@@ -1715,7 +1834,17 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
 
   try {
     // WAIT FOR TAB before any DOM operations (user may be on a different tab)
-    await waitForTabReady(currentTabId, 10000);
+    const loopTabStatus = await waitForTabReady(currentTabId, 10000);
+    if (loopTabStatus.reason === 'TAB_CLOSED') {
+      cleanupLoop();
+      return finishExploration({
+        success: false,
+        error: 'The target tab was closed before exploration could start. Please reopen the page and try again.',
+        stepsUsed: 0,
+        creditsUsed: 0,
+        stepLog: [],
+      });
+    }
 
     // Show HUD on the page — show up to 10 step dots for readability
     const hudSteps = [];
@@ -1797,6 +1926,30 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
 
           if (planRes.ok) {
             const planData = await planRes.json();
+
+            // ── INSTANT ANSWER: planner determined answer is already on the page ──
+            // Skip the entire exploration loop — return the answer directly.
+            if (planData.instantAnswer && planData.instantAnswer.length > 5) {
+              console.log('[Explore] INSTANT ANSWER — skipping exploration loop:', planData.instantAnswer.slice(0, 200));
+              creditsUsed += 0.5; // EXPLORE_PLAN cost only
+              stepLog.push({
+                step: 0,
+                action: { type: 'instant_answer', description: 'Answer found on visible page' },
+                result: { success: true },
+                observation: `Planner found the answer directly: ${planData.instantAnswer.slice(0, 300)}`,
+              });
+              await hudUpdate(currentTabId, 'explore-0', 'success', 'Answer found on page!');
+              await updateExplorationProgress(0, maxSteps, 'Answer found on page!', 'complete');
+              cleanupLoop();
+              return finishExploration({
+                success: true,
+                goalResult: planData.instantAnswer,
+                stepsUsed: 0,
+                creditsUsed,
+                stepLog,
+              });
+            }
+
             if (planData.strategy && planData.strategy.length > 10) {
               currentStrategy = planData.strategy;
               console.log(`[Explore] Observe→Plan: grounded strategy created (${planData.maxSteps} steps recommended): ${currentStrategy.slice(0, 200)}`);
@@ -1856,6 +2009,25 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
       await updateExplorationProgress(step, maxSteps, 'Observing page...', 'running');
 
       const snapshot = await takePageSnapshot(currentTabId);
+
+      // TAB CLOSED: If snapshot signals tab is gone, abort immediately
+      if (snapshot._tabClosed) {
+        console.error(`[Explore] Step ${step}: target tab ${currentTabId} was closed. Aborting.`);
+        stepLog.push({
+          step,
+          action: { type: 'tab_lost', description: `Tab ${currentTabId} closed during snapshot` },
+          result: { success: false, failureReason: 'TAB_CLOSED' },
+          observation: 'The target tab was closed. Exploration cannot continue.',
+        });
+        cleanupLoop();
+        return finishExploration({
+          success: false,
+          error: 'The target tab was closed. Please reopen the page and try again.',
+          stepsUsed: step,
+          creditsUsed,
+          stepLog,
+        });
+      }
 
       // ── AUTH GATE DETECTOR: Comprehensive auth page handling ──
       // Runs BEFORE any action decision. Checks for login, 2FA, CAPTCHA, OAuth.
@@ -1996,11 +2168,99 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         }
       }
 
-      // THINK: call backend for next action
+      // ── SITEMAP PHASE 1: Fingerprint check (for confidence tracking) ──
+      let siteMapMatch = null;
+      try {
+        const lookupUrl = `${API_BASE}/api/sitemap/lookup?url=${encodeURIComponent(snapshot.url)}`;
+        const lookupRes = await fetch(lookupUrl, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (lookupRes.ok) {
+          const lookupData = await lookupRes.json();
+          if (lookupData.found && lookupData.canUseDeterministic) {
+            siteMapMatch = lookupData.siteMap;
+            console.log(`[SiteMap] Fingerprint available for ${lookupData.siteMap.domain} (confidence: ${lookupData.siteMap.confidence}, freshness: ${lookupData.siteMap.freshnessTier})`);
+          }
+        }
+      } catch (siteMapErr) {
+        console.warn('[SiteMap] Lookup failed (non-blocking):', siteMapErr.message);
+      }
+
+      // ── SITEMAP PHASE 2: Deterministic action check ──
+      // "AI explores once, code repeats forever"
+      // Check if we have a stored goal→action mapping for this page.
+      // If yes AND the target element still exists on the page → skip AI call entirely.
+      let siteActionMatch = null;
+      let usedDeterministic = false;
+      try {
+        const actionLookupRes = await fetch(`${API_BASE}/api/sitemap/lookup-action`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            url: snapshot.url,
+            goal,
+            snapshot: { semanticElements: snapshot.semanticElements },
+          }),
+        });
+        if (actionLookupRes.ok) {
+          const actionData = await actionLookupRes.json();
+          if (actionData.found && actionData.siteAction?.matchedElement?.sid) {
+            siteActionMatch = actionData.siteAction;
+            console.log(`[SiteAction] ⚡ Deterministic match! goal="${actionData.siteAction.goalPattern}" → ${actionData.siteAction.actionType} on "${actionData.siteAction.matchedElement.text}" (sid: ${actionData.siteAction.matchedElement.sid}, confidence: ${actionData.siteAction.confidence}, matchScore: ${actionData.siteAction.matchedElement.score.toFixed(2)})`);
+          }
+        }
+      } catch (actionErr) {
+        console.warn('[SiteAction] Lookup failed (non-blocking):', actionErr.message);
+      }
+
+      // THINK: either use deterministic action or call backend AI
       const exploreStepUrl = `${API_BASE}/api/agent/explore-step`;
-      await updateExplorationProgress(step, maxSteps, 'Deciding next action...', 'running');
+      await updateExplorationProgress(step, maxSteps, siteActionMatch ? '⚡ Replaying known action...' : 'Deciding next action...', 'running');
 
       let decision;
+
+      // ── DETERMINISTIC PATH: Skip AI call if we have a confident match ──
+      if (siteActionMatch && siteActionMatch.confidence >= 0.6 && siteActionMatch.matchedElement?.sid) {
+        usedDeterministic = true;
+        console.log(`[SiteAction] ⚡ SKIPPING AI CALL — using deterministic action: ${siteActionMatch.actionType} on sid=${siteActionMatch.matchedElement.sid}`);
+
+        // Build a synthetic decision object matching the AI response format
+        decision = {
+          nextAction: {
+            type: siteActionMatch.actionType,
+            target: siteActionMatch.matchedElement.sid,
+            value: siteActionMatch.actionValue || undefined,
+            description: `⚡ Deterministic: ${siteActionMatch.actionType} "${siteActionMatch.matchedElement.text}"`,
+          },
+          isGoalComplete: false,
+          reasoning: `Deterministic replay — this action (${siteActionMatch.goalPattern}) has succeeded ${siteActionMatch.confidence >= 0.9 ? 'many' : 'several'} times on this page type with ${(siteActionMatch.confidence * 100).toFixed(0)}% confidence.`,
+          // No credits used for deterministic actions!
+        };
+
+        // NOTE: We do NOT increment creditsUsed here — deterministic actions are FREE
+      }
+
+      if (!usedDeterministic) {
+      // ── FAILURE MEMORY: Fetch past failures so AI avoids repeating mistakes ──
+      let failedActions = [];
+      try {
+        const failRes = await fetch(`${API_BASE}/api/sitemap/lookup-failures`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ url: snapshot.url, goal: originalPrompt || goal }),
+        });
+        if (failRes.ok) {
+          const failData = await failRes.json();
+          if (failData.success && failData.failures?.length > 0) {
+            failedActions = failData.failures;
+            console.log(`[SiteAction] 🧠 Found ${failedActions.length} past failures for this goal on ${snapshot.url}`);
+          }
+        }
+      } catch (failErr) {
+        console.warn('[SiteAction] Failure lookup failed (non-blocking):', failErr.message);
+      }
+
+      // ── NORMAL AI PATH: Call backend for next action ──
       try {
         console.log(`[Explore] Step ${step}: calling ${exploreStepUrl}`);
         console.log(`[Explore] Step ${step}: snapshot url=${snapshot.url}, elements=${snapshot.semanticElements?.length || 0}, content=${(snapshot.mainContent || '').length} chars`);
@@ -2015,6 +2275,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           previousPhases: previousPhases.length > 0 ? previousPhases : undefined,
           originalPrompt: originalPrompt || undefined,
           dataBuffer: dataBuffer || undefined,
+          failedActions: failedActions.length > 0 ? failedActions : undefined,
           ...byokPayload(exploreByokConfig),
         };
 
@@ -2113,13 +2374,14 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         stepLog.push({
           step,
           action: { type: 'think', description: 'AI decision' },
-          result: { success: false, isRateLimited },
+          result: { success: false, isRateLimited, failureReason: isRateLimited ? 'RATE_LIMITED' : isNetworkError ? 'NETWORK_ERROR' : 'AI_ERROR' },
           observation: `Think failed: ${userMsg}`,
         });
         await hudUpdate(currentTabId, `explore-${step}`, isRateLimited ? 'running' : 'error', userMsg);
         await updateExplorationProgress(step, maxSteps, userMsg, 'running');
         continue;
       }
+      } // end if (!usedDeterministic)
 
       // ── Loop Detection: stop the AI from repeating the same action ──
       if (decision.nextAction && stepLog.length > 0) {
@@ -2138,11 +2400,148 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
 
           if (repeatCount >= 3) {
             console.warn(`[Explore] Step ${step}: LOOP DETECTED — ${currType}(${currTarget}) repeated ${repeatCount} times`);
-            // Log the loop and try alternative approach
+
+            // ── CONTEXT-AWARE RECOVERY: Branch based on WHY we're stuck ──
+
+            // BRANCH 1: Tab is dead/closed — fatal, don't retry
+            let tabAlive = true;
+            try {
+              await chrome.tabs.get(currentTabId);
+            } catch (tabErr) {
+              const msg = tabErr.message || '';
+              if (msg.includes('No tab with id')) {
+                tabAlive = false;
+              }
+            }
+
+            if (!tabAlive) {
+              console.error(`[Explore] Step ${step}: TAB CLOSED — target tab ${currentTabId} no longer exists. Aborting.`);
+              stepLog.push({
+                step,
+                action: { type: 'tab_lost', description: `Tab ${currentTabId} closed during exploration` },
+                result: { success: false, failureReason: 'TAB_CLOSED' },
+                observation: 'The target tab was closed or navigated away. Exploration cannot continue.',
+              });
+              cleanupLoop();
+              return finishExploration({
+                success: false,
+                error: 'The target tab was closed. Please reopen the page and try again.',
+                stepsUsed: step,
+                creditsUsed,
+                stepLog,
+              });
+            }
+
+            // BRANCH 2: Modal is blocking — try Escape → click close → navigate fallback
+            if (snapshot.hasOpenModal) {
+              console.warn(`[Explore] Step ${step}: MODAL STUCK — attempting modal dismissal subroutine`);
+
+              // Step 2a: Press Escape
+              let modalDismissed = false;
+              try {
+                const escResult = await executeExploreAction(currentTabId, {
+                  type: 'press_key', value: 'Escape',
+                  description: 'Pressing Escape to dismiss modal',
+                }, token);
+                console.log(`[Explore] Modal dismiss: Escape result:`, escResult?.success);
+                await new Promise(r => setTimeout(r, 600));
+
+                // Check if modal is gone via fresh snapshot
+                const postEscSnapshot = await takePageSnapshot(currentTabId);
+                if (!postEscSnapshot.hasOpenModal) {
+                  modalDismissed = true;
+                  console.log('[Explore] Modal dismissed via Escape key');
+                }
+              } catch (escErr) {
+                console.warn('[Explore] Modal dismiss: Escape failed:', escErr.message);
+              }
+
+              // Step 2b: If Escape didn't work, find and click a close button inside the modal
+              if (!modalDismissed) {
+                try {
+                  // Find a close/dismiss/cancel button inside the modal from the snapshot
+                  const modalCloseElement = (snapshot.semanticElements || []).find(el => {
+                    if (!el.inModal) return false;
+                    const text = (el.text || '').toLowerCase();
+                    const ariaLabel = (el.attrs?.ariaLabel || '').toLowerCase();
+                    const iconMeaning = (el.attrs?.iconMeaning || '').toLowerCase();
+                    return (
+                      text === 'close' || text === 'cancel' || text === 'dismiss' || text === '×' || text === 'x' ||
+                      ariaLabel.includes('close') || ariaLabel.includes('dismiss') || ariaLabel.includes('cancel') ||
+                      iconMeaning.includes('close') || iconMeaning.includes('dismiss')
+                    );
+                  });
+
+                  if (modalCloseElement) {
+                    console.log(`[Explore] Modal dismiss: clicking close button ${modalCloseElement.sid} ("${modalCloseElement.text}")`);
+                    const clickResult = await executeExploreAction(currentTabId, {
+                      type: 'click_element', target: modalCloseElement.sid,
+                      description: `Clicking modal close button: "${modalCloseElement.text}"`,
+                    }, token);
+                    await new Promise(r => setTimeout(r, 600));
+
+                    const postClickSnapshot = await takePageSnapshot(currentTabId);
+                    if (!postClickSnapshot.hasOpenModal) {
+                      modalDismissed = true;
+                      console.log(`[Explore] Modal dismissed via click on ${modalCloseElement.sid}`);
+                    }
+                  } else {
+                    console.warn('[Explore] Modal dismiss: no close/cancel button found in modal elements');
+                  }
+                } catch (clickErr) {
+                  console.warn('[Explore] Modal dismiss: click-close failed:', clickErr.message);
+                }
+              }
+
+              // Log the modal break result
+              stepLog.push({
+                step,
+                action: { type: 'modal_break', description: `Modal stuck: ${currType}(${currTarget}) x${repeatCount}, dismissed=${modalDismissed}` },
+                result: { success: modalDismissed, failureReason: modalDismissed ? null : 'MODAL_STUCK' },
+                observation: modalDismissed
+                  ? 'Modal dismissed successfully. Re-scanning page.'
+                  : 'Modal could not be dismissed via Escape or close button. Try navigating to a different URL.',
+              });
+
+              // ── SITEACTION: Capture successful modal dismissal as learned behavior ──
+              // So future visits to this site know "when a modal appears, press Escape" or
+              // "click the close button" without the agent having to rediscover it.
+              if (modalDismissed && snapshot?.url) {
+                try {
+                  fetch(`${API_BASE}/api/sitemap/capture-action`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                    body: JSON.stringify({
+                      url: snapshot.url,
+                      goal: 'dismiss_modal',
+                      actionType: 'press_key',
+                      targetText: 'Escape',
+                      targetRole: 'modal-dismiss',
+                      targetSection: null,
+                      targetXPct: null,
+                      targetYPct: null,
+                      actionValue: 'Escape',
+                    }),
+                  }).catch(() => {});
+                } catch {}
+              }
+
+              decision.nextAction = {
+                type: 'scrape_page',
+                description: `Re-scanning after modal ${modalDismissed ? 'dismissal' : 'break attempt'}`,
+              };
+              decision.revisedStrategy = modalDismissed
+                ? `Modal has been closed. Continue with the original goal. Do NOT re-open the same modal.`
+                : `A modal/dialog is blocking the page and could not be dismissed. Navigate to a different URL or try a completely different approach to achieve the goal.`;
+              if (!modalDismissed) consecutiveFailures++;
+              continue;
+            }
+
+            // BRANCH 3: Default — no modal, tab alive. Original behavior: scroll + scrape.
             stepLog.push({
               step,
               action: { type: 'loop_break', description: `Loop detected: ${currType}(${currTarget}) x${repeatCount}` },
-              result: { success: false },
+              result: { success: false, failureReason: 'ACTION_LOOP' },
               observation: `LOOP BREAK: Agent tried ${currType} on "${currTarget}" ${repeatCount} times with no progress. Attempting alternative approach: scroll + re-scan.`,
             });
 
@@ -2228,6 +2627,146 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
               console.warn(`[Explore] Step ${step}: type_text failed twice on "${targetId}" — injecting click-first hint`);
               decision.revisedStrategy = (decision.revisedStrategy || currentStrategy) +
                 ' IMPORTANT: type_text has failed twice on this target. Before retrying, use click_element on the exact target field to activate the editor cursor, wait a moment, then try type_text again with the same content.';
+            }
+          }
+        }
+      }
+
+      // ── ENHANCED CYCLE DETECTION (Layer 3) ──
+      // Detect cross-target cycles: A→B→C→A patterns (not just A→A repeats).
+      // Also detect no-progress states where interactive actions don't change the page.
+      if (decision.nextAction && stepLog.length >= 4) {
+        const interactiveTypes = new Set(['click_element', 'type_text', 'navigate', 'select_option', 'fill_field', 'press_key']);
+        const recentInteractive = stepLog
+          .filter(s => interactiveTypes.has(s.action?.type))
+          .slice(-6);
+
+        if (recentInteractive.length >= 4) {
+          // Build a signature sequence from recent interactive actions
+          const signatures = recentInteractive.map(s => `${s.action.type}:${s.action.target || ''}`);
+          const currentSig = `${decision.nextAction.type}:${decision.nextAction.target || ''}`;
+
+          // Check for A→B→A→B or A→B→C→A cycles (look for current signature repeating in recent history)
+          const cycleWindow = signatures.slice(-4);
+          const matchesInWindow = cycleWindow.filter(s => s === currentSig).length;
+
+          if (matchesInWindow >= 2) {
+            // Current action appeared 2+ times in last 4 interactive steps = cross-target cycle
+            console.warn(`[Explore] Step ${step}: CROSS-TARGET CYCLE detected — "${currentSig}" appeared ${matchesInWindow}x in last 4 interactive steps`);
+            console.warn(`[Explore] Cycle pattern: [${cycleWindow.join(' → ')} → ${currentSig}]`);
+
+            // Count total cycle blocks this phase
+            const cycleBlocks = stepLog.filter(s => s.action?.type === 'cycle_break').length;
+
+            if (cycleBlocks >= 3) {
+              // Hard circuit breaker: 3 cycle blocks → force complete with partial answer
+              console.warn(`[Explore] Step ${step}: HARD CIRCUIT BREAKER — ${cycleBlocks} cycle blocks, forcing goal complete`);
+              const partialResults = stepLog
+                .filter(s => s.observation && s.result?.success !== false)
+                .map(s => s.observation)
+                .slice(-3)
+                .join(' | ');
+
+              decision.isGoalComplete = true;
+              decision.goalResult = `I was unable to fully complete this task due to a navigation cycle on this page. Here is what I found so far: ${partialResults || 'No data collected yet. The page may require manual interaction.'}`;
+              decision.nextAction = null;
+            } else {
+              // Soft break: inject cycle-break step, force navigate or scrape
+              stepLog.push({
+                step,
+                action: { type: 'cycle_break', description: `Cross-target cycle: ${currentSig} (block #${cycleBlocks + 1})` },
+                result: { success: false, failureReason: 'CYCLE_DETECTED' },
+                observation: `CYCLE BREAK: Agent is cycling between targets without progress. Pattern: [${cycleWindow.join(' → ')}]. Forcing fresh approach.`,
+              });
+              decision.nextAction = {
+                type: 'scrape_page',
+                description: `Re-scanning after cycle break (pattern: ${cycleWindow.slice(-2).join('→')})`,
+              };
+              // Build explicit list of cycling elements so AI knows exactly what to avoid
+              const cycleAvoidList = [];
+              for (const sig of [...new Set(cycleWindow)]) {
+                const [, ...targetParts] = sig.split(':');
+                const targetSid = targetParts.join(':');
+                if (targetSid) {
+                  const el = snapshot?.semanticElements?.find(e => e.sid === targetSid);
+                  const elText = el?.text || el?.attrs?.ariaLabel || targetSid;
+                  cycleAvoidList.push(`"${elText}" (${targetSid})`);
+                }
+              }
+              const avoidStr = cycleAvoidList.length > 0
+                ? ` DO NOT click any of these elements again: ${cycleAvoidList.join(', ')}.`
+                : '';
+
+              decision.revisedStrategy = (decision.revisedStrategy || currentStrategy) +
+                ` CRITICAL: You are cycling between the same elements.${avoidStr} Take a COMPLETELY different approach — navigate to a different URL, scroll to find new elements, or mark the goal complete with what you have.`;
+              consecutiveFailures++;
+
+              // ── NEGATIVE SIGNAL: Record ALL elements in the cycle as failures ──
+              // The cycle means these elements don't achieve the goal, even though
+              // the clicks technically "succeeded". This teaches the SiteMap to
+              // avoid these elements for this goal on future visits.
+              if (snapshot?.url) {
+                const cycleElements = new Set();
+                for (const sig of cycleWindow) {
+                  const target = sig.split(':').slice(1).join(':');
+                  if (target) cycleElements.add(target);
+                }
+                // Also add the current action that triggered the cycle detection
+                if (decision.nextAction?.target) cycleElements.add(currentSig.split(':').slice(1).join(':'));
+
+                for (const targetSid of cycleElements) {
+                  const targetEl = snapshot.semanticElements?.find(el => el.sid === targetSid);
+                  const cycleTargetText = targetEl?.text || targetEl?.attrs?.ariaLabel || targetSid || '';
+                  if (cycleTargetText) {
+                    fetch(`${API_BASE}/api/sitemap/capture-action`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                      body: JSON.stringify({
+                        url: snapshot.url,
+                        goal: originalPrompt || goal,
+                        actionType: 'click_element',
+                        targetText: cycleTargetText.slice(0, 60),
+                        targetRole: targetEl?.attrs?.role || targetEl?.type || null,
+                        targetSection: targetEl?.section || null,
+                        targetXPct: targetEl?.xPct ?? null,
+                        targetYPct: targetEl?.yPct ?? null,
+                        actionValue: null,
+                        failed: true,
+                      }),
+                    }).then(r => {
+                      if (r.ok) console.log(`[SiteAction] Negative signal from CYCLE: "${cycleTargetText.slice(0, 40)}" doesn't achieve goal`);
+                    }).catch(() => {});
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // No-change detector: if last 3 interactive actions all succeeded but page content
+        // hash stayed the same (snapshot URL + element count), the agent is spinning in place
+        if (decision.nextAction && recentInteractive.length >= 3) {
+          const recentSuccessful = recentInteractive.filter(s => s.result?.success !== false).slice(-3);
+          if (recentSuccessful.length >= 3) {
+            // Check if all recent successful steps had similar page states
+            const pageStates = recentSuccessful
+              .map(s => s.observation || '')
+              .filter(obs => !obs.includes('Navigated') && !obs.includes('new content'));
+            if (pageStates.length >= 3) {
+              // 3 actions without any navigation or new content = spinning
+              const noChangeBlocks = stepLog.filter(s => s.action?.type === 'no_change_break').length;
+              if (noChangeBlocks === 0) {
+                // First time: warn and inject hint
+                console.warn(`[Explore] Step ${step}: NO-CHANGE detected — 3 successful actions with no page state change`);
+                stepLog.push({
+                  step: -1,
+                  action: { type: 'no_change_break', description: 'Page not changing despite actions' },
+                  result: { success: false, failureReason: 'NO_PAGE_CHANGE' },
+                  observation: 'WARNING: Multiple actions executed but page state unchanged. The information may already be visible, or a different approach is needed.',
+                });
+                decision.revisedStrategy = (decision.revisedStrategy || currentStrategy) +
+                  ' The page is not changing despite your actions. CHECK: is the answer already visible in the page text? If yes, set isGoalComplete=true. If not, navigate to a different page.';
+              }
             }
           }
         }
@@ -2323,7 +2862,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
             step,
             action: decision.nextAction,
             reasoning: decision.reasoning,
-            result: { success: false },
+            result: { success: false, failureReason: 'CONSENT_DECLINED' },
             observation: `User declined consent: ${decision.consentReason}`,
           });
           await hudUpdate(currentTabId, `explore-${step}`, 'error',
@@ -2354,7 +2893,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         stepLog.push({
           step,
           action: { type: 'none', description: 'AI returned no action' },
-          result: { success: false },
+          result: { success: false, failureReason: 'NO_ACTION' },
           observation: 'AI did not provide a nextAction. Goal may need rephrasing.',
         });
         await hudUpdate(currentTabId, `explore-${step}`, 'error', 'No action from AI');
@@ -2369,14 +2908,63 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         console.log(`[Explore] Step ${step}: paste_tsv — substituted scratchpad data (${(dataBuffer || '').length} chars)`);
       }
 
+      // ── STALE SID GUARD: Verify target element exists in current snapshot ──
+      // If the AI references a SID that's not in the current snapshot, it's using a stale ID
+      // from a previous step. Force a re-scrape instead of clicking the wrong element.
+      const sidTargetActions = new Set(['click_element', 'type_text', 'read_element', 'select_option', 'press_key']);
+      if (decision.nextAction.target && sidTargetActions.has(decision.nextAction.type) &&
+          snapshot.semanticElements?.length > 0) {
+        const targetSid = decision.nextAction.target;
+        const matchingEl = snapshot.semanticElements.find(el => el.sid === targetSid);
+        if (!matchingEl) {
+          console.warn(`[Explore] Step ${step}: STALE SID "${targetSid}" not found in current snapshot (${snapshot.semanticElements.length} elements). Forcing scrape_page.`);
+          stepLog.push({
+            step,
+            action: { type: 'stale_sid_guard', description: `Blocked stale SID: ${targetSid} for ${decision.nextAction.type}` },
+            result: { success: false, failureReason: 'STALE_SID' },
+            observation: `Element "${targetSid}" does not exist in the current page snapshot. The page likely changed since the last observation. Re-scanning the page.`,
+          });
+          decision.nextAction = {
+            type: 'scrape_page',
+            description: `Re-scanning after stale SID detection (${targetSid} not found)`,
+          };
+          decision.revisedStrategy = (decision.revisedStrategy || currentStrategy) +
+            ` CRITICAL: You used a stale element ID "${targetSid}" that no longer exists. Use ONLY IDs from the CURRENT "Interactable Elements" list below. Never reuse IDs from previous steps.`;
+          consecutiveFailures++;
+          continue;
+        }
+      }
+
       const actionDesc = decision.nextAction.description || decision.nextAction.type || 'Action';
       await hudUpdate(currentTabId, `explore-${step}`, 'processing', actionDesc);
       await updateExplorationProgress(step, maxSteps, actionDesc, 'running');
 
       const actionResult = await executeExploreAction(currentTabId, decision.nextAction, token);
 
-      // If navigation happened, re-inject all scripts and restore HUD
-      if (decision.nextAction?.type === 'navigate' && actionResult.success) {
+      // If navigation happened (explicit navigate OR click that triggered page change),
+      // re-inject all scripts and restore HUD
+      let clickCausedNavigation = false;
+      if (decision.nextAction?.type === 'click_element' && actionResult.success) {
+        try {
+          // Wait for tab to finish loading after click (catches link clicks that trigger navigation)
+          await waitForTabReady(currentTabId, 5000, { requireComplete: true });
+          const postClickTab = await chrome.tabs.get(currentTabId);
+          const preClickUrl = snapshot.url || '';
+          const postClickUrl = postClickTab.url || '';
+          // Compare origins + pathnames (ignore hash/query changes — those are SPA, not full nav)
+          try {
+            const pre = new URL(preClickUrl);
+            const post = new URL(postClickUrl);
+            clickCausedNavigation = (pre.origin + pre.pathname) !== (post.origin + post.pathname);
+          } catch {
+            clickCausedNavigation = preClickUrl !== postClickUrl;
+          }
+          if (clickCausedNavigation) {
+            console.log(`[Explore] Step ${step}: click_element caused navigation: ${preClickUrl} → ${postClickUrl}`);
+          }
+        } catch {}
+      }
+      if ((decision.nextAction?.type === 'navigate' || clickCausedNavigation) && actionResult.success) {
         for (const script of ['content_explore.js', HUD_SCRIPT]) {
           try {
             await chrome.scripting.executeScript({
@@ -2405,19 +2993,181 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         step,
         action: decision.nextAction,
         reasoning: decision.reasoning,
-        result: { success: actionResult.success },
+        result: {
+          success: actionResult.success,
+          ...(actionResult.success ? {} : {
+            failureReason: actionResult.blocked ? 'SECURITY_BLOCK'
+              : actionResult.authGate ? 'AUTH_GATE'
+              : (actionResult.errorType || 'ACTION_FAILED'),
+          }),
+        },
         observation: actionResult.observation || actionResult.error || '',
       });
+
+      // ── SITEMAP: Capture fingerprint regardless of action outcome ──
+      // The page structure is valid whether the action succeeded or failed.
+      // Without this, the SiteMap never learns page layouts for sites where
+      // the agent consistently struggles (icon-only buttons, shadow DOM, etc.).
+      // Fires every 3 steps, non-blocking.
+      if (step % 3 === 0 && snapshot?.semanticElements?.length > 0) {
+        try {
+          fetch(`${API_BASE}/api/sitemap/capture`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({
+              url: snapshot.url,
+              snapshot: {
+                semanticElements: snapshot.semanticElements,
+                mainContent: (snapshot.mainContent || '').slice(0, 500),
+                title: snapshot.title,
+                url: snapshot.url,
+              },
+              viewportWidth: snapshot.viewportWidth || 1920,
+              viewportHeight: snapshot.viewportHeight || 1080,
+              platformHints: snapshot.platformHints || {},
+            }),
+          }).then(r => {
+            if (r.ok) console.log(`[SiteMap] Fingerprint captured for ${snapshot.url}`);
+          }).catch(e => console.warn('[SiteMap] Capture failed (non-blocking):', e.message));
+        } catch {}
+      }
 
       if (actionResult.success) {
         consecutiveFailures = 0;
         await hudUpdate(currentTabId, `explore-${step}`, 'success', actionDesc);
         await updateExplorationProgress(step, maxSteps, `Done: ${actionDesc}`, 'running');
+
+        // ── SITEMAP: Record match outcome if we used deterministic path ──
+        if (siteMapMatch?.id) {
+          try {
+            fetch(`${API_BASE}/api/sitemap/record-match`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ siteMapId: siteMapMatch.id, success: true }),
+            }).catch(() => {});
+          } catch {}
+        }
+
+        // ── SITEACTION PHASE 2: Capture successful goal→action mapping ──
+        // Every successful interactive action gets recorded for future deterministic replay.
+        // Non-interactive actions (scrape_page, scroll, wait) are excluded — they don't help with replay.
+        const captureableActions = ['click_element', 'type_text', 'navigate', 'select_option', 'press_key'];
+        if (decision.nextAction && captureableActions.includes(decision.nextAction.type) && snapshot?.url) {
+          try {
+            // Find the target element's details from the snapshot for richer matching
+            const targetSid = decision.nextAction.target;
+            const targetEl = snapshot.semanticElements?.find(el => el.sid === targetSid);
+            const targetText = targetEl?.text || targetEl?.attrs?.ariaLabel || decision.nextAction.target || '';
+
+            if (targetText) {
+              fetch(`${API_BASE}/api/sitemap/capture-action`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                body: JSON.stringify({
+                  url: snapshot.url,
+                  goal: originalPrompt || goal,
+                  actionType: decision.nextAction.type,
+                  targetText: targetText.slice(0, 60),
+                  targetRole: targetEl?.attrs?.role || targetEl?.type || null,
+                  targetSection: targetEl?.section || null,
+                  targetXPct: targetEl?.xPct ?? null,
+                  targetYPct: targetEl?.yPct ?? null,
+                  actionValue: decision.nextAction.value || null,
+                }),
+              }).then(r => {
+                if (r.ok) console.log(`[SiteAction] Captured: ${decision.nextAction.type} on "${targetText.slice(0, 40)}" for goal="${(originalPrompt || goal).slice(0, 40)}"`);
+              }).catch(e => console.warn('[SiteAction] Capture failed (non-blocking):', e.message));
+            }
+          } catch {}
+        }
+
+        // ── SITEACTION PHASE 2: Record deterministic replay success ──
+        if (usedDeterministic && siteActionMatch?.id) {
+          try {
+            fetch(`${API_BASE}/api/sitemap/record-action`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ siteActionId: siteActionMatch.id, success: true }),
+            }).catch(() => {});
+          } catch {}
+        }
       } else {
         consecutiveFailures++;
+
+        // TAB CLOSED during action: abort immediately, don't waste iterations
+        if (actionResult.errorType === 'TAB_CLOSED') {
+          console.error(`[Explore] Step ${step}: tab closed during action execution. Aborting.`);
+          cleanupLoop();
+          return finishExploration({
+            success: false,
+            error: 'The target tab was closed. Please reopen the page and try again.',
+            stepsUsed: step,
+            creditsUsed,
+            stepLog,
+          });
+        }
+
         await hudUpdate(currentTabId, `explore-${step}`, 'error',
           `Failed: ${actionResult.error || 'unknown error'}`);
         await updateExplorationProgress(step, maxSteps, `Failed: ${actionResult.error || actionDesc}`, 'running');
+
+        // Record SiteMap match failure if deterministic path was used
+        if (siteMapMatch?.id) {
+          try {
+            fetch(`${API_BASE}/api/sitemap/record-match`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ siteMapId: siteMapMatch.id, success: false }),
+            }).catch(() => {});
+          } catch {}
+        }
+
+        // ── SITEACTION PHASE 2: Record deterministic replay failure ──
+        // If deterministic action failed, record it so confidence drops and we fall back to AI next time
+        if (usedDeterministic && siteActionMatch?.id) {
+          try {
+            fetch(`${API_BASE}/api/sitemap/record-action`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ siteActionId: siteActionMatch.id, success: false }),
+            }).catch(() => {});
+          } catch {}
+        }
+
+        // ── NEGATIVE SIGNAL: Record failed AI-directed actions ──
+        // Even when the AI picks an element and it fails, capture this as a negative signal.
+        // This way the SiteMap learns "this element doesn't work for this goal" and future
+        // visits can avoid the same mistake. Without this, persistent failures are invisible.
+        if (!usedDeterministic && decision.nextAction && snapshot?.url) {
+          const failCaptureActions = ['click_element', 'type_text', 'select_option', 'press_key'];
+          if (failCaptureActions.includes(decision.nextAction.type)) {
+            try {
+              const targetSid = decision.nextAction.target;
+              const targetEl = snapshot.semanticElements?.find(el => el.sid === targetSid);
+              const failTargetText = targetEl?.text || targetEl?.attrs?.ariaLabel || decision.nextAction.target || '';
+              if (failTargetText) {
+                fetch(`${API_BASE}/api/sitemap/capture-action`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                  body: JSON.stringify({
+                    url: snapshot.url,
+                    goal: originalPrompt || goal,
+                    actionType: decision.nextAction.type,
+                    targetText: failTargetText.slice(0, 60),
+                    targetRole: targetEl?.attrs?.role || targetEl?.type || null,
+                    targetSection: targetEl?.section || null,
+                    targetXPct: targetEl?.xPct ?? null,
+                    targetYPct: targetEl?.yPct ?? null,
+                    actionValue: decision.nextAction.value || null,
+                    failed: true,
+                  }),
+                }).then(r => {
+                  if (r.ok) console.log(`[SiteAction] Negative signal: ${decision.nextAction.type} on "${failTargetText.slice(0, 40)}" FAILED`);
+                }).catch(() => {});
+              }
+            } catch {}
+          }
+        }
       }
 
       // Dynamic pause between steps — use DOM stability detection for clicks
@@ -3421,25 +4171,40 @@ async function handleMessage(request, sender) {
       if (!isAllowedUrl(action.value)) {
         return { success: false, error: `Navigation to ${action.value} is not allowed.` };
       }
-      // Check if the target URL is already open in an existing tab
-      const allTabs = await chrome.tabs.query({ currentWindow: true });
-      const targetHost = new URL(action.value).hostname;
-      const existingTab = allTabs.find(t => {
-        try { return new URL(t.url).hostname === targetHost; } catch { return false; }
-      });
 
-      let navTabId;
-      if (existingTab) {
-        // Site already open — just switch to it
-        await chrome.tabs.update(existingTab.id, { active: true });
-        navTabId = existingTab.id;
-      } else {
-        // Open in a NEW tab so the current page is preserved
-        const newTab = await chrome.tabs.create({ url: action.value, active: true });
-        navTabId = newTab.id;
-        await waitForTabLoad(navTabId, 10000);
+      // Retry wrapper for transient Chrome errors ("Tabs cannot be edited right now")
+      const MAX_NAV_RETRIES = 3;
+      for (let attempt = 0; attempt < MAX_NAV_RETRIES; attempt++) {
+        try {
+          // Check if the target URL is already open in an existing tab
+          const allTabs = await chrome.tabs.query({ currentWindow: true });
+          const targetHost = new URL(action.value).hostname;
+          const existingTab = allTabs.find(t => {
+            try { return new URL(t.url).hostname === targetHost; } catch { return false; }
+          });
+
+          let navTabId;
+          if (existingTab) {
+            // Site already open — switch to it AND navigate to the new URL
+            await chrome.tabs.update(existingTab.id, { active: true, url: action.value });
+            navTabId = existingTab.id;
+            await waitForTabLoad(navTabId, 10000);
+          } else {
+            // Open in a NEW tab so the current page is preserved
+            const newTab = await chrome.tabs.create({ url: action.value, active: true });
+            navTabId = newTab.id;
+            await waitForTabLoad(navTabId, 10000);
+          }
+          return { success: true, tabId: navTabId };
+        } catch (navErr) {
+          const msg = (navErr.message || '').toLowerCase();
+          if ((msg.includes('cannot be edited') || msg.includes('dragging')) && attempt < MAX_NAV_RETRIES - 1) {
+            await new Promise(r => setTimeout(r, 600 * (attempt + 1)));
+            continue;
+          }
+          return { success: false, error: navErr.message || 'Navigation failed.' };
+        }
       }
-      return { success: true, tabId: navTabId };
     }
 
     // semantic_fill: Ghost-Driver AI form filling (stageAction already returns pageStateAfter)

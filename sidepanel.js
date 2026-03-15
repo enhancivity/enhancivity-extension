@@ -72,6 +72,8 @@ function truncateForDisplay(text, maxLen = 500) {
 
 // ── Conversation Helpers ───────────────────────────────────────
 
+let _navigationInFlight = false; // suppresses onActivated conversation reset during agent-initiated navigation
+
 function convKey() {
   return currentTabId ? `enhConversation_${currentTabId}` : 'enhConversation_global';
 }
@@ -120,9 +122,47 @@ function rebuildChatThread() {
 
 function extractSiteHint(prompt) {
   const lower = prompt.toLowerCase();
-  const sites = ['amazon', 'ebay', 'etsy', 'google', 'expedia', 'kayak', 'skyscanner'];
-  const mentioned = sites.filter(s => lower.includes(s));
-  if (mentioned.length > 0) return { explicitSites: mentioned, onlyThese: true };
+
+  // Broad list of well-known sites (covers shopping, travel, jobs, freelance, real estate, cars, general)
+  const knownSites = [
+    'amazon', 'ebay', 'etsy', 'walmart', 'target', 'bestbuy', 'best buy', 'costco', 'newegg',
+    'aliexpress', 'wayfair', 'overstock', 'zappos', 'nordstrom', 'macys', 'ikea', 'homedepot', 'home depot',
+    'google', 'bing', 'duckduckgo',
+    'expedia', 'kayak', 'skyscanner', 'booking', 'airbnb', 'hotels', 'priceline', 'tripadvisor',
+    'indeed', 'linkedin', 'glassdoor', 'ziprecruiter', 'monster',
+    'fiverr', 'upwork', 'freelancer', 'toptal',
+    'zillow', 'rightmove', 'redfin', 'realtor',
+    'autotrader', 'cargurus', 'carmax',
+    'youtube', 'reddit', 'twitter', 'facebook', 'instagram', 'tiktok', 'pinterest',
+    'github', 'stackoverflow', 'stack overflow',
+    'netflix', 'spotify', 'hulu', 'disney',
+    'craigslist', 'mercari', 'poshmark', 'depop', 'vinted'
+  ];
+
+  const mentioned = knownSites.filter(s => {
+    // For multi-word names (e.g. "best buy"), check as-is
+    if (s.includes(' ')) return lower.includes(s);
+    // For single-word names, use word boundary check to avoid false positives
+    // e.g., "target" in "targeting" should not match, but "target" as standalone should
+    const re = new RegExp(`\\b${s}\\b`);
+    return re.test(lower);
+  });
+
+  // Also detect explicit domain mentions like "newegg.com", "shop.xyz", etc.
+  const domainPattern = /\b([a-z0-9][-a-z0-9]*)\.(com|co\.uk|de|fr|ca|com\.au|net|org|io)\b/g;
+  let match;
+  while ((match = domainPattern.exec(lower)) !== null) {
+    const domain = match[1];
+    // Skip generic words that happen to precede .com in normal text
+    if (!['www', 'http', 'https', 'mail', 'api', 'service'].includes(domain) && !mentioned.includes(domain)) {
+      mentioned.push(domain);
+    }
+  }
+
+  // Deduplicate — normalize multi-word to single key (e.g., "best buy" → "bestbuy")
+  const deduped = [...new Set(mentioned.map(s => s.replace(/\s+/g, '')))];
+
+  if (deduped.length > 0) return { explicitSites: deduped, onlyThese: true };
   return null;
 }
 
@@ -269,6 +309,10 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
     currentTabUrl = tab.url || '';
     currentSite = detectSite(currentTabUrl);
     applyContext(currentSite);
+
+    // If the agent just navigated to this tab, don't reset the conversation —
+    // the conversation was already migrated to this tab's key in renderAutoExecute
+    if (_navigationInFlight) return;
 
     // Switch conversation to new tab's conversation
     try {
@@ -971,9 +1015,24 @@ function renderAutoExecute(container, data) {
   card.appendChild(statusEl);
   container.appendChild(card);
 
+  // Flag: suppress onActivated conversation reset while navigation is in flight
+  const isNavAction = data.action_type === 'NAVIGATE' || data.action_type === 'SEARCH_SITE' || (data.dom_actions?.[0]?.action === 'navigate');
+  if (isNavAction) {
+    _navigationInFlight = true;
+    // Safety: clear flag after 15s in case the promise never resolves
+    setTimeout(() => { _navigationInFlight = false; }, 15000);
+  }
+
   executeAutoAction(data).then(async (res) => {
+    _navigationInFlight = false;
     if (res?.success) {
-      if (data.action_type === 'NAVIGATE' || (data.dom_actions?.[0]?.action === 'navigate')) {
+      // If navigation returned a new tabId, migrate conversation to that tab
+      if (isNavAction && res.tabId && res.tabId !== currentTabId) {
+        const newKey = `enhConversation_${res.tabId}`;
+        try { await chrome.storage.session.set({ [newKey]: conversationMessages }); } catch {}
+        currentTabId = res.tabId;
+      }
+      if (isNavAction) {
         statusEl.textContent = 'Done \u2014 page opened.';
         statusEl.style.color = '#34d399';
         return;
@@ -1391,7 +1450,7 @@ async function startOrchestration(searchPlan, userPrompt) {
   }
 
   const res = await new Promise((resolve) => {
-    const timeout = setTimeout(() => resolve({ success: false, error: 'Search timed out after 60 seconds.' }), 60000);
+    const timeout = setTimeout(() => resolve({ success: false, error: 'Search timed out after 90 seconds.' }), 90000);
     const resultListener = (changes, areaName) => {
       if (areaName !== 'session' || !changes.orchestrationResult) return;
       clearTimeout(timeout);
