@@ -172,6 +172,8 @@ function showView(viewId) {
   authView.classList.add('hidden');
   mainView.classList.add('hidden');
   settingsView.classList.add('hidden');
+  const lv = $('#learning-view');
+  if (lv) lv.classList.add('hidden');
   $(viewId).classList.remove('hidden');
 }
 
@@ -295,6 +297,9 @@ async function initMainView() {
       attachExplorationHUD(exploreState.explorationActive);
     }
   } catch { /* non-critical */ }
+
+  // Initialize Learning Mode
+  setupLearningMode();
 
   promptInput.focus();
 }
@@ -435,8 +440,19 @@ async function handleSubmit() {
     return;
   }
 
+  if (res.data?.action_type === 'PARALLEL_EXPLORE' && res.data?.parallel_explore_plan) {
+    renderParallelExplorePlan(res.data);
+    return;
+  }
+
   if (res.data?.action_type === 'FIND_AND_REPLY') {
     await handleFindAndReply(res.data);
+    return;
+  }
+
+  // RECIPE_MATCH: offer to replay a learned recipe
+  if (res.data?.action_type === 'RECIPE_MATCH' && res.data?.recipe) {
+    renderRecipeMatch(res.data);
     return;
   }
 
@@ -694,6 +710,28 @@ function renderResultsInto(container, data) {
     return;
   }
 
+  if (data.action_type === 'PARALLEL_EXPLORE_RESULT') {
+    const card = document.createElement('div');
+    card.className = 'action-card synthesis-card';
+    const headlineEl = document.createElement('p');
+    headlineEl.className = 'action-headline';
+    headlineEl.textContent = 'Comparison Complete';
+    card.appendChild(headlineEl);
+    const synthEl = document.createElement('div');
+    synthEl.className = 'synthesis-content';
+    synthEl.style.whiteSpace = 'pre-wrap';
+    synthEl.textContent = truncateForDisplay(data.synthesis || 'Comparison finished.');
+    card.appendChild(synthEl);
+    if (data.tabCount) {
+      const metaEl = document.createElement('p');
+      metaEl.style.cssText = 'font-size: 10px; opacity: 0.5; margin-top: 8px;';
+      metaEl.textContent = `${data.tabCount} sources \u00B7 ${(data.creditsUsed || 0).toFixed(1)} EU`;
+      card.appendChild(metaEl);
+    }
+    container.appendChild(card);
+    return;
+  }
+
   if (data.action_type === 'FIND_AND_REPLY') {
     const findReplyCard = document.createElement('div');
     findReplyCard.className = 'action-card consent-soft';
@@ -735,6 +773,200 @@ function renderResults(data) {
   const wrapper = document.createElement('div');
   wrapper.className = 'msg msg-assistant';
   renderResultsInto(wrapper, data);
+  resultsArea.appendChild(wrapper);
+  resultsArea.classList.remove('hidden');
+  chatArea.scrollTop = chatArea.scrollHeight;
+}
+
+function renderRecipeMatch(data) {
+  const recipe = data.recipe;
+  const variables = Array.isArray(recipe.variables) ? recipe.variables : [];
+  const wrapper = document.createElement('div');
+  wrapper.className = 'msg msg-assistant';
+
+  const card = document.createElement('div');
+  card.className = 'action-card';
+  card.style.borderLeft = '3px solid #34d399';
+
+  const headline = document.createElement('p');
+  headline.className = 'action-headline';
+  headline.textContent = data.headline || 'Learned recipe found!';
+  card.appendChild(headline);
+
+  const desc = document.createElement('p');
+  desc.className = 'action-summary';
+  desc.textContent = data.primary_content || `${recipe.stepCount} steps, ${Math.round(recipe.confidence * 100)}% confidence`;
+  card.appendChild(desc);
+
+  // If recipe has variables, show input fields inline
+  if (variables.length > 0) {
+    const varsDiv = document.createElement('div');
+    varsDiv.style.cssText = 'margin-top: 10px;';
+    for (const v of variables) {
+      const field = document.createElement('div');
+      field.style.cssText = 'margin-bottom: 8px;';
+      field.innerHTML = `
+        <label style="display:block;font-size:11px;font-weight:500;color:#a5b4fc;margin-bottom:3px;">${escapeHtml(v.description || v.name)}</label>
+        <input type="text" data-var-name="${escapeHtml(v.name)}" placeholder="${escapeHtml(v.description || v.name)}"
+          style="width:100%;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 10px;color:#ededef;font-size:12px;font-family:inherit;outline:none;">
+      `;
+      varsDiv.appendChild(field);
+    }
+    card.appendChild(varsDiv);
+  }
+
+  const btnRow = document.createElement('div');
+  btnRow.style.cssText = 'display: flex; gap: 8px; margin-top: 10px;';
+
+  const replayBtn = document.createElement('button');
+  replayBtn.className = 'btn btn-primary btn-sm';
+  replayBtn.textContent = 'Replay Recipe';
+  replayBtn.addEventListener('click', async () => {
+    // Collect variables if any
+    const varValues = {};
+    const varInputs = card.querySelectorAll('input[data-var-name]');
+    for (const input of varInputs) {
+      varValues[input.dataset.varName] = input.value;
+    }
+
+    // Pre-check: verify current tab matches recipe domain
+    try {
+      const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (currentTab?.url) {
+        const currentDomain = new URL(currentTab.url).hostname.replace(/^www\./, '').toLowerCase();
+        const recipeDomain = (recipe.siteDomain || '').replace(/^www\./, '').toLowerCase();
+        if (recipeDomain && currentDomain !== recipeDomain) {
+          const mismatchEl = document.createElement('p');
+          mismatchEl.style.cssText = 'font-size: 12px; color: #fbbf24; margin-top: 8px;';
+          mismatchEl.textContent = `This recipe was recorded on ${recipeDomain}. You're currently on ${currentDomain}. Navigate to ${recipeDomain} first, then retry.`;
+          card.appendChild(mismatchEl);
+          return;
+        }
+      }
+    } catch {}
+
+    // Disable buttons, show progress inline
+    replayBtn.disabled = true;
+    replayBtn.textContent = 'Running...';
+    skipBtn.disabled = true;
+
+    const progressEl = document.createElement('p');
+    progressEl.style.cssText = 'font-size: 12px; color: #a5b4fc; margin-top: 8px;';
+    progressEl.textContent = 'Starting replay...';
+    card.appendChild(progressEl);
+
+    // Listen for progress updates
+    const progressListener = (msg) => {
+      if (msg.type === 'replay_progress' && msg.data) {
+        progressEl.textContent = `Step ${msg.data.stepNumber}/${msg.data.totalSteps}: ${msg.data.description || ''}`;
+      }
+    };
+    chrome.runtime.onMessage.addListener(progressListener);
+
+    try {
+      const res = await sendToBackground('learning_replay_recipe', {
+        recipe,
+        variables: varValues,
+      }, 120000);
+
+      chrome.runtime.onMessage.removeListener(progressListener);
+
+      if (res?.success && !res?.partial) {
+        // Full completion — all steps ran successfully
+        sendToBackground('learning_record_outcome', { recipeId: recipe.id, success: true, durationMs: res.durationMs });
+        progressEl.style.color = '#34d399';
+        progressEl.textContent = `Done! ${res.completedSteps}/${res.totalSteps} steps in ${((res.durationMs || 0) / 1000).toFixed(1)}s — 0 EU used`;
+        replayBtn.textContent = 'Completed';
+      } else if (res?.success && res?.partial) {
+        // Partial — some steps ran but replay stopped (page navigated away, etc.)
+        // This should rarely happen now that background.js handles continuation,
+        // but guard against it just in case.
+        sendToBackground('learning_record_outcome', { recipeId: recipe.id, success: false });
+        progressEl.style.color = '#fbbf24';
+        progressEl.textContent = `Partial: ${res.completedSteps}/${res.totalSteps} steps completed. Page navigated away before finishing.`;
+        replayBtn.textContent = 'Retry';
+        replayBtn.disabled = false;
+        skipBtn.disabled = false;
+        skipBtn.textContent = 'Try AI Instead';
+      } else {
+        // Only penalize confidence if the failure is NOT "element not found" on step 1
+        // Step 1 failures almost always mean wrong page/wrong site — not a bad recipe
+        const isPageMismatch = res?.failedAtStep === 1 && (res?.failReason || '').includes('Element not found');
+        if (!isPageMismatch) {
+          sendToBackground('learning_record_outcome', { recipeId: recipe.id, success: false });
+        }
+        progressEl.style.color = '#f87171';
+        if (isPageMismatch) {
+          // Check if user is on the right domain but wrong page
+          try {
+            const [curTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            const curDomain = curTab?.url ? new URL(curTab.url).hostname.replace(/^www\./, '').toLowerCase() : '';
+            const recDomain = (recipe.siteDomain || '').replace(/^www\./, '').toLowerCase();
+            if (curDomain === recDomain) {
+              // Right domain, wrong page — give helpful guidance
+              const startPath = recipe.startUrl ? new URL(recipe.startUrl).pathname : '';
+              progressEl.textContent = `Step 1 element not found. This recipe starts from a specific page${startPath ? ' (' + startPath + ')' : ''}. Navigate there and retry.`;
+            } else {
+              progressEl.textContent = `Wrong site — this recipe was recorded on ${recipe.siteDomain}. Navigate there first.`;
+            }
+          } catch {
+            progressEl.textContent = `Step 1 element not found — you may need to navigate to the right page first.`;
+          }
+        } else {
+          progressEl.textContent = `Failed at step ${res?.failedAtStep || '?'}: ${res?.failReason || res?.error || 'Unknown error'}`;
+        }
+        replayBtn.textContent = 'Failed';
+        replayBtn.disabled = false;
+        skipBtn.disabled = false;
+        skipBtn.textContent = 'Try AI Instead';
+      }
+    } catch (err) {
+      chrome.runtime.onMessage.removeListener(progressListener);
+      progressEl.style.color = '#f87171';
+      progressEl.textContent = `Error: ${err.message}`;
+      replayBtn.disabled = false;
+      replayBtn.textContent = 'Retry';
+      skipBtn.disabled = false;
+    }
+  });
+
+  const skipBtn = document.createElement('button');
+  skipBtn.className = 'btn btn-ghost btn-sm';
+  skipBtn.textContent = 'Use AI Instead';
+  skipBtn.addEventListener('click', async () => {
+    wrapper.remove();
+    setLoading(true);
+    setStage('STAGE_BACKEND');
+
+    const siteHint = extractSiteHint(lastUserPrompt);
+    let availableTabs = [];
+    try {
+      const triageRes = await sendToBackground('GET_TAB_TRIAGE_MAP', {}, 5000);
+      if (triageRes?.success) availableTabs = triageRes.tabs;
+    } catch {}
+
+    const res = await sendToBackground('process_request_skip_recipe', {
+      userPrompt: lastUserPrompt,
+      tabId: currentTabId,
+      url: currentTabUrl,
+      availableTabs,
+      conversationHistory: conversationMessages.slice(-10).map(m => ({ role: m.role, content: m.content })),
+      siteHint,
+    });
+
+    setLoading(false);
+    if (!res?.success) {
+      showError((res?.errorType ? `[${res.errorType}] ` : '') + (res?.error || 'Something went wrong.'));
+      return;
+    }
+    renderResults(res.data);
+  });
+
+  btnRow.appendChild(replayBtn);
+  btnRow.appendChild(skipBtn);
+  card.appendChild(btnRow);
+
+  wrapper.appendChild(card);
   resultsArea.appendChild(wrapper);
   resultsArea.classList.remove('hidden');
   chatArea.scrollTop = chatArea.scrollHeight;
@@ -1827,6 +2059,283 @@ async function startExploration(explorePlan) {
   promptInput.focus();
 }
 
+// ── PARALLEL_EXPLORE: Multi-tab orchestration rendering ──────
+
+function renderParallelExplorePlan(data) {
+  resultsArea.classList.remove('hidden');
+  const wrapper = document.createElement('div');
+  wrapper.className = 'msg msg-assistant';
+  const card = document.createElement('div');
+  card.className = 'action-card consent-soft';
+
+  const headline = document.createElement('p');
+  headline.className = 'action-headline';
+  headline.textContent = data.headline || 'Multi-Tab Exploration';
+  card.appendChild(headline);
+
+  const plan = data.parallel_explore_plan;
+
+  // Goal
+  const goalEl = document.createElement('p');
+  goalEl.className = 'orch-criteria';
+  goalEl.textContent = plan.goal;
+  goalEl.style.fontWeight = '500';
+  card.appendChild(goalEl);
+
+  // Tab list preview
+  const tabList = document.createElement('div');
+  tabList.className = 'parallel-tab-list';
+  for (const tab of plan.tabs) {
+    const tabItem = document.createElement('div');
+    tabItem.className = 'parallel-tab-item';
+    const icon = document.createElement('span');
+    icon.className = 'parallel-tab-icon';
+    icon.textContent = '\u23F3'; // hourglass
+    const label = document.createElement('span');
+    label.className = 'parallel-tab-label';
+    label.textContent = tab.label;
+    const inputPreview = document.createElement('span');
+    inputPreview.className = 'parallel-tab-input';
+    inputPreview.textContent = tab.input.length > 40 ? tab.input.slice(0, 37) + '...' : tab.input;
+    tabItem.appendChild(icon);
+    tabItem.appendChild(label);
+    tabItem.appendChild(inputPreview);
+    tabList.appendChild(tabItem);
+  }
+  card.appendChild(tabList);
+
+  // Badges
+  const budgetBadges = document.createElement('div');
+  budgetBadges.className = 'orch-site-badges';
+  const tabBadge = document.createElement('span');
+  tabBadge.className = 'orch-site-badge';
+  tabBadge.textContent = `${plan.tabs.length} Tabs`;
+  budgetBadges.appendChild(tabBadge);
+  const euEstimate = 1.0 + (plan.tabs.length * 0.3) + 0.5;
+  const creditBadge = document.createElement('span');
+  creditBadge.className = 'orch-site-badge';
+  creditBadge.textContent = `~${euEstimate.toFixed(1)} EU`;
+  budgetBadges.appendChild(creditBadge);
+  card.appendChild(budgetBadges);
+
+  if (data.rationale) {
+    const rationale = document.createElement('p');
+    rationale.className = 'action-rationale';
+    rationale.textContent = data.rationale;
+    card.appendChild(rationale);
+  }
+
+  // Auto-start (consent is 'auto')
+  const statusEl = document.createElement('p');
+  statusEl.className = 'action-rationale';
+  statusEl.textContent = 'Starting exploration...';
+  card.appendChild(statusEl);
+  wrapper.appendChild(card);
+  resultsArea.appendChild(wrapper);
+  setTimeout(() => { startParallelExplore(plan); }, 800);
+}
+
+let parallelExploreListener = null;
+
+async function startParallelExplore(plan) {
+  const peWrapper = document.createElement('div');
+  peWrapper.className = 'msg msg-assistant';
+  const hud = document.createElement('div');
+  hud.className = 'orch-hud';
+
+  // Header
+  const header = document.createElement('div');
+  header.className = 'orch-header';
+  const badge = document.createElement('span');
+  badge.className = 'orch-badge-label';
+  badge.textContent = 'Multi-Tab';
+  header.appendChild(badge);
+  const phaseEl = document.createElement('span');
+  phaseEl.className = 'orch-status';
+  phaseEl.textContent = 'Resolving tabs...';
+  header.appendChild(phaseEl);
+  hud.appendChild(header);
+
+  // Tab status list
+  const tabStatusList = document.createElement('div');
+  tabStatusList.className = 'parallel-tab-list';
+  const tabEls = {};
+  for (const tab of plan.tabs) {
+    const item = document.createElement('div');
+    item.className = 'parallel-tab-item';
+    const icon = document.createElement('span');
+    icon.className = 'parallel-tab-icon';
+    icon.textContent = '\u23F3';
+    const label = document.createElement('span');
+    label.className = 'parallel-tab-label';
+    label.textContent = tab.label;
+    const status = document.createElement('span');
+    status.className = 'parallel-tab-status pending';
+    status.textContent = 'Waiting...';
+    item.appendChild(icon);
+    item.appendChild(label);
+    item.appendChild(status);
+    tabStatusList.appendChild(item);
+    tabEls[tab.label] = { icon, status, item };
+  }
+  hud.appendChild(tabStatusList);
+  peWrapper.appendChild(hud);
+  resultsArea.appendChild(peWrapper);
+  resultsArea.classList.remove('hidden');
+  chatArea.scrollTop = chatArea.scrollHeight;
+
+  // Progress listener
+  if (parallelExploreListener) chrome.storage.onChanged.removeListener(parallelExploreListener);
+  parallelExploreListener = (changes) => {
+    if (!changes.parallelExploreProgress) return;
+    const progress = changes.parallelExploreProgress.newValue;
+    if (!progress) return;
+
+    // Update phase label
+    const phaseLabels = {
+      resolving: 'Resolving tabs...',
+      dispatching: 'Typing in each tab...',
+      polling: 'Waiting for responses...',
+      collecting: 'Collecting results...',
+      synthesizing: 'Synthesizing comparison...',
+      done: 'Complete',
+      error: 'Error',
+    };
+    phaseEl.textContent = phaseLabels[progress.phase] || progress.phase;
+
+    // Update per-tab status
+    if (progress.tabs) {
+      for (const tabState of progress.tabs) {
+        const el = tabEls[tabState.label];
+        if (!el) continue;
+        const statusIcons = {
+          pending: '\u23F3', dispatched: '\uD83D\uDD04', ready: '\u2713', complete: '\u2713',
+          timeout: '\u231B', error: '\u2717', needs_login: '\uD83D\uDD12',
+        };
+        el.icon.textContent = statusIcons[tabState.status] || '\u2022';
+        const statusTexts = {
+          pending: 'Waiting...', dispatched: 'Processing...', ready: 'Ready',
+          timeout: 'Timed out', error: 'Error', needs_login: 'Login needed',
+          complete: 'Done',
+        };
+        el.status.textContent = statusTexts[tabState.status] || tabState.status;
+        el.status.className = `parallel-tab-status ${tabState.status}`;
+      }
+    }
+    chatArea.scrollTop = chatArea.scrollHeight;
+  };
+  chrome.storage.onChanged.addListener(parallelExploreListener);
+
+  // Get user prompt for context
+  const lastUserMsg = conversationMessages.filter(m => m.role === 'user').pop();
+  const userPrompt = lastUserMsg?.content || plan.goal;
+
+  // Start the parallel exploration
+  const startRes = await sendToBackground('parallel_explore_start', { parallelPlan: plan, userPrompt }, 10000);
+
+  if (!startRes?.success && !startRes?.async) {
+    chrome.storage.onChanged.removeListener(parallelExploreListener);
+    parallelExploreListener = null;
+    peWrapper.innerHTML = `<div class="action-card"><p class="error-message">${startRes?.error || 'Failed to start parallel exploration.'}</p></div>`;
+    chatArea.scrollTop = chatArea.scrollHeight;
+    promptInput.focus();
+    return;
+  }
+
+  // Wait for result (up to 3 minutes)
+  const res = await new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve({ success: false, error: 'Parallel exploration timed out after 3 minutes.' }), 180000);
+    const resultListener = (changes, areaName) => {
+      if (areaName !== 'session' || !changes.parallelExploreResult) return;
+      clearTimeout(timeout);
+      chrome.storage.onChanged.removeListener(resultListener);
+      resolve(changes.parallelExploreResult.newValue);
+    };
+    chrome.storage.onChanged.addListener(resultListener);
+    // Check if result already arrived
+    chrome.storage.session.get(['parallelExploreResult']).then(data => {
+      if (data.parallelExploreResult) {
+        clearTimeout(timeout);
+        chrome.storage.onChanged.removeListener(resultListener);
+        chrome.storage.session.remove(['parallelExploreResult']).catch(() => {});
+        resolve(data.parallelExploreResult);
+      }
+    }).catch(() => {});
+  });
+
+  if (parallelExploreListener) { chrome.storage.onChanged.removeListener(parallelExploreListener); parallelExploreListener = null; }
+
+  // Render result
+  peWrapper.innerHTML = '';
+  if (res?.success && res?.data) {
+    const card = document.createElement('div');
+    card.className = 'action-card synthesis-card';
+
+    const headlineEl = document.createElement('p');
+    headlineEl.className = 'action-headline';
+    headlineEl.textContent = 'Comparison Complete';
+    card.appendChild(headlineEl);
+
+    // Synthesis text
+    const synthEl = document.createElement('div');
+    synthEl.className = 'synthesis-content';
+    synthEl.style.whiteSpace = 'pre-wrap';
+    synthEl.textContent = res.data.synthesis || 'No synthesis available.';
+    card.appendChild(synthEl);
+
+    // Per-source key points (collapsible)
+    if (res.data.sources && res.data.sources.length > 0) {
+      const sourcesSection = document.createElement('div');
+      sourcesSection.className = 'synthesis-sources';
+      for (const source of res.data.sources) {
+        const toggle = document.createElement('details');
+        toggle.className = 'source-toggle';
+        const summary = document.createElement('summary');
+        summary.textContent = source.label;
+        toggle.appendChild(summary);
+        if (source.keyPoints && source.keyPoints.length > 0) {
+          const ul = document.createElement('ul');
+          ul.style.cssText = 'margin: 4px 0 0 16px; padding: 0; font-size: 11px; opacity: 0.8;';
+          for (const point of source.keyPoints) {
+            const li = document.createElement('li');
+            li.textContent = point;
+            ul.appendChild(li);
+          }
+          toggle.appendChild(ul);
+        }
+        sourcesSection.appendChild(toggle);
+      }
+      card.appendChild(sourcesSection);
+    }
+
+    // Meta footer
+    const metaEl = document.createElement('p');
+    metaEl.style.cssText = 'font-size: 10px; opacity: 0.5; margin-top: 8px;';
+    metaEl.textContent = `${res.tabCount || 0} sources \u00B7 ${(res.creditsUsed || 0).toFixed(1)} EU`;
+    card.appendChild(metaEl);
+
+    peWrapper.appendChild(card);
+    conversationMessages.push({
+      role: 'assistant',
+      content: `[Parallel Explore Result] ${res.data.synthesis || 'Comparison completed.'}`,
+      data: { action_type: 'PARALLEL_EXPLORE_RESULT', synthesis: res.data.synthesis, tabCount: res.tabCount, creditsUsed: res.creditsUsed },
+      timestamp: Date.now(),
+    });
+    saveConversation();
+  } else {
+    const errorCard = document.createElement('div');
+    errorCard.className = 'action-card';
+    errorCard.innerHTML = `<p class="error-message">${res?.error || 'Parallel exploration failed. Please try again.'}</p>`;
+    peWrapper.appendChild(errorCard);
+    conversationMessages.push({ role: 'assistant', content: `[Parallel Explore Failed] ${res?.error || 'Failed.'}`, timestamp: Date.now() });
+    saveConversation();
+  }
+
+  resultsArea.classList.remove('hidden');
+  chatArea.scrollTop = chatArea.scrollHeight;
+  promptInput.focus();
+}
+
 // ── Exploration Recovery HUD ─────────────────────────────────
 
 function attachExplorationHUD(activeState) {
@@ -2160,6 +2669,565 @@ function showError(msg) {
   chatArea.scrollTop = chatArea.scrollHeight;
   mainError.textContent = '';
   console.warn('[Enhancivity Side Panel] Error:', msg);
+}
+
+// ── Learning Mode ─────────────────────────────────────────────
+
+const learningView    = $('#learning-view');
+const learnModeBtn    = $('#learn-mode-btn');
+
+let learningState = {
+  active: false,
+  recording: false,
+  pendingRecipe: null, // Recipe awaiting save (after recording)
+};
+
+// Poll recording status while recording is active
+let learningPollTimer = null;
+
+function setupLearningMode() {
+  const learningBackBtn    = $('#learning-back-btn');
+  const workflowNameInput  = $('#learning-workflow-name');
+  const startBtn           = $('#learning-start-btn');
+  const stopBtn            = $('#learning-stop-btn');
+  const cancelBtn          = $('#learning-cancel-btn');
+  const saveBtn            = $('#learning-save-btn');
+  const discardBtn         = $('#learning-discard-btn');
+  const replayRunBtn       = $('#learning-replay-run-btn');
+  const replayCancelBtn    = $('#learning-replay-cancel-btn');
+
+  // Toggle learning view
+  learnModeBtn.addEventListener('click', () => {
+    if (learningState.recording) return; // Don't leave while recording
+    mainView.classList.add('hidden');
+    settingsView.classList.add('hidden');
+    learningView.classList.remove('hidden');
+    loadMyRecipes();
+  });
+
+  learningBackBtn.addEventListener('click', () => {
+    if (learningState.recording) return;
+    learningView.classList.add('hidden');
+    mainView.classList.remove('hidden');
+  });
+
+  // Enable start button when name is typed
+  workflowNameInput.addEventListener('input', () => {
+    startBtn.disabled = !workflowNameInput.value.trim();
+  });
+
+  // Start recording
+  startBtn.addEventListener('click', async () => {
+    const name = workflowNameInput.value.trim();
+    if (!name) return;
+
+    startBtn.disabled = true;
+    startBtn.textContent = 'Starting...';
+
+    try {
+      // Inject content_learning.js into active tab and start recording
+      const tab = await getActiveTab();
+      if (!tab) { showLearningError('No active tab found. Open a website first.'); startBtn.disabled = false; startBtn.textContent = 'Start Recording'; return; }
+
+      // Block chrome:// and extension pages (can't inject content scripts)
+      const tabUrl = tab.url || '';
+      if (tabUrl.startsWith('chrome://') || tabUrl.startsWith('chrome-extension://') || tabUrl.startsWith('about:') || tabUrl === '') {
+        showLearningError('Cannot record on this page. Navigate to a website first (e.g., gmail.com, amazon.com).');
+        startBtn.disabled = false;
+        startBtn.textContent = 'Start Recording';
+        return;
+      }
+
+      // Step 1: Initialize centralized session in background.js
+      const sessionRes = await sendToBackground('learning_session_start', {
+        workflowName: name,
+        tabId: tab.id,
+        tabUrl: tab.url,
+      });
+      if (!sessionRes?.success) {
+        showLearningError('Failed to initialize recording session.');
+        startBtn.disabled = false;
+        startBtn.textContent = 'Start Recording';
+        return;
+      }
+
+      // Step 2: Inject content_learning.js into the active tab
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ['content_learning.js'],
+      });
+
+      // Small delay for script injection
+      await new Promise(r => setTimeout(r, 300));
+
+      // Step 3: Tell content script to start recording
+      let res;
+      try {
+        res = await chrome.tabs.sendMessage(tab.id, { type: 'learning_start' });
+      } catch (msgErr) {
+        showLearningError('Could not connect to the page. Try refreshing the tab and clicking Start again.');
+        await sendToBackground('learning_session_cancel', {});
+        startBtn.disabled = false;
+        startBtn.textContent = 'Start Recording';
+        return;
+      }
+
+      if (!res?.success) {
+        showLearningError('Failed to start recording. Try refreshing the tab.');
+        await sendToBackground('learning_session_cancel', {});
+        startBtn.disabled = false;
+        startBtn.textContent = 'Start Recording';
+        return;
+      }
+
+      learningState.recording = true;
+      learningState.active = true;
+      learningState.recordingTabId = tab.id;
+      learnModeBtn.classList.add('learning-active');
+
+      // Show recording UI
+      $('#learning-idle').classList.add('hidden');
+      $('#learning-recording').classList.remove('hidden');
+      $('#learning-review').classList.add('hidden');
+      $('#learning-replay').classList.add('hidden');
+      $('#learning-recording-name').textContent = `Teaching: "${name}"`;
+
+      // Start polling background.js for step count
+      startLearningPoll();
+    } catch (err) {
+      console.error('[Learning] Start recording error:', err);
+      showLearningError(`Failed to start: ${err.message}. Make sure you're on a regular website.`);
+    }
+
+    startBtn.disabled = false;
+    startBtn.textContent = 'Start Recording';
+  });
+
+  // Stop recording
+  stopBtn.addEventListener('click', async () => {
+    stopLearningPoll();
+    const tabId = learningState.recordingTabId;
+    if (tabId) {
+      try {
+        // Tell content script to stop (removes overlay, detaches listeners)
+        await chrome.tabs.sendMessage(tabId, { type: 'learning_stop' });
+      } catch {}
+    }
+    // content_learning.js sends 'learning_session_stop' to background.js,
+    // which builds the recipe and forwards it via 'learning_recipe_recorded'
+  });
+
+  // Cancel recording
+  cancelBtn.addEventListener('click', async () => {
+    stopLearningPoll();
+    const tabId = learningState.recordingTabId;
+    if (tabId) {
+      try {
+        await chrome.tabs.sendMessage(tabId, { type: 'learning_cancel' });
+      } catch {}
+    }
+    // Clear centralized session
+    await sendToBackground('learning_session_cancel', {});
+    resetLearningUI();
+  });
+
+  // Save recipe
+  saveBtn.addEventListener('click', async () => {
+    if (!learningState.pendingRecipe) return;
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+
+    const res = await sendToBackground('learning_save_recipe', learningState.pendingRecipe);
+
+    if (res?.success) {
+      learningState.pendingRecipe = null;
+      resetLearningUI();
+      loadMyRecipes();
+      // Show success message briefly
+      const idle = $('#learning-idle');
+      const successMsg = document.createElement('p');
+      successMsg.style.cssText = 'color: #34d399; font-size: 13px; font-weight: 500; margin-top: 8px;';
+      successMsg.textContent = 'Recipe saved! I can replay it next time.';
+      idle.insertBefore(successMsg, idle.querySelector('.settings-section-title + p').nextSibling);
+      setTimeout(() => successMsg.remove(), 4000);
+    } else {
+      showLearningError(res?.error || 'Failed to save recipe.');
+    }
+
+    saveBtn.disabled = false;
+    saveBtn.textContent = 'Save Recipe';
+  });
+
+  // Discard recipe
+  discardBtn.addEventListener('click', () => {
+    learningState.pendingRecipe = null;
+    resetLearningUI();
+  });
+
+  // Replay: Run button
+  replayRunBtn.addEventListener('click', async () => {
+    const recipeId = replayRunBtn.dataset.recipeId;
+    const recipe = replayRunBtn._recipe;
+    if (!recipe) return;
+
+    // Collect variable values
+    const variables = {};
+    const variableInputs = document.querySelectorAll('#learning-replay-variables input[data-var-name]');
+    for (const input of variableInputs) {
+      variables[input.dataset.varName] = input.value;
+    }
+
+    // Hide inputs, show progress
+    replayRunBtn.classList.add('hidden');
+    replayCancelBtn.classList.add('hidden');
+    $('#learning-replay-progress').classList.remove('hidden');
+
+    const res = await sendToBackground('learning_replay_recipe', {
+      recipe,
+      variables,
+    }, 300000); // 5 min timeout for replay (LLM steps can take time)
+
+    $('#learning-replay-progress').classList.add('hidden');
+
+    if (res?.success && !res?.partial) {
+      // Full completion — all steps ran
+      sendToBackground('learning_record_outcome', { recipeId, success: true, durationMs: res.durationMs });
+
+      const resultMsg = document.createElement('p');
+      resultMsg.style.cssText = 'color: #34d399; font-size: 13px; font-weight: 500; margin-top: 12px;';
+      resultMsg.textContent = `Done! Completed ${res.completedSteps}/${res.totalSteps} steps in ${((res.durationMs || 0) / 1000).toFixed(1)}s`;
+      $('#learning-replay').appendChild(resultMsg);
+      setTimeout(() => { resetLearningUI(); loadMyRecipes(); }, 3000);
+    } else if (res?.success && res?.partial) {
+      // Partial — page navigated away before all steps finished
+      sendToBackground('learning_record_outcome', { recipeId, success: false });
+      showLearningError(`Partial: ${res.completedSteps}/${res.totalSteps} steps completed. Page navigated away before finishing.`);
+      replayRunBtn.classList.remove('hidden');
+      replayCancelBtn.classList.remove('hidden');
+    } else {
+      // Don't penalize confidence for page-mismatch failures (step 1 element not found)
+      const isPageMismatch = res?.failedAtStep === 1 && (res?.failReason || '').includes('Element not found');
+      if (!isPageMismatch) {
+        sendToBackground('learning_record_outcome', { recipeId, success: false });
+      }
+      if (isPageMismatch && recipe) {
+        const startPath = recipe.startUrl ? (() => { try { return new URL(recipe.startUrl).pathname; } catch { return ''; } })() : '';
+        showLearningError(`Step 1 element not found. This recipe starts from a specific page${startPath ? ' (' + startPath + ')' : ''}. Navigate there and retry.`);
+      } else {
+        showLearningError(`Replay failed at step ${res?.failedAtStep || '?'}: ${res?.failReason || res?.error || 'Unknown error'}`);
+      }
+      replayRunBtn.classList.remove('hidden');
+      replayCancelBtn.classList.remove('hidden');
+    }
+  });
+
+  replayCancelBtn.addEventListener('click', () => {
+    resetLearningUI();
+  });
+
+  // Listen for recipe completion from background
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.type === 'learning_recipe_recorded') {
+      learningState.recording = false;
+      learnModeBtn.classList.remove('learning-active');
+      learningState.pendingRecipe = msg.data;
+      showRecipeReview(msg.data);
+    }
+
+    if (msg.type === 'replay_progress') {
+      const { stepNumber, totalSteps, description } = msg.data || {};
+      const label = $('#learning-replay-step-label');
+      const bar = $('#learning-replay-progress-bar');
+      if (label) label.textContent = `Step ${stepNumber}/${totalSteps}: ${description || ''}`;
+      if (bar) bar.style.width = `${Math.round((stepNumber / totalSteps) * 100)}%`;
+    }
+  });
+}
+
+async function getActiveTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
+
+function startLearningPoll() {
+  stopLearningPoll();
+  learningPollTimer = setInterval(async () => {
+    try {
+      const res = await sendToBackground('learning_session_status', {});
+      if (res?.success && res.active) {
+        $('#learning-step-status').textContent = `${res.stepCount} steps recorded`;
+        // Show domains if multi-tab
+        const domainsEl = $('#learning-domains-status');
+        if (domainsEl && res.domains && res.domains.length > 1) {
+          domainsEl.textContent = `Sites: ${res.domains.join(', ')}`;
+        } else if (domainsEl) {
+          domainsEl.textContent = '';
+        }
+      }
+    } catch {
+      // Background may be waking up
+    }
+  }, 1000);
+}
+
+function stopLearningPoll() {
+  if (learningPollTimer) {
+    clearInterval(learningPollTimer);
+    learningPollTimer = null;
+  }
+}
+
+function resetLearningUI() {
+  learningState.recording = false;
+  learningState.active = false;
+  learningState.pendingRecipe = null;
+  learningState.recordingTabId = null;
+  learnModeBtn.classList.remove('learning-active');
+  stopLearningPoll();
+
+  $('#learning-idle').classList.remove('hidden');
+  $('#learning-recording').classList.add('hidden');
+  $('#learning-review').classList.add('hidden');
+  $('#learning-replay').classList.add('hidden');
+  $('#learning-workflow-name').value = '';
+  $('#learning-start-btn').disabled = true;
+  $('#learning-step-status').textContent = '0 steps recorded';
+}
+
+function showLearningError(msg) {
+  const container = $('#learning-content');
+  const errEl = document.createElement('p');
+  errEl.style.cssText = 'color: #f87171; font-size: 12px; margin-top: 8px; padding: 6px 10px; background: rgba(248,113,113,0.1); border-radius: 6px;';
+  errEl.textContent = msg;
+  container.appendChild(errEl);
+  setTimeout(() => errEl.remove(), 5000);
+}
+
+function showRecipeReview(recipe) {
+  $('#learning-idle').classList.add('hidden');
+  $('#learning-recording').classList.add('hidden');
+  $('#learning-review').classList.remove('hidden');
+  $('#learning-replay').classList.add('hidden');
+
+  const domainLabel = recipe.isMultiTab && recipe.siteDomains?.length > 1
+    ? recipe.siteDomains.join(', ')
+    : recipe.siteDomain;
+  const multiTabLabel = recipe.isMultiTab ? ' (multi-tab)' : '';
+  const summary = `"${recipe.workflowName}" on ${domainLabel}${multiTabLabel} — ${recipe.steps.length} steps, ${recipe.variables.length} variables`;
+  $('#learning-review-summary').textContent = summary;
+
+  // Render steps with clickable values for variable marking
+  const stepsContainer = $('#learning-review-steps');
+  stepsContainer.innerHTML = '';
+
+  for (const step of recipe.steps) {
+    if (step.action.type === 'wait') continue; // Don't show wait steps in review
+
+    const row = document.createElement('div');
+    row.className = 'review-step-row';
+    if (step.action.type === 'switch_tab') {
+      row.style.cssText = 'background: rgba(99, 102, 241, 0.08); border-left: 2px solid #6366f1; padding-left: 8px; margin: 4px 0;';
+    }
+
+    const numEl = document.createElement('span');
+    numEl.className = 'review-step-number';
+    numEl.textContent = step.stepNumber;
+
+    const typeEl = document.createElement('span');
+    typeEl.className = 'review-step-type';
+    typeEl.textContent = step.action.type === 'switch_tab' ? '⇥ tab' : step.action.type;
+
+    const descEl = document.createElement('span');
+    descEl.className = 'review-step-desc';
+    descEl.textContent = step.action.description || '';
+
+    row.appendChild(numEl);
+    row.appendChild(typeEl);
+    row.appendChild(descEl);
+
+    // Show clickable value for type steps (to mark as variable or AI-generated)
+    if (step.action.type === 'type' && step.action.fixedValue) {
+      const valEl = document.createElement('span');
+      valEl.className = 'review-step-value';
+      valEl.textContent = step.action.fixedValue;
+      valEl.title = 'Click to mark as variable or AI-generated';
+      valEl.addEventListener('click', () => {
+        // Show choice: User Variable or AI-Generated
+        const choice = prompt(
+          'How should this value be filled during replay?\n\n' +
+          '1 = User variable (you type the value each time)\n' +
+          '2 = AI-generated (the AI writes it for you)\n\n' +
+          'Enter 1 or 2:',
+          '1'
+        );
+
+        if (choice === '1') {
+          // User-provided variable (existing behavior)
+          const varName = prompt('Name this variable:', step.action.variableName || '');
+          if (varName) {
+            step.action.inputType = 'variable';
+            step.action.variableName = varName.trim().replace(/\s+/g, '_').toLowerCase();
+            step.action.variableDescription = `Value for "${step.action.description}"`;
+            delete step.action.fixedValue;
+            valEl.textContent = `{{${step.action.variableName}}}`;
+            valEl.classList.add('is-variable');
+
+            if (learningState.pendingRecipe) {
+              const vars = learningState.pendingRecipe.variables || [];
+              if (!vars.find(v => v.name === step.action.variableName)) {
+                vars.push({
+                  name: step.action.variableName,
+                  description: step.action.variableDescription,
+                  fieldType: 'text',
+                });
+                learningState.pendingRecipe.variables = vars;
+              }
+            }
+          }
+        } else if (choice === '2') {
+          // AI-generated (LLM fill)
+          const llmPrompt = prompt(
+            'What should the AI generate?\n\nDescribe what to write (e.g., "Write a professional reply to this email", "Summarize the page content", "Write a reddit post about AI tools"):',
+            step.action.fixedValue ? `Write something similar to: ${step.action.fixedValue.slice(0, 50)}` : ''
+          );
+          if (llmPrompt) {
+            step.action.type = 'llm_fill';
+            step.action.llmPrompt = llmPrompt;
+            step.action.variableDescription = llmPrompt;
+            delete step.action.fixedValue;
+            delete step.action.inputType;
+            valEl.textContent = `🤖 AI: ${llmPrompt.slice(0, 40)}${llmPrompt.length > 40 ? '...' : ''}`;
+            valEl.classList.add('is-llm-fill');
+            valEl.style.color = '#a78bfa';
+          }
+        }
+      });
+      row.appendChild(valEl);
+    } else if (step.action.type === 'type' && step.action.inputType === 'variable') {
+      const valEl = document.createElement('span');
+      valEl.className = 'review-step-value is-variable';
+      valEl.textContent = `{{${step.action.variableName}}}`;
+      row.appendChild(valEl);
+    } else if (step.action.type === 'llm_fill') {
+      const valEl = document.createElement('span');
+      valEl.className = 'review-step-value is-llm-fill';
+      valEl.style.color = '#a78bfa';
+      valEl.textContent = `🤖 AI: ${(step.action.llmPrompt || '').slice(0, 40)}`;
+      row.appendChild(valEl);
+    }
+
+    stepsContainer.appendChild(row);
+  }
+}
+
+async function loadMyRecipes() {
+  const container = $('#learning-my-recipes');
+  const res = await sendToBackground('learning_get_recipes', {});
+
+  if (!res?.success || !res.recipes?.length) {
+    container.innerHTML = '<p class="settings-section-desc" style="opacity: 0.5;">No recipes yet. Teach me something!</p>';
+    return;
+  }
+
+  container.innerHTML = '';
+
+  for (const recipe of res.recipes) {
+    const card = document.createElement('div');
+    card.className = 'recipe-card';
+
+    const confLevel = recipe.confidence >= 0.8 ? 'high' : recipe.confidence >= 0.5 ? 'medium' : 'low';
+
+    card.innerHTML = `
+      <div style="display: flex; justify-content: space-between; align-items: start;">
+        <div class="recipe-card-name">${escapeHtml(recipe.workflowName)}</div>
+        <button class="recipe-delete-btn" data-recipe-id="${recipe.id}" title="Delete">✕</button>
+      </div>
+      <div class="recipe-card-meta">
+        <span>${recipe.siteDomain}</span>
+        <span>${recipe.stepCount} steps</span>
+        <span class="recipe-card-confidence ${confLevel}">${Math.round(recipe.confidence * 100)}%</span>
+        <span>${recipe.status.toLowerCase()}</span>
+      </div>
+    `;
+
+    // Click to replay
+    card.addEventListener('click', (e) => {
+      if (e.target.closest('.recipe-delete-btn')) return;
+      showReplayUI(recipe);
+    });
+
+    // Delete button
+    card.querySelector('.recipe-delete-btn').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Delete recipe "${recipe.workflowName}"?`)) return;
+      const delRes = await sendToBackground('learning_delete_recipe', { recipeId: recipe.id });
+      if (delRes?.success) {
+        card.remove();
+      } else {
+        showLearningError(delRes?.error || 'Failed to delete.');
+      }
+    });
+
+    container.appendChild(card);
+  }
+}
+
+function showReplayUI(recipe) {
+  $('#learning-idle').classList.add('hidden');
+  $('#learning-recording').classList.add('hidden');
+  $('#learning-review').classList.add('hidden');
+  $('#learning-replay').classList.remove('hidden');
+  $('#learning-replay-progress').classList.add('hidden');
+
+  const replayRunBtn = $('#learning-replay-run-btn');
+  replayRunBtn.classList.remove('hidden');
+  $('#learning-replay-cancel-btn').classList.remove('hidden');
+
+  $('#learning-replay-title').textContent = recipe.workflowName;
+  $('#learning-replay-desc').textContent = `${recipe.stepCount} steps on ${recipe.siteDomain}`;
+
+  replayRunBtn.dataset.recipeId = recipe.id;
+  replayRunBtn._recipe = recipe;
+
+  // Render variable input fields
+  const varsContainer = $('#learning-replay-variables');
+  varsContainer.innerHTML = '';
+
+  const variables = Array.isArray(recipe.variables) ? recipe.variables : [];
+
+  // Check if recipe has any llm_fill steps
+  const llmSteps = (recipe.steps || []).filter(s => s.action?.type === 'llm_fill');
+
+  if (variables.length === 0 && llmSteps.length === 0) {
+    varsContainer.innerHTML = '<p class="settings-section-desc" style="opacity: 0.5;">No variables needed — ready to run.</p>';
+  } else {
+    for (const v of variables) {
+      const field = document.createElement('div');
+      field.className = 'replay-variable-field';
+      field.innerHTML = `
+        <label>${escapeHtml(v.description || v.name)}</label>
+        <input type="text" data-var-name="${escapeHtml(v.name)}" placeholder="${escapeHtml(v.description || v.name)}">
+      `;
+      varsContainer.appendChild(field);
+    }
+
+    // Show LLM-fill steps as info (no input needed — AI handles them)
+    if (llmSteps.length > 0) {
+      const llmInfo = document.createElement('div');
+      llmInfo.style.cssText = 'margin-top: 12px; padding: 10px; background: rgba(167, 139, 250, 0.08); border-radius: 8px; border: 1px solid rgba(167, 139, 250, 0.15);';
+      llmInfo.innerHTML = `
+        <p style="font-size: 12px; color: #a78bfa; font-weight: 500; margin: 0 0 4px 0;">🤖 AI-Generated Steps (${llmSteps.length})</p>
+        <p style="font-size: 11px; color: #8b8fa3; margin: 0;">The AI will generate text for ${llmSteps.length === 1 ? 'this step' : 'these steps'} during replay. This may take a moment.</p>
+      `;
+      varsContainer.appendChild(llmInfo);
+    }
+  }
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str || '';
+  return div.innerHTML;
 }
 
 // ── Auth Handlers ────────────────────────────────────────────

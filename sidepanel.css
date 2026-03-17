@@ -1291,3 +1291,274 @@ h2 {
 .api-mode-panel {
   margin-top: 12px;
 }
+
+/* ── PARALLEL_EXPLORE: Multi-tab orchestration ────────────── */
+
+.parallel-tab-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 10px 0;
+}
+
+.parallel-tab-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: rgba(24, 24, 30, 0.5);
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  font-size: 12px;
+}
+
+.parallel-tab-icon {
+  font-size: 12px;
+  width: 16px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.parallel-tab-label {
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.9);
+  flex-shrink: 0;
+}
+
+.parallel-tab-input {
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.parallel-tab-status {
+  font-size: 11px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.parallel-tab-status.pending { color: rgba(255, 255, 255, 0.4); }
+.parallel-tab-status.dispatched { color: #818cf8; }
+.parallel-tab-status.ready, .parallel-tab-status.complete { color: #34d399; }
+.parallel-tab-status.timeout { color: #fbbf24; }
+.parallel-tab-status.error { color: #f87171; }
+.parallel-tab-status.needs_login { color: #fbbf24; }
+
+.synthesis-card {
+  border-left: 2px solid #6366f1;
+}
+
+.synthesis-content {
+  font-size: 13px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.85);
+  margin: 8px 0;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.synthesis-sources {
+  margin-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 8px;
+}
+
+.source-toggle {
+  margin: 4px 0;
+  font-size: 12px;
+}
+
+.source-toggle summary {
+  cursor: pointer;
+  color: #818cf8;
+  font-weight: 500;
+  padding: 4px 0;
+}
+
+.source-toggle summary:hover {
+  color: #a5b4fc;
+}
+
+/* ── LEARNING MODE ─────────────────────────────────────────── */
+
+#learn-mode-btn.learning-active {
+  color: #34d399;
+  background: rgba(52, 211, 153, 0.1);
+}
+
+.learning-record-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #ef4444;
+  flex-shrink: 0;
+  animation: learning-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes learning-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.4; transform: scale(0.85); }
+}
+
+.recipe-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.recipe-card {
+  background: rgba(24, 24, 30, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.recipe-card:hover {
+  border-color: rgba(99, 102, 241, 0.3);
+  background: rgba(99, 102, 241, 0.08);
+}
+
+.recipe-card-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: #ededef;
+  margin-bottom: 4px;
+}
+
+.recipe-card-meta {
+  font-size: 11px;
+  color: #6b6b76;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.recipe-card-confidence {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.recipe-card-confidence.high { background: rgba(52, 211, 153, 0.15); color: #34d399; }
+.recipe-card-confidence.medium { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+.recipe-card-confidence.low { background: rgba(248, 113, 113, 0.15); color: #f87171; }
+
+.review-step-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: rgba(24, 24, 30, 0.4);
+  border-radius: 6px;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.review-step-number {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: rgba(99, 102, 241, 0.15);
+  color: #818cf8;
+  font-size: 10px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.review-step-type {
+  font-weight: 500;
+  color: #a5b4fc;
+  text-transform: uppercase;
+  font-size: 10px;
+  min-width: 38px;
+}
+
+.review-step-desc {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-step-value {
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 11px;
+  color: #ededef;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+
+.review-step-value:hover {
+  background: rgba(99, 102, 241, 0.15);
+  color: #a5b4fc;
+}
+
+.review-step-value.is-variable {
+  background: rgba(99, 102, 241, 0.2);
+  color: #a5b4fc;
+  border: 1px solid rgba(99, 102, 241, 0.3);
+}
+
+.replay-variable-field {
+  margin-bottom: 10px;
+}
+
+.replay-variable-field label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: #a5b4fc;
+  margin-bottom: 4px;
+}
+
+.replay-variable-field input {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: #ededef;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.replay-variable-field input:focus {
+  border-color: #6366f1;
+}
+
+.recipe-delete-btn {
+  background: none;
+  border: none;
+  color: #6b6b76;
+  cursor: pointer;
+  padding: 2px 4px;
+  font-size: 12px;
+  transition: color 0.2s;
+  flex-shrink: 0;
+}
+
+.recipe-delete-btn:hover {
+  color: #f87171;
+}

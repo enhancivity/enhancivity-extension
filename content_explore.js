@@ -430,8 +430,30 @@
     'complete purchase', 'checkout', 'place your order',
   ];
 
+  // AI chatbot sites where clicking Send/Submit is expected and non-consequential.
+  // The One-Inch Rule does NOT apply here — typing a question into a chatbot is not
+  // a consequential third-party action (no money, no irreversible data change).
+  const CHATBOT_ALLOWLIST = [
+    'chatgpt.com', 'chat.openai.com', 'claude.ai', 'gemini.google.com',
+  ];
+
+  function isOnChatbotSite() {
+    try {
+      const hostname = window.location.hostname;
+      return CHATBOT_ALLOWLIST.some(domain => hostname === domain || hostname.endsWith('.' + domain));
+    } catch { return false; }
+  }
+
   function isDangerousClick(el) {
     const text = (el.innerText || el.value || el.textContent || '').toLowerCase().trim();
+    // On chatbot sites, "send" and "submit" are safe — they just send a chat message
+    if (isOnChatbotSite()) {
+      // Still block actual dangerous actions even on chatbot sites (pay, delete, purchase)
+      const CHATBOT_STILL_DANGEROUS = new Set(['pay', 'delete', 'remove']);
+      if (CHATBOT_STILL_DANGEROUS.has(text)) return true;
+      if (DANGEROUS_PHRASE.some(d => text.includes(d))) return true;
+      return false;
+    }
     // Exact match — the ENTIRE button text must be one of these single words
     if (DANGEROUS_EXACT.has(text)) return true;
     // Phrase match — button text contains a multi-word dangerous phrase
@@ -673,10 +695,65 @@
       // - A form-group div was tagged but the real input is nested inside
       let el = findBySid(target);
       if (!el) {
-        return {
-          success: false,
-          error: `Element not found: ${target}. Cannot type — element may have been removed or the page changed.${getRecoverySnapshot()}`,
-        };
+        // ── FALLBACK: Find the dominant editable input on the page ──
+        // When SID resolution fails (page changed, element re-rendered, SPA navigation),
+        // try to find the most prominent input field. This is especially important for
+        // chatbot sites where the chat input is the main interaction point.
+        console.warn(`[type_text] SID not found: "${target}". Attempting fallback input discovery...`);
+
+        // Priority 1: Visible contentEditable with role=textbox (chatbot inputs)
+        const editables = [...document.querySelectorAll('[contenteditable="true"], [role="textbox"]')]
+          .filter(e => {
+            const rect = e.getBoundingClientRect();
+            return rect.width > 50 && rect.height > 10 && rect.bottom > 0 && rect.top < window.innerHeight;
+          });
+        if (editables.length > 0) {
+          // Pick the largest visible one (most likely the main chat input)
+          el = editables.reduce((best, cur) => {
+            const bestRect = best.getBoundingClientRect();
+            const curRect = cur.getBoundingClientRect();
+            return (curRect.width * curRect.height) > (bestRect.width * bestRect.height) ? cur : best;
+          });
+          console.log('[type_text] Fallback found contentEditable/textbox:', el.tagName, 'class:', (typeof el.className === 'string' ? el.className.slice(0, 60) : ''));
+        }
+
+        // Priority 2: Visible textarea (many sites use plain textareas)
+        if (!el) {
+          const textareas = [...document.querySelectorAll('textarea')]
+            .filter(e => {
+              const rect = e.getBoundingClientRect();
+              return rect.width > 50 && rect.height > 10 && rect.bottom > 0 && rect.top < window.innerHeight && !e.disabled && !e.readOnly;
+            });
+          if (textareas.length > 0) {
+            el = textareas.reduce((best, cur) => {
+              const bestRect = best.getBoundingClientRect();
+              const curRect = cur.getBoundingClientRect();
+              return (curRect.width * curRect.height) > (bestRect.width * bestRect.height) ? cur : best;
+            });
+            console.log('[type_text] Fallback found textarea:', el.name || el.id || el.placeholder || '');
+          }
+        }
+
+        // Priority 3: Visible text input
+        if (!el) {
+          const inputs = [...document.querySelectorAll('input[type="text"], input[type="search"], input:not([type])')]
+            .filter(e => {
+              const rect = e.getBoundingClientRect();
+              return rect.width > 50 && rect.height > 10 && rect.bottom > 0 && rect.top < window.innerHeight && !e.disabled && !e.readOnly;
+            });
+          if (inputs.length > 0) {
+            el = inputs[0]; // Take the first visible text input
+            console.log('[type_text] Fallback found input:', el.type, el.name || el.id || el.placeholder || '');
+          }
+        }
+
+        if (!el) {
+          return {
+            success: false,
+            error: `Element not found: ${target}. Fallback input discovery also failed — no visible editable fields on this page.${getRecoverySnapshot()}`,
+          };
+        }
+        console.log('[type_text] Using fallback element instead of SID target');
       }
 
       // ── SMART TARGET RESOLUTION: Find the real editable surface ──
@@ -2242,10 +2319,20 @@
               }
             }
 
-            const label = ariaLabel || placeholder || labelText || cssPlaceholder || nearbyLabel ||
+            // Check parent/ancestor aria-label (chatbot inputs often have labels on wrapper)
+            let ancestorLabel = '';
+            if (!ariaLabel && !placeholder && !labelText) {
+              let ancestor = node.parentElement;
+              for (let depth = 0; ancestor && depth < 3; depth++, ancestor = ancestor.parentElement) {
+                const aLabel = ancestor.getAttribute('aria-label');
+                if (aLabel) { ancestorLabel = aLabel.trim().slice(0, 60); break; }
+              }
+            }
+
+            const label = ariaLabel || placeholder || labelText || cssPlaceholder || nearbyLabel || ancestorLabel ||
               (name ? `${name} field` : '') ||
               (id ? `${id} field` : '') ||
-              (isEditable ? `[editable area]` : '') ||
+              (isEditable ? `[chat/text input area]` : '') ||
               (isRoleInput ? `[text input]` : '') ||
               (type ? `[${type} input]` : `[${tag.toLowerCase()} field]`);
 

@@ -1,0 +1,145 @@
+{
+  "version": "1.0.0",
+  "generatedAt": "2026-03-15T00:00:00Z",
+  "description": "Initial SiteMap seed bundle — Top 100 sites. Fingerprints are populated organically as users browse, or manually via scout runs. Platform templates cover thousands of additional sites.",
+  "entries": [
+    {
+      "domain": "amazon.com",
+      "pageType": "homepage",
+      "urlPattern": "/",
+      "fingerprint": { "elements": [], "sections": ["header", "nav", "main", "footer"], "platform": null, "domHash": "0:0", "url": "https://www.amazon.com", "title": "Amazon.com", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": null
+    },
+    {
+      "domain": "amazon.com",
+      "pageType": "search_results",
+      "urlPattern": "/s?k=*",
+      "fingerprint": { "elements": [], "sections": ["header", "nav", "sidebar", "main", "footer"], "platform": null, "domHash": "0:0", "url": "https://www.amazon.com/s", "title": "Amazon.com Search", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": null
+    },
+    {
+      "domain": "amazon.com",
+      "pageType": "product_detail",
+      "urlPattern": "/dp/*",
+      "fingerprint": { "elements": [], "sections": ["header", "buy-box", "description", "reviews", "footer"], "platform": null, "domHash": "0:0", "url": "https://www.amazon.com/dp/", "title": "Amazon Product", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": null
+    },
+    {
+      "domain": "ebay.com",
+      "pageType": "homepage",
+      "urlPattern": "/",
+      "fingerprint": { "elements": [], "sections": ["header", "nav", "main", "footer"], "platform": null, "domHash": "0:0", "url": "https://www.ebay.com", "title": "eBay", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": null
+    },
+    {
+      "domain": "ebay.com",
+      "pageType": "search_results",
+      "urlPattern": "/sch/i.html?_nkw=*",
+      "fingerprint": { "elements": [], "sections": ["header", "sidebar", "results", "pagination", "footer"], "platform": null, "domHash": "0:0", "url": "https://www.ebay.com/sch/", "title": "eBay Search", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": null
+    },
+    {
+      "domain": "google.com",
+      "pageType": "homepage",
+      "urlPattern": "/",
+      "fingerprint": { "elements": [], "sections": ["header", "main", "footer"], "platform": null, "domHash": "0:0", "url": "https://www.google.com", "title": "Google", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": null
+    },
+    {
+      "domain": "google.com",
+      "pageType": "search_results",
+      "urlPattern": "/search?q=*",
+      "fingerprint": { "elements": [], "sections": ["header", "results", "sidebar", "pagination", "footer"], "platform": null, "domHash": "0:0", "url": "https://www.google.com/search", "title": "Google Search", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": null
+    },
+    {
+      "domain": "linkedin.com",
+      "pageType": "homepage",
+      "urlPattern": "/",
+      "fingerprint": { "elements": [], "sections": ["header", "nav", "feed", "sidebar", "footer"], "platform": null, "domHash": "0:0", "url": "https://www.linkedin.com", "title": "LinkedIn", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": null
+    },
+    {
+      "domain": "youtube.com",
+      "pageType": "homepage",
+      "urlPattern": "/",
+      "fingerprint": { "elements": [], "sections": ["header", "nav", "main", "sidebar"], "platform": null, "domHash": "0:0", "url": "https://www.youtube.com", "title": "YouTube", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": null
+    },
+    {
+      "domain": "reddit.com",
+      "pageType": "homepage",
+      "urlPattern": "/",
+      "fingerprint": { "elements": [], "sections": ["header", "nav", "feed", "sidebar"], "platform": null, "domHash": "0:0", "url": "https://www.reddit.com", "title": "Reddit", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": null
+    }
+  ],
+  "platformTemplates": [
+    {
+      "domain": "_template_shopify",
+      "pageType": "product_detail",
+      "urlPattern": "/products/*",
+      "fingerprint": { "elements": [], "sections": ["header", "product-images", "product-info", "add-to-cart", "description", "reviews", "footer"], "platform": "shopify", "domHash": "0:0", "url": "", "title": "Shopify Product", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": "shopify"
+    },
+    {
+      "domain": "_template_shopify",
+      "pageType": "search_results",
+      "urlPattern": "/search?q=*",
+      "fingerprint": { "elements": [], "sections": ["header", "nav", "results", "pagination", "footer"], "platform": "shopify", "domHash": "0:0", "url": "", "title": "Shopify Search", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": "shopify"
+    },
+    {
+      "domain": "_template_wordpress",
+      "pageType": "homepage",
+      "urlPattern": "/",
+      "fingerprint": { "elements": [], "sections": ["header", "nav", "content", "sidebar", "footer"], "platform": "wordpress", "domHash": "0:0", "url": "", "title": "WordPress Site", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": "wordpress"
+    },
+    {
+      "domain": "_template_wix",
+      "pageType": "homepage",
+      "urlPattern": "/",
+      "fingerprint": { "elements": [], "sections": ["header", "main", "footer"], "platform": "wix", "domHash": "0:0", "url": "", "title": "Wix Site", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": "wix"
+    },
+    {
+      "domain": "_template_squarespace",
+      "pageType": "homepage",
+      "urlPattern": "/",
+      "fingerprint": { "elements": [], "sections": ["header", "main", "footer"], "platform": "squarespace", "domHash": "0:0", "url": "", "title": "Squarespace Site", "capturedAt": null },
+      "viewportWidth": 1920,
+      "viewportHeight": 1080,
+      "platformType": "squarespace"
+    }
+  ],
+  "_note": "Element arrays are empty in v1.0.0. They get populated organically as users browse these sites while using Enhancivity. Once populated, future users get instant deterministic paths. Platform templates cover Shopify (~2M stores), WordPress (~800M sites), Wix (~200M sites), Squarespace (~4M sites)."
+}

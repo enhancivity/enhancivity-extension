@@ -44,7 +44,10 @@ const ALLOWED_DOMAINS = [
   // Productivity & communication
   'mail.google.com', 'slack.com', 'notion.so', 'trello.com', 'asana.com',
   'docs.google.com', 'drive.google.com', 'calendar.google.com',
+  'sheets.google.com', 'slides.google.com',
   'outlook.live.com', 'outlook.office.com',
+  'excel.cloud.microsoft.com', 'word.new', 'powerpoint.new',
+  'office.com', 'office.live.com',
   'github.com', 'youtube.com', 'twitter.com', 'x.com', 'reddit.com',
   // Finance & payments
   'wise.com', 'paypal.com', 'stripe.com', 'dashboard.stripe.com',
@@ -1414,6 +1417,452 @@ async function runOrchestration(userPrompt, searchPlan, token) {
   }
 }
 
+// --- PARALLEL_EXPLORE: Multi-tab orchestration loop ---
+// Switches between visible tabs to type input, polls for completion, collects results, synthesizes.
+
+async function updateParallelExploreProgress(phase, tabStates) {
+  const tabs = tabStates.map(s => ({
+    label: s.label, status: s.status, tabId: s.tabId || null,
+  }));
+  await chrome.storage.session.set({
+    parallelExploreProgress: { phase, tabs, timestamp: Date.now() },
+  });
+}
+
+// Simple string hash for content comparison (not cryptographic — just for change detection)
+function simpleHash(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + ch;
+    hash |= 0; // Convert to 32-bit integer
+  }
+  return hash;
+}
+
+async function runParallelExplore(parallelPlan, userPrompt, token) {
+  const startedAt = Date.now();
+  let creditsUsed = 0;
+
+  // Service worker keepalive (prevents Chrome from killing us)
+  const keepAlive = setInterval(() => {
+    chrome.runtime.getPlatformInfo(() => {});
+  }, 20000);
+
+  try {
+    // ── Phase 1: Resolve Tabs ──────────────────────────────────
+    console.log('[ParallelExplore] Phase 1: Resolving tabs...');
+    await updateParallelExploreProgress('resolving', []);
+
+    const allTabs = await chrome.tabs.query({});
+    const tabStates = [];
+
+    for (const entry of parallelPlan.tabs) {
+      let match = null;
+
+      // forceNewChat: skip tab matching entirely — always open fresh tab
+      if (entry.forceNewChat && entry.url) {
+        try {
+          match = await chrome.tabs.create({ url: entry.url, active: false });
+          await waitForTabLoad(match.id, 15000);
+          console.log(`[ParallelExplore] Opened NEW CHAT tab for "${entry.label}": ${entry.url} (forceNewChat=true)`);
+        } catch (tabErr) {
+          console.warn(`[ParallelExplore] Failed to open new chat tab for "${entry.label}":`, tabErr.message);
+        }
+      } else {
+        // Find by URL substring or title match
+        match = allTabs.find(t => t.url && t.url.includes(entry.tabHint));
+        if (!match) {
+          match = allTabs.find(t => t.title && t.title.toLowerCase().includes(entry.tabHint.toLowerCase()));
+        }
+        // Fallback: open new tab if URL provided
+        if (!match && entry.url) {
+          try {
+            match = await chrome.tabs.create({ url: entry.url, active: false });
+            await waitForTabLoad(match.id, 15000);
+            console.log(`[ParallelExplore] Opened new tab for "${entry.label}": ${entry.url}`);
+          } catch (tabErr) {
+            console.warn(`[ParallelExplore] Failed to open tab for "${entry.label}":`, tabErr.message);
+          }
+        }
+      }
+
+      if (!match) {
+        tabStates.push({
+          label: entry.label, status: 'error', error: `Tab not found (hint: "${entry.tabHint}")`,
+          tabId: null, input: entry.input, inputTarget: entry.inputTarget,
+          fingerprint: null, stableCount: 0, result: null, url: null,
+        });
+        console.warn(`[ParallelExplore] Tab not found for "${entry.label}" (hint: "${entry.tabHint}")`);
+        continue;
+      }
+
+      tabStates.push({
+        label: entry.label, status: 'pending', error: null,
+        tabId: match.id, input: entry.input, inputTarget: entry.inputTarget,
+        fingerprint: null, baselineFingerprint: null, baselineContentHash: null,
+        stableCount: 0, result: null, url: match.url || entry.url || '',
+      });
+      console.log(`[ParallelExplore] Resolved "${entry.label}" → tabId ${match.id} (${match.url})`);
+    }
+
+    const pendingTabs = tabStates.filter(s => s.status === 'pending');
+    if (pendingTabs.length < 2) {
+      const found = pendingTabs.map(s => s.label).join(', ') || 'none';
+      const missing = tabStates.filter(s => s.status === 'error').map(s => `${s.label} (${s.error})`).join(', ');
+      clearInterval(keepAlive);
+      return {
+        success: false,
+        error: `Need at least 2 tabs but only found: ${found}. Missing: ${missing}. Please open the missing tabs and try again.`,
+      };
+    }
+
+    await updateParallelExploreProgress('dispatching', tabStates);
+
+    // ── Phase 2: Dispatch Input ────────────────────────────────
+    // Sequential — typing requires the active tab
+    console.log(`[ParallelExplore] Phase 2: Dispatching input to ${pendingTabs.length} tabs...`);
+
+    for (const state of tabStates) {
+      if (state.status !== 'pending') continue;
+
+      try {
+        // Activate the tab
+        await chrome.tabs.update(state.tabId, { active: true });
+        await waitForTabReady(state.tabId, 15000);
+        await waitForDomStable(state.tabId, 2000, 300);
+
+        // Inject content_explore.js
+        await injectAndConfirm(state.tabId, 'content_explore.js');
+
+        // Capture baseline fingerprint BEFORE typing (for false-ready detection)
+        try {
+          const baselineFp = await safeSendMessage(state.tabId, {
+            type: 'explore_action', actionType: 'dom_fingerprint',
+          }).catch(() => null);
+          if (baselineFp?.fingerprint) {
+            state.baselineFingerprint = baselineFp.fingerprint;
+          }
+          // Hash the main content to detect if it changes after submission
+          const baselineSnap = await takePageSnapshot(state.tabId);
+          if (baselineSnap?.mainContent) {
+            state.baselineContentHash = simpleHash(baselineSnap.mainContent.slice(0, 4000));
+          }
+        } catch (bErr) {
+          console.warn(`[ParallelExplore] Baseline capture failed for "${state.label}":`, bErr.message);
+        }
+
+        // Take snapshot to find input field
+        const snapshot = await takePageSnapshot(state.tabId);
+        if (snapshot._tabClosed) {
+          state.status = 'error';
+          state.error = 'Tab was closed';
+          await updateParallelExploreProgress('dispatching', tabStates);
+          continue;
+        }
+
+        // Call explore-step to figure out where to type and how to submit
+        const stepByokConfig = await getByokConfig();
+        const stepGoal = `Type the following text into the main input field and submit it: "${state.input}"${state.inputTarget ? `. The input field hint: "${state.inputTarget}"` : ''}. After typing, press Enter or click the submit/send button.`;
+
+        const stepRes = await fetch(`${API_BASE}/api/agent/explore-step`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({
+            goal: stepGoal,
+            strategy: 'Find the main text input, type the question, and submit.',
+            stepNumber: 1,
+            maxSteps: 4,
+            previousActions: [],
+            currentPageState: snapshot,
+            ...byokPayload(stepByokConfig),
+          }),
+        });
+
+        if (!stepRes.ok) {
+          console.warn(`[ParallelExplore] Explore-step failed for "${state.label}": HTTP ${stepRes.status}`);
+          state.status = 'error';
+          state.error = `AI step failed (HTTP ${stepRes.status})`;
+          creditsUsed += 0.3;
+          await updateParallelExploreProgress('dispatching', tabStates);
+          continue;
+        }
+
+        const stepData = await stepRes.json();
+        creditsUsed += 0.3; // PARALLEL_EXPLORE_STEP
+
+        // Execute up to 4 micro-steps (type + enter + maybe dismiss dialog)
+        let actionsExecuted = 0;
+        let currentAction = stepData.nextAction;
+
+        for (let microStep = 0; microStep < 4 && currentAction; microStep++) {
+          console.log(`[ParallelExplore] "${state.label}" micro-step ${microStep}: ${currentAction.type} ${currentAction.target || ''}`);
+
+          const actionResult = await executeExploreAction(state.tabId, currentAction, token);
+          actionsExecuted++;
+
+          if (!actionResult.success) {
+            console.warn(`[ParallelExplore] "${state.label}" action failed:`, actionResult.error);
+            break;
+          }
+
+          // If AI said goal is complete after this action, stop
+          if (stepData.isGoalComplete) break;
+
+          // For the first step (usually type_text), follow up with press_key Enter
+          if (microStep === 0 && currentAction.type === 'type_text') {
+            currentAction = { type: 'press_key', value: 'Enter', description: 'Submit the input' };
+          } else if (microStep === 1 && currentAction.type === 'press_key') {
+            // After pressing Enter, we're done dispatching to this tab
+            break;
+          } else {
+            // Get next action from AI if needed
+            const nextSnapshot = await takePageSnapshot(state.tabId);
+            const nextStepRes = await fetch(`${API_BASE}/api/agent/explore-step`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+              body: JSON.stringify({
+                goal: stepGoal,
+                strategy: 'Continue: type the question and submit.',
+                stepNumber: microStep + 2,
+                maxSteps: 4,
+                previousActions: [{ step: microStep, action: currentAction, result: { success: actionResult.success } }],
+                currentPageState: nextSnapshot,
+                ...byokPayload(stepByokConfig),
+              }),
+            });
+            if (nextStepRes.ok) {
+              const nextData = await nextStepRes.json();
+              creditsUsed += 0.3;
+              currentAction = nextData.nextAction;
+              if (nextData.isGoalComplete) break;
+            } else {
+              break;
+            }
+          }
+        }
+
+        state.status = actionsExecuted > 0 ? 'dispatched' : 'error';
+        if (state.status === 'error') state.error = 'No actions executed';
+        state.url = snapshot.url;
+
+        console.log(`[ParallelExplore] "${state.label}" dispatched (${actionsExecuted} actions)`);
+        await updateParallelExploreProgress('dispatching', tabStates);
+
+        // Brief pause before switching to next tab
+        await new Promise(r => setTimeout(r, 500));
+
+      } catch (dispatchErr) {
+        console.error(`[ParallelExplore] Dispatch error for "${state.label}":`, dispatchErr);
+        state.status = 'error';
+        state.error = dispatchErr.message || 'Dispatch failed';
+        await updateParallelExploreProgress('dispatching', tabStates);
+      }
+    }
+
+    // Check we still have enough dispatched tabs
+    const dispatchedTabs = tabStates.filter(s => s.status === 'dispatched');
+    if (dispatchedTabs.length < 2) {
+      const dispatched = dispatchedTabs.map(s => s.label).join(', ') || 'none';
+      const errors = tabStates.filter(s => s.status === 'error').map(s => `${s.label}: ${s.error}`).join('; ');
+      clearInterval(keepAlive);
+      return {
+        success: false,
+        error: `Only ${dispatchedTabs.length} tab(s) dispatched successfully (${dispatched}). Errors: ${errors}`,
+        creditsUsed,
+      };
+    }
+
+    // ── Phase 3: Poll for Completion ───────────────────────────
+    // Round-robin DOM fingerprint checks (works on non-active tabs)
+    // ANTI-FABRICATION: Require DOM to actually CHANGE from baseline before marking ready.
+    console.log(`[ParallelExplore] Phase 3: Polling ${dispatchedTabs.length} tabs for response completion...`);
+    await updateParallelExploreProgress('polling', tabStates);
+
+    // Minimum wait before polling — chatbots need time to start generating
+    const MIN_WAIT_BEFORE_POLL = 5000;
+    await new Promise(r => setTimeout(r, MIN_WAIT_BEFORE_POLL));
+
+    const MAX_WAIT = (parallelPlan.maxWaitPerTab || 60) * 1000;
+    const POLL_INTERVAL = 3000;    // 3s between checks per tab
+    const STABLE_THRESHOLD = 3;    // 3 consecutive stable reads = 9s of no DOM change
+    const pollStart = Date.now();
+
+    while (Date.now() - pollStart < MAX_WAIT) {
+      let allDone = true;
+
+      for (const state of tabStates) {
+        if (state.status !== 'dispatched') continue;
+        allDone = false;
+
+        try {
+          const fp = await safeSendMessage(state.tabId, {
+            type: 'explore_action',
+            actionType: 'dom_fingerprint',
+          }).catch(() => null);
+
+          if (fp?.fingerprint) {
+            // ANTI-FABRICATION CHECK: If fingerprint matches baseline, the page
+            // hasn't changed since before we typed — the chatbot hasn't responded yet.
+            // Do NOT count stable reads if the DOM is still the same as pre-dispatch.
+            const matchesBaseline = state.baselineFingerprint && fp.fingerprint === state.baselineFingerprint;
+
+            if (matchesBaseline) {
+              // Page unchanged from baseline — still waiting for response
+              state.stableCount = 0;
+              state.fingerprint = fp.fingerprint;
+            } else if (state.fingerprint && state.fingerprint === fp.fingerprint) {
+              state.stableCount++;
+              if (state.stableCount >= STABLE_THRESHOLD) {
+                state.status = 'ready';
+                console.log(`[ParallelExplore] "${state.label}" response is ready (DOM changed from baseline AND stable for ${STABLE_THRESHOLD * POLL_INTERVAL / 1000}s)`);
+                await updateParallelExploreProgress('polling', tabStates);
+              }
+            } else {
+              state.fingerprint = fp.fingerprint;
+              state.stableCount = 0;
+            }
+          }
+        } catch (pollErr) {
+          console.warn(`[ParallelExplore] Poll error for "${state.label}":`, pollErr.message);
+        }
+      }
+
+      if (allDone || tabStates.filter(s => s.status === 'dispatched').length === 0) break;
+
+      await new Promise(r => setTimeout(r, POLL_INTERVAL));
+    }
+
+    // Mark remaining dispatched tabs as timeout (still try to collect partial)
+    for (const state of tabStates) {
+      if (state.status === 'dispatched') {
+        state.status = 'timeout';
+        console.log(`[ParallelExplore] "${state.label}" timed out after ${MAX_WAIT / 1000}s — will collect partial result`);
+      }
+    }
+    await updateParallelExploreProgress('collecting', tabStates);
+
+    // ── Phase 4: Collect Results ───────────────────────────────
+    console.log('[ParallelExplore] Phase 4: Collecting results from all tabs...');
+
+    for (const state of tabStates) {
+      if (state.status !== 'ready' && state.status !== 'timeout') continue;
+
+      try {
+        await injectAndConfirm(state.tabId, 'content_explore.js');
+        const snapshot = await takePageSnapshot(state.tabId);
+
+        if (snapshot._tabClosed) {
+          state.status = 'error';
+          state.error = 'Tab was closed before collection';
+          continue;
+        }
+
+        // Capture visible text content (up to 4000 chars)
+        const content = (snapshot.mainContent || '').slice(0, 4000);
+
+        // ANTI-FABRICATION: Verify content actually changed from pre-dispatch
+        if (state.baselineContentHash !== null) {
+          const currentHash = simpleHash(content);
+          if (currentHash === state.baselineContentHash) {
+            console.warn(`[ParallelExplore] "${state.label}" content UNCHANGED from baseline — chatbot likely didn't respond. Marking as no-response.`);
+            state.status = 'error';
+            state.error = 'No response detected — page content unchanged after submission';
+            continue;
+          }
+        }
+
+        state.result = content;
+        state.url = snapshot.url || state.url;
+        console.log(`[ParallelExplore] "${state.label}" collected ${content.length} chars`);
+      } catch (collectErr) {
+        console.warn(`[ParallelExplore] Collect error for "${state.label}":`, collectErr.message);
+        state.status = 'error';
+        state.error = 'Collection failed';
+      }
+    }
+
+    // Build results for synthesis
+    const collectedResults = tabStates
+      .filter(s => s.result && s.result.length > 0)
+      .map(s => ({ label: s.label, url: s.url, content: s.result }));
+
+    if (collectedResults.length < 2) {
+      const collected = collectedResults.map(r => r.label).join(', ') || 'none';
+      clearInterval(keepAlive);
+      return {
+        success: false,
+        error: `Only ${collectedResults.length} tab(s) returned results (${collected}). Need at least 2 for synthesis.`,
+        creditsUsed,
+        tabStates: tabStates.map(s => ({ label: s.label, status: s.status, error: s.error })),
+      };
+    }
+
+    // ── Phase 5: Synthesize ────────────────────────────────────
+    console.log(`[ParallelExplore] Phase 5: Synthesizing ${collectedResults.length} results...`);
+    await updateParallelExploreProgress('synthesizing', tabStates);
+
+    try {
+      const synthByokConfig = await getByokConfig();
+      const synthRes = await fetch(`${API_BASE}/api/agent/synthesize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          results: collectedResults,
+          synthesisPrompt: parallelPlan.synthesisPrompt,
+          userPrompt,
+          ...byokPayload(synthByokConfig),
+        }),
+      });
+
+      creditsUsed += 0.5; // PARALLEL_EXPLORE_SYNTH
+
+      if (!synthRes.ok) {
+        const errBody = await synthRes.json().catch(() => ({}));
+        clearInterval(keepAlive);
+        return {
+          success: false,
+          error: errBody.error || `Synthesis failed (HTTP ${synthRes.status})`,
+          creditsUsed,
+          rawResults: collectedResults,
+        };
+      }
+
+      const synthesis = await synthRes.json();
+      const durationMs = Date.now() - startedAt;
+
+      console.log(`[ParallelExplore] ✓ Complete! ${collectedResults.length} sources, ${creditsUsed.toFixed(1)} EU, ${durationMs}ms`);
+
+      await updateParallelExploreProgress('done', tabStates);
+      clearInterval(keepAlive);
+
+      return {
+        success: true,
+        data: synthesis,
+        tabCount: collectedResults.length,
+        creditsUsed,
+        durationMs,
+        tabStates: tabStates.map(s => ({ label: s.label, status: s.status, error: s.error })),
+      };
+
+    } catch (synthErr) {
+      console.error('[ParallelExplore] Synthesis error:', synthErr);
+      clearInterval(keepAlive);
+      return {
+        success: false,
+        error: `Synthesis failed: ${synthErr.message}`,
+        creditsUsed,
+        rawResults: collectedResults,
+      };
+    }
+
+  } catch (err) {
+    console.error('[ParallelExplore] Unhandled error:', err);
+    clearInterval(keepAlive);
+    return { success: false, error: err.message || 'Parallel exploration failed.', creditsUsed };
+  }
+}
+
 // --- EXPLORE: Multi-step agentic exploration loop ---
 
 async function updateExplorationProgress(step, total, description, status, phase = 1) {
@@ -1584,11 +2033,51 @@ async function executeExploreAction(tabId, action, token, _retryCount = 0) {
         return { success: false, error: `BLOCKED: Domain not allowed for exploration: ${url}` };
       }
 
-      await chrome.tabs.update(tabId, { url });
-      await waitForTabLoad(tabId, 15000, 500); // 500ms after load for SPA rendering
+      // ── TAB SWIPE SYSTEM ──────────────────────────────────────
+      // Instead of always overwriting the current tab, check if this is
+      // a cross-domain navigation. If so, preserve the current tab and
+      // either switch to an existing tab with that domain or open a new one.
+      // This prevents losing the source page (e.g., Gmail) when navigating
+      // to a target page (e.g., Excel Online) during data transfer tasks.
+      let targetTabId = tabId;
+      let currentHost = '';
+      let targetHost = '';
+      try {
+        const currentTab = await chrome.tabs.get(tabId);
+        currentHost = new URL(currentTab.url || '').hostname.toLowerCase();
+        targetHost = new URL(url).hostname.toLowerCase();
+      } catch {}
+
+      const isCrossDomain = currentHost && targetHost && currentHost !== targetHost;
+
+      if (isCrossDomain) {
+        // Cross-domain: look for an existing tab with the target domain
+        const allTabs = await chrome.tabs.query({ currentWindow: true });
+        const existingTab = allTabs.find(t => {
+          if (t.id === tabId) return false; // Don't match the source tab
+          try { return new URL(t.url).hostname.toLowerCase() === targetHost; } catch { return false; }
+        });
+
+        if (existingTab) {
+          // Tab with target domain already open — switch to it and navigate
+          await chrome.tabs.update(existingTab.id, { active: true, url });
+          targetTabId = existingTab.id;
+          console.log(`[Explore] Tab Swipe: reused existing tab ${targetTabId} for ${targetHost} (source tab ${tabId} preserved)`);
+        } else {
+          // No existing tab — open a new one, preserve the source tab
+          const newTab = await chrome.tabs.create({ url, active: true });
+          targetTabId = newTab.id;
+          console.log(`[Explore] Tab Swipe: created new tab ${targetTabId} for ${targetHost} (source tab ${tabId} preserved)`);
+        }
+      } else {
+        // Same domain or unknown: navigate within the same tab (existing behavior)
+        await chrome.tabs.update(tabId, { url });
+      }
+
+      await waitForTabLoad(targetTabId, 15000, 500); // 500ms after load for SPA rendering
 
       // Get the ACTUAL loaded URL (chrome.tabs.update returns before navigation)
-      const loadedTab = await chrome.tabs.get(tabId);
+      const loadedTab = await chrome.tabs.get(targetTabId);
       const actualUrl = loadedTab.url || url;
 
       // Re-inject DOM interaction scripts with retry (Reddit/SPAs may need a moment)
@@ -1598,7 +2087,7 @@ async function executeExploreAction(tabId, action, token, _retryCount = 0) {
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
             await chrome.scripting.executeScript({
-              target: { tabId },
+              target: { tabId: targetTabId },
               files: [script],
             });
             console.log(`[Explore] Injected ${script} on`, actualUrl);
@@ -1617,6 +2106,8 @@ async function executeExploreAction(tabId, action, token, _retryCount = 0) {
         success: true,
         observation: `Navigated to ${actualUrl}`,
         newUrl: actualUrl,
+        // Signal the exploration loop that the active tab changed
+        newTabId: isCrossDomain ? targetTabId : undefined,
       };
     }
 
@@ -1741,6 +2232,133 @@ function generateCheckpoint(stepLog, goal) {
 
   // Cap at 500 chars to keep prompt compact
   return checkpoint.length > 500 ? checkpoint.slice(0, 497) + '...' : checkpoint;
+}
+
+// ── LAYER 2: Heuristic Completion Detector ──
+// Detects goal-completion signals from page state changes WITHOUT relying on the AI.
+// Returns a hint string if strong signals detected, null otherwise.
+// NEVER force-stops — only hints to the AI. No false-positive risk.
+function detectGoalCompletionSignals(goal, preActionSnapshot, postActionSnapshot, lastAction) {
+  if (!postActionSnapshot || !lastAction) return null;
+  const signals = [];
+
+  const postUrl = (postActionSnapshot.url || '').toLowerCase();
+  const postContent = (postActionSnapshot.mainContent || '').toLowerCase();
+  const goalLower = (goal || '').toLowerCase();
+
+  // Signal 1: URL changed to a success/confirmation pattern
+  const successUrlPatterns = ['/success', '/confirmation', '/confirm', '/complete', '/thank', '/done', '/created', '/scheduled', '/submitted', '/receipt'];
+  if (preActionSnapshot?.url && postUrl !== preActionSnapshot.url.toLowerCase()) {
+    for (const pattern of successUrlPatterns) {
+      if (postUrl.includes(pattern)) {
+        signals.push(`URL contains "${pattern}"`);
+        break;
+      }
+    }
+    // Meeting link patterns (Google Meet, Zoom, Teams)
+    if (postUrl.match(/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}/)) signals.push('Google Meet link created');
+    if (postUrl.match(/zoom\.us\/j\/\d+/)) signals.push('Zoom meeting link created');
+    if (postUrl.match(/teams\.microsoft\.com\/.*meetup/)) signals.push('Teams meeting created');
+  }
+
+  // Signal 2: Page content contains success keywords
+  const successPhrases = [
+    'successfully created', 'has been scheduled', 'has been created', 'meeting is ready',
+    'your meeting', 'meeting link', 'has been saved', 'successfully saved',
+    'order confirmed', 'booking confirmed', 'reservation confirmed',
+    'has been submitted', 'successfully submitted', 'successfully sent',
+    'was sent', 'message sent', 'email sent', 'has been deleted',
+    'successfully updated', 'changes saved', 'settings updated',
+    'copied to clipboard', 'link copied', 'download started',
+    'task created', 'event created', 'document created',
+  ];
+  for (const phrase of successPhrases) {
+    if (postContent.includes(phrase)) {
+      signals.push(`Page says "${phrase}"`);
+      break; // One is enough
+    }
+  }
+
+  // Signal 3: Goal-action semantic match
+  // If goal is "create/schedule/send/submit" and the action was a click that succeeded
+  const createVerbs = ['create', 'schedule', 'start', 'new', 'set up', 'make', 'add', 'send', 'submit', 'post', 'publish'];
+  const goalHasCreateVerb = createVerbs.some(v => goalLower.includes(v));
+  const actionWasClick = lastAction.type === 'click_element';
+  const actionSucceeded = true; // caller only calls this on success
+
+  if (goalHasCreateVerb && actionWasClick && preActionSnapshot?.url &&
+      postUrl !== preActionSnapshot.url.toLowerCase()) {
+    signals.push('Create/schedule action caused page navigation (likely confirmation)');
+  }
+
+  // Signal 4: Dramatic content change after click (new content appeared)
+  if (preActionSnapshot?.mainContent && actionWasClick) {
+    const preLen = (preActionSnapshot.mainContent || '').length;
+    const postLen = (postActionSnapshot.mainContent || '').length;
+    // If page content changed by >50% and URL changed, something significant happened
+    if (Math.abs(postLen - preLen) > preLen * 0.5 &&
+        preActionSnapshot.url && postUrl !== preActionSnapshot.url.toLowerCase()) {
+      signals.push('Page content changed dramatically after action');
+    }
+  }
+
+  // Return hint only if 2+ signals (high confidence) to avoid false positives
+  if (signals.length >= 2) {
+    return `The page shows strong completion signals: ${signals.join('; ')}. If the goal is achieved, set isGoalComplete=true immediately.`;
+  }
+  // Return weaker hint for 1 signal
+  if (signals.length === 1) {
+    return `Possible completion signal detected: ${signals[0]}. Check if the goal is already achieved.`;
+  }
+  return null;
+}
+
+// ── LAYER 4: Phase Completion Evidence Scanner ──
+// Scans a phase's stepLog for evidence that the goal was achieved,
+// even if the AI never set isGoalComplete=true.
+// Used as a gate before auto-continuation to prevent wasting phases.
+function phaseContainsCompletionEvidence(stepLog, goal) {
+  if (!stepLog || stepLog.length === 0) return false;
+  const goalLower = (goal || '').toLowerCase();
+
+  // Check observations for success language
+  const successKeywords = [
+    'successfully', 'created', 'scheduled', 'confirmed', 'saved', 'sent',
+    'completed', 'done', 'finished', 'meeting is ready', 'meeting link',
+    'has been', 'was created', 'submitted', 'published', 'posted',
+  ];
+
+  let evidenceCount = 0;
+
+  for (const entry of stepLog) {
+    if (!entry.observation || entry.result?.success === false) continue;
+    const obs = entry.observation.toLowerCase();
+
+    for (const kw of successKeywords) {
+      if (obs.includes(kw)) {
+        evidenceCount++;
+        break; // one keyword per entry is enough
+      }
+    }
+
+    // Strong signal: if observation contains the URL pattern of a created resource
+    if (obs.match(/meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}/) ||
+        obs.match(/zoom\.us\/j\/\d+/) ||
+        obs.includes('/confirmation') || obs.includes('/success') ||
+        obs.includes('/thank-you') || obs.includes('/created')) {
+      evidenceCount += 2; // strong signal counts double
+    }
+  }
+
+  // Also check: did a click on a "create/new/schedule/submit" button succeed?
+  const actionButtons = stepLog.filter(s =>
+    s.action?.type === 'click_element' && s.result?.success !== false &&
+    /(create|new|schedule|submit|send|post|publish|start|confirm)/i.test(s.action?.description || '')
+  );
+  if (actionButtons.length > 0) evidenceCount++;
+
+  // Threshold: 2+ evidence signals = likely completed
+  return evidenceCount >= 2;
 }
 
 // ── Auto-Continuation Constants ──
@@ -2276,6 +2894,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           originalPrompt: originalPrompt || undefined,
           dataBuffer: dataBuffer || undefined,
           failedActions: failedActions.length > 0 ? failedActions : undefined,
+          completionHint: stepLog._completionHint || undefined,
           ...byokPayload(exploreByokConfig),
         };
 
@@ -2387,6 +3006,31 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
       if (decision.nextAction && stepLog.length > 0) {
         const currType = decision.nextAction.type;
         const currTarget = decision.nextAction.target;
+
+        // ── LAYER 3: Success-then-repeat circuit breaker ──
+        // If the LAST action SUCCEEDED and the page changed (URL or content shift),
+        // and the AI wants to repeat the same action TYPE — it likely already achieved the goal.
+        // Example: clicked "New meeting" → meeting was created → AI wants to click "New meeting" again
+        if (currType !== 'scrape_page' && currType !== 'scroll' && currType !== 'wait' && stepLog.length >= 1) {
+          const lastEntry = stepLog[stepLog.length - 1];
+          const lastSucceeded = lastEntry.result?.success !== false;
+          const lastType = lastEntry.action?.type;
+          const lastTarget = lastEntry.action?.target;
+
+          if (lastSucceeded && lastType === currType && lastTarget === currTarget) {
+            // Exact same action+target after success — very likely the goal is done
+            // Check if there's a completion hint already detected
+            if (stepLog._completionHint) {
+              console.warn(`[Explore] Step ${step}: SUCCESS-THEN-REPEAT detected: ${currType}(${currTarget}) after success + completion hint. Forcing goal completion check.`);
+              // Force isGoalComplete — the AI is clearly confused
+              decision.isGoalComplete = true;
+              decision.goalResult = stepLog._completionHint.includes('Page says')
+                ? `The action was completed successfully. ${lastEntry.observation || ''}`
+                : `The action "${lastEntry.action?.description || lastType}" was completed successfully. ${lastEntry.observation || ''}`;
+              decision.nextAction = null;
+            }
+          }
+        }
 
         // Skip loop detection for non-interactive actions
         if (currType !== 'scrape_page' && currType !== 'scrape_table' && currType !== 'scroll' && currType !== 'wait' && currType !== 'resolve_element' && currType !== 'paste_tsv') {
@@ -2939,7 +3583,55 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
       await hudUpdate(currentTabId, `explore-${step}`, 'processing', actionDesc);
       await updateExplorationProgress(step, maxSteps, actionDesc, 'running');
 
+      // ── LAYER 2: Capture pre-action snapshot for heuristic completion detection ──
+      const preActionSnapshot = { url: snapshot.url, mainContent: snapshot.mainContent };
+
       const actionResult = await executeExploreAction(currentTabId, decision.nextAction, token);
+
+      // ── TAB SWIPE: Update currentTabId if navigate opened/switched to a different tab ──
+      if (actionResult.newTabId && actionResult.newTabId !== currentTabId) {
+        const oldTabId = currentTabId;
+        currentTabId = actionResult.newTabId;
+        console.log(`[Explore] Tab Swipe: exploration now tracking tab ${currentTabId} (was ${oldTabId})`);
+
+        // Update webNavigation listeners to watch the new tab
+        chrome.webNavigation.onCompleted.removeListener(navListener);
+        chrome.webNavigation.onHistoryStateUpdated.removeListener(spaNavListener);
+
+        // Re-create listeners with closure over the (now-updated) currentTabId
+        // We need to use the variable directly since it's mutable
+        const newNavListener = (details) => {
+          if (details.tabId !== currentTabId || details.frameId !== 0) return;
+          console.log('[Explore] webNavigation.onCompleted — re-injecting DOM scripts on', details.url);
+          injectAndConfirm(currentTabId, 'content_explore.js').catch(() => {});
+          chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: [HUD_SCRIPT] }).catch(() => {});
+        };
+        const newSpaNavListener = (details) => {
+          if (details.tabId !== currentTabId || details.frameId !== 0) return;
+          console.log('[Explore] SPA navigation (onHistoryStateUpdated) — re-injecting DOM scripts on', details.url);
+          injectAndConfirm(currentTabId, 'content_explore.js').catch(() => {});
+          chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: [HUD_SCRIPT] }).catch(() => {});
+        };
+        chrome.webNavigation.onCompleted.addListener(newNavListener);
+        chrome.webNavigation.onHistoryStateUpdated.addListener(newSpaNavListener);
+
+        // Patch cleanupLoop to remove the new listeners
+        const origCleanup = cleanupLoop;
+        cleanupLoop = function() {
+          origCleanup();
+          chrome.webNavigation.onCompleted.removeListener(newNavListener);
+          chrome.webNavigation.onHistoryStateUpdated.removeListener(newSpaNavListener);
+        };
+
+        // Update explorationActive storage with new tabId
+        try {
+          await chrome.storage.session.set({
+            explorationActive: { goal, maxSteps, tabId: currentTabId, startedAt: Date.now(), phase: currentPhase },
+          });
+        } catch (e) {
+          console.warn('[Explore] Could not update explorationActive with new tabId:', e.message);
+        }
+      }
 
       // If navigation happened (explicit navigate OR click that triggered page change),
       // re-inject all scripts and restore HUD
@@ -3036,6 +3728,23 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         consecutiveFailures = 0;
         await hudUpdate(currentTabId, `explore-${step}`, 'success', actionDesc);
         await updateExplorationProgress(step, maxSteps, `Done: ${actionDesc}`, 'running');
+
+        // ── LAYER 2: Run heuristic completion detector after successful action ──
+        // Takes a quick post-action snapshot and checks for completion signals.
+        // The hint is passed to the next AI step call (Layer 1 STOP CHECK amplifies it).
+        try {
+          const postActionSnapshot = await takePageSnapshot(currentTabId);
+          const hint = detectGoalCompletionSignals(goal, preActionSnapshot, postActionSnapshot, decision.nextAction);
+          if (hint) {
+            // Store hint — it will be sent with the next explore-step API call
+            stepLog._completionHint = hint;
+            console.log(`[Explore] Step ${step}: COMPLETION HINT detected: ${hint}`);
+          } else {
+            stepLog._completionHint = null;
+          }
+        } catch (hintErr) {
+          console.warn('[Explore] Completion hint check failed (non-blocking):', hintErr.message);
+        }
 
         // ── SITEMAP: Record match outcome if we used deterministic path ──
         if (siteMapMatch?.id) {
@@ -3185,6 +3894,27 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
     cleanupLoop();
 
     const stoppedDueToFailures = consecutiveFailures >= 5;
+
+    // ── LAYER 4: Auto-continuation gate ──
+    // Before auto-continuing, check if the phase's step log contains evidence
+    // that the goal was already achieved (even though isGoalComplete was never set).
+    // This prevents wasting entire phases on goals that were done mid-phase.
+    if (!stoppedDueToFailures && phaseContainsCompletionEvidence(stepLog, goal)) {
+      console.log('[Explore] LAYER 4 GATE: Phase contains completion evidence — NOT auto-continuing.');
+      cleanupLoop();
+      const successObservations = stepLog
+        .filter(s => s.observation && s.result?.success)
+        .map(s => s.observation)
+        .join('\n');
+      await updateExplorationProgress(maxSteps, maxSteps, 'Goal likely achieved — stopping.', 'complete');
+      return finishExploration({
+        success: true,
+        goalResult: successObservations || 'The task appears to have been completed successfully.',
+        stepsUsed: totalStepsAcrossPhases + stepLog.length,
+        creditsUsed,
+        stepLog,
+      });
+    }
 
     // ── AUTO-CONTINUATION: if goal not complete and phases remain, auto-continue ──
     if (!stoppedDueToFailures && currentPhase < MAX_PHASES) {
@@ -3435,10 +4165,175 @@ async function stageAction(tabId, userGoal, category, token) {
   };
 }
 
+// ── Build Recipe from Centralized Session ─────────────────────
+// Called when recording stops. Transforms the raw step log into
+// a clean recipe ready for review and saving.
+
+function buildRecipeFromSession(session) {
+  const steps = session.steps;
+
+  // Extract variable declarations
+  const variables = [];
+  const seenVars = new Set();
+
+  for (const step of steps) {
+    if (step.action.inputType === 'variable' && step.action.variableName) {
+      if (!seenVars.has(step.action.variableName)) {
+        seenVars.add(step.action.variableName);
+        variables.push({
+          name: step.action.variableName,
+          description: step.action.variableDescription || `Value for ${step.action.variableName}`,
+          fieldType: 'text',
+        });
+      }
+    }
+  }
+
+  // Clean up steps: remove redundant consecutive scrolls, strip internals,
+  // filter out same-domain SPA navigations (e.g., Gmail compose URL change), reindex
+  const cleanedSteps = [];
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+
+    // Skip consecutive scroll events (keep only the last one)
+    if (step.action.type === 'scroll' && i + 1 < steps.length && steps[i + 1].action.type === 'scroll') {
+      continue;
+    }
+
+    // Skip same-domain navigate steps — these are SPA URL changes (Gmail compose,
+    // React Router, etc.) that don't actually reload the page. The click that triggered
+    // the SPA navigation is already recorded; replaying a navigate step would cause
+    // the content script to return partial:true and abort remaining steps.
+    if (step.action.type === 'navigate' && step.action.url && session.startDomain) {
+      try {
+        const navDomain = new URL(step.action.url).hostname.replace(/^www\./, '').toLowerCase();
+        const startDomain = session.startDomain.replace(/^www\./, '').toLowerCase();
+        if (navDomain === startDomain) {
+          console.log('[Learning] Skipping same-domain SPA navigate step:', step.action.url);
+          continue;
+        }
+      } catch {}
+    }
+
+    // Strip internal tracking fields
+    const { _elementKey, tabId, ...cleanStep } = step;
+    cleanedSteps.push({
+      ...cleanStep,
+      stepNumber: cleanedSteps.length + 1,
+    });
+  }
+
+  // Collect all unique domains touched
+  const allDomains = [...new Set(Object.values(session.tabDomains))];
+
+  return {
+    workflowName: session.workflowName,
+    siteDomain: session.startDomain,
+    siteDomains: allDomains,
+    isMultiTab: allDomains.length > 1,
+    startUrl: session.startUrl,
+    contractVersion: '1.0',
+    steps: cleanedSteps,
+    variables,
+    metadata: {
+      totalSteps: cleanedSteps.length,
+      trainedAt: new Date().toISOString(),
+      estimatedDuration: cleanedSteps.length > 0
+        ? cleanedSteps[cleanedSteps.length - 1].timestamp - cleanedSteps[0].timestamp
+        : 0,
+    },
+  };
+}
+
+// ── Multi-Tab Replay Helpers ──────────────────────────────────
+
+// Split recipe steps into segments by switch_tab boundaries.
+// Each segment has: { switchTo: { domain, url } | null, steps: [...] }
+// The first segment has switchTo: null (runs on the current tab).
+function splitIntoSegments(steps) {
+  const segments = [];
+  let currentSegment = { switchTo: null, steps: [] };
+
+  for (const step of steps) {
+    if (step.action.type === 'switch_tab') {
+      // End current segment (if it has steps), start a new one
+      if (currentSegment.steps.length > 0) {
+        segments.push(currentSegment);
+      }
+      currentSegment = {
+        switchTo: {
+          domain: step.action.targetDomain,
+          url: step.action.targetUrl,
+        },
+        steps: [],
+      };
+    } else {
+      currentSegment.steps.push(step);
+    }
+  }
+
+  // Push the last segment
+  if (currentSegment.steps.length > 0) {
+    segments.push(currentSegment);
+  }
+
+  return segments;
+}
+
+// Find an existing tab by domain, or create a new one.
+// Returns tabId or null.
+async function findTabByDomain(domain, fallbackUrl) {
+  try {
+    const allTabs = await chrome.tabs.query({ currentWindow: true });
+
+    // Pass 1: exact domain match
+    for (const tab of allTabs) {
+      if (!tab.url) continue;
+      try {
+        const tabDomain = new URL(tab.url).hostname.replace(/^www\./, '').toLowerCase();
+        if (tabDomain === domain) {
+          console.log('[Learning] Found existing tab for', domain, '→ tab', tab.id);
+          return tab.id;
+        }
+      } catch {}
+    }
+
+    // Pass 2: no existing tab found — open the fallback URL
+    if (fallbackUrl) {
+      console.log('[Learning] No tab found for', domain, '— opening:', fallbackUrl);
+      const newTab = await chrome.tabs.create({ url: fallbackUrl, active: true });
+
+      // Wait for the tab to finish loading
+      await new Promise((resolve) => {
+        const checkReady = (tabId, changeInfo) => {
+          if (tabId === newTab.id && changeInfo.status === 'complete') {
+            chrome.tabs.onUpdated.removeListener(checkReady);
+            resolve();
+          }
+        };
+        chrome.tabs.onUpdated.addListener(checkReady);
+        // Safety timeout
+        setTimeout(() => {
+          chrome.tabs.onUpdated.removeListener(checkReady);
+          resolve();
+        }, 10000);
+      });
+
+      return newTab.id;
+    }
+
+    console.warn('[Learning] No tab found for domain:', domain);
+    return null;
+  } catch (err) {
+    console.error('[Learning] findTabByDomain error:', err.message);
+    return null;
+  }
+}
+
 // --- Central Message Handler ---
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  // Timeout guard: if handleMessage takes longer than 30s, send an error response
+  // Timeout guard: if handleMessage takes longer than the limit, send an error response
   // so the message channel doesn't hang open indefinitely (causing "message channel closed" warnings).
   let responded = false;
   const safeRespond = (result) => {
@@ -3447,16 +4342,20 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     try { sendResponse(result); } catch (_) { /* channel already closed */ }
   };
 
+  // Long-running handlers get extended timeouts
+  const LONG_RUNNING_TYPES = ['learning_replay_recipe', 'explore_start', 'explore_resume'];
+  const timeoutMs = LONG_RUNNING_TYPES.includes(request.type) ? 300000 : 30000; // 5 min for replays/explore, 30s for others
+
   const timeoutId = setTimeout(() => {
     if (!responded) {
-      console.warn(`[BG_TIMEOUT] Handler for '${request.type}' exceeded 30s — sending timeout response.`);
+      console.warn(`[BG_TIMEOUT] Handler for '${request.type}' exceeded ${timeoutMs / 1000}s — sending timeout response.`);
       safeRespond({
         success: false,
         errorType: 'BACKEND_TIMEOUT',
-        error: `Handler for '${request.type}' timed out after 30 seconds. The operation may still be running in the background.`,
+        error: `Handler for '${request.type}' timed out after ${timeoutMs / 1000} seconds. The operation may still be running in the background.`,
       });
     }
-  }, 30000);
+  }, timeoutMs);
 
   handleMessage(request, sender)
     .then(result => {
@@ -4004,7 +4903,8 @@ async function handleMessage(request, sender) {
   }
 
   // ── MAIN: Process a user request with 3-Tier Memory ─────
-  if (request.type === 'process_request') {
+  if (request.type === 'process_request' || request.type === 'process_request_skip_recipe') {
+    const skipRecipeCheck = request.type === 'process_request_skip_recipe';
     const { userPrompt, tabId, url, availableTabs, conversationHistory, siteHint } = request.data;
 
     // Load memory (from cache or fresh fetch)
@@ -4081,6 +4981,37 @@ async function handleMessage(request, sender) {
           if (scraped.formFields) pageContext.formFields = scraped.formFields;
         }
       } catch { /* Some pages block injection — proceed without */ }
+    }
+
+    // ── LEARNING MODE: Check for a matching recipe before AI call ──
+    // If a learned recipe exists for this site + task, offer to replay it
+    // instead of spending credits on an AI call.
+    if (!skipRecipeCheck) try {
+      const siteDomain = url ? new URL(url).hostname : '';
+      if (siteDomain && userPrompt) {
+        const recipeRes = await fetch(
+          `${API_BASE}/api/recipes/match?siteDomain=${encodeURIComponent(siteDomain)}&task=${encodeURIComponent(userPrompt)}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        const recipeMatch = await recipeRes.json();
+        if (recipeMatch?.success && recipeMatch?.found && recipeMatch?.recipe) {
+          // Return a special action type that tells the side panel to offer replay
+          return {
+            success: true,
+            data: {
+              action_type: 'RECIPE_MATCH',
+              headline: `I know how to do this! "${recipeMatch.recipe.workflowName}" (${Math.round(recipeMatch.recipe.confidence * 100)}% confidence)`,
+              primary_content: `I have a learned recipe for this with ${recipeMatch.recipe.stepCount} steps. Would you like me to replay it?`,
+              recipe: recipeMatch.recipe,
+              matchType: recipeMatch.matchType,
+              consent_level: 'confirm',
+            },
+          };
+        }
+      }
+    } catch (recipeErr) {
+      // Non-critical — fall through to normal AI flow
+      console.warn('[BG] Recipe check failed (non-fatal):', recipeErr.message);
     }
 
     // Send enriched payload to backend agent endpoint (dual-provider BYOK)
@@ -4358,6 +5289,31 @@ async function handleMessage(request, sender) {
       }
     })();
     return { success: true, async: true, message: 'Exploration started. Progress updates will arrive separately.' };
+  }
+
+  // ── PARALLEL_EXPLORE: Multi-tab orchestration ───────────────
+  // Fire-and-forget: return immediately, results come via chrome.storage.session
+  if (request.type === 'parallel_explore_start') {
+    const { parallelPlan, userPrompt } = request.data;
+    if (!parallelPlan || !parallelPlan.tabs || parallelPlan.tabs.length < 2) {
+      return { success: false, error: 'Invalid parallel plan: need at least 2 tabs.' };
+    }
+
+    // Clear stale result before starting
+    await chrome.storage.session.remove(['parallelExploreResult']).catch(() => {});
+
+    // Run in background — don't await
+    (async () => {
+      try {
+        const result = await runParallelExplore(parallelPlan, userPrompt, token);
+        chrome.storage.session.set({ parallelExploreResult: result }).catch(() => {});
+        console.log(`[ParallelExplore] Loop completed. ${result.tabCount || 0} tabs, ${result.creditsUsed?.toFixed(1) || '?'} EU. Result stored.`);
+      } catch (err) {
+        console.error('[ParallelExplore] Background loop error:', err);
+        chrome.storage.session.set({ parallelExploreResult: { success: false, error: err.message } }).catch(() => {});
+      }
+    })();
+    return { success: true, async: true, message: 'Parallel exploration started. Progress updates will arrive separately.' };
   }
 
   // ── EXPLORE RESUME: Continue a paused exploration after login ──
@@ -4704,6 +5660,584 @@ async function handleMessage(request, sender) {
     return { success: true };
   }
 
+  // ══════════════════════════════════════════════════════════════
+  // ── LEARNING MODE: Centralized Recording Session ──
+  // Background.js is the central coordinator for recording.
+  // Content scripts report steps individually; we accumulate here.
+  // This enables multi-tab recording in Phase 2.
+  // ══════════════════════════════════════════════════════════════
+
+  if (request.type === 'learning_session_start') {
+    // Initialize a new recording session (called from sidepanel)
+    const { workflowName, tabId, tabUrl } = request.data;
+    const session = {
+      active: true,
+      workflowName,
+      steps: [],
+      stepCounter: 0,
+      startUrl: tabUrl || '',
+      startDomain: tabUrl ? new URL(tabUrl).hostname.replace(/^www\./, '').toLowerCase() : '',
+      activeTabId: tabId,
+      tabDomains: {},
+      startedAt: Date.now(),
+    };
+    if (tabUrl) {
+      const domain = new URL(tabUrl).hostname.replace(/^www\./, '').toLowerCase();
+      session.tabDomains[tabId] = domain;
+    }
+    await chrome.storage.session.set({ learningSession: session });
+    console.log('[Learning] Session started:', workflowName, 'on tab', tabId);
+    return { success: true };
+  }
+
+  if (request.type === 'learning_step_recorded') {
+    // A content script reported a new step — append to centralized log
+    const { learningSession } = await chrome.storage.session.get('learningSession');
+    if (!learningSession?.active) return { success: false };
+
+    const step = request.data;
+    step.stepNumber = ++learningSession.stepCounter;
+    step.tabId = sender?.tab?.id || learningSession.activeTabId;
+
+    learningSession.steps.push(step);
+    await chrome.storage.session.set({ learningSession });
+    return { success: true };
+  }
+
+  if (request.type === 'learning_step_update') {
+    // Update an existing type step's fixedValue (debounce — same element, new value)
+    const { learningSession } = await chrome.storage.session.get('learningSession');
+    if (!learningSession?.active) return { success: false };
+
+    const { elementKey, fixedValue } = request.data;
+
+    // Search backward for matching type step
+    for (let i = learningSession.steps.length - 1; i >= 0; i--) {
+      const s = learningSession.steps[i];
+      if (s.action.type !== 'type' && s.action.type !== 'wait') break;
+      if (s.action.type === 'type' && s._elementKey === elementKey) {
+        if (s.action.inputType === 'fixed') {
+          s.action.fixedValue = fixedValue;
+        }
+        break;
+      }
+    }
+
+    await chrome.storage.session.set({ learningSession });
+    return { success: true };
+  }
+
+  if (request.type === 'learning_session_stop') {
+    // Content script clicked Done — build recipe and forward to sidepanel
+    const { learningSession } = await chrome.storage.session.get('learningSession');
+    if (!learningSession) return { success: false };
+
+    const recipe = buildRecipeFromSession(learningSession);
+    console.log('[Learning] Session stopped. Built recipe:', recipe.metadata.totalSteps, 'steps');
+
+    // Clear session
+    await chrome.storage.session.remove('learningSession');
+
+    // Forward to sidepanel for review
+    try {
+      await chrome.runtime.sendMessage({
+        type: 'learning_recipe_recorded',
+        data: recipe,
+      });
+    } catch {
+      await chrome.storage.session.set({ pendingRecipe: recipe });
+    }
+    return { success: true };
+  }
+
+  if (request.type === 'learning_session_cancel') {
+    await chrome.storage.session.remove('learningSession');
+    console.log('[Learning] Session cancelled');
+    return { success: true };
+  }
+
+  if (request.type === 'learning_session_status') {
+    // Sidepanel polls this for step count
+    const { learningSession } = await chrome.storage.session.get('learningSession');
+    if (!learningSession?.active) {
+      return { success: true, active: false, stepCount: 0 };
+    }
+    const actionSteps = learningSession.steps.filter(s => s.action.type !== 'wait');
+    const domains = [...new Set(Object.values(learningSession.tabDomains))];
+    return {
+      success: true,
+      active: true,
+      stepCount: actionSteps.length,
+      domains,
+      workflowName: learningSession.workflowName,
+    };
+  }
+
+  // ── LEARNING MODE: Save recorded recipe to backend ──
+  if (request.type === 'learning_save_recipe') {
+    const { token } = await chrome.storage.local.get(['token']);
+    if (!token) return { success: false, error: 'Not authenticated.' };
+
+    try {
+      const response = await fetch(`${API_BASE}/api/recipes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(request.data),
+      });
+      const result = await response.json();
+      return result;
+    } catch (err) {
+      console.error('[Learning] Save recipe error:', err.message);
+      return { success: false, error: 'Failed to save recipe to server.' };
+    }
+  }
+
+  // ── LEARNING MODE: Get user's recipes ──
+  if (request.type === 'learning_get_recipes') {
+    const { token } = await chrome.storage.local.get(['token']);
+    if (!token) return { success: false, error: 'Not authenticated.' };
+
+    try {
+      const response = await fetch(`${API_BASE}/api/recipes/mine`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const result = await response.json();
+      return result;
+    } catch (err) {
+      console.error('[Learning] Get recipes error:', err.message);
+      return { success: false, error: 'Failed to fetch recipes.' };
+    }
+  }
+
+  // ── LEARNING MODE: Delete recipe ──
+  if (request.type === 'learning_delete_recipe') {
+    const { token } = await chrome.storage.local.get(['token']);
+    if (!token) return { success: false, error: 'Not authenticated.' };
+
+    try {
+      const response = await fetch(`${API_BASE}/api/recipes/${request.data.recipeId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const result = await response.json();
+      return result;
+    } catch (err) {
+      console.error('[Learning] Delete recipe error:', err.message);
+      return { success: false, error: 'Failed to delete recipe.' };
+    }
+  }
+
+  // ── LEARNING MODE: Recipe completed from content script ──
+  if (request.type === 'learning_recipe_complete') {
+    // Forward recipe data to the side panel for review
+    try {
+      await chrome.runtime.sendMessage({
+        type: 'learning_recipe_recorded',
+        data: request.data,
+      });
+    } catch {
+      // Side panel may not be listening — store in session for later pickup
+      await chrome.storage.session.set({ pendingRecipe: request.data });
+    }
+    return { success: true };
+  }
+
+  // ── LEARNING MODE: Replay a recipe on active tab ──
+  if (request.type === 'learning_replay_recipe') {
+    const { recipe, variables } = request.data;
+
+    try {
+      // Check if this is a multi-tab recipe (has switch_tab steps)
+      const hasSwitchTab = recipe.steps.some(s => s.action.type === 'switch_tab');
+
+      if (!hasSwitchTab) {
+        // ── Single-tab replay ──
+        let [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tab) return { success: false, error: 'No active tab for replay.' };
+
+        // Auto-navigate to startUrl if on the same domain but different page
+        if (recipe.startUrl || recipe.urlPattern) {
+          const startUrl = recipe.startUrl || recipe.urlPattern;
+          try {
+            const currentDomain = new URL(tab.url).hostname.replace(/^www\./, '').toLowerCase();
+            const startDomain = new URL(startUrl).hostname.replace(/^www\./, '').toLowerCase();
+            const currentPath = new URL(tab.url).pathname;
+            const startPath = new URL(startUrl).pathname;
+
+            if (currentDomain === startDomain && currentPath !== startPath) {
+              console.log('[Learning] Auto-navigating to recipe start page:', startUrl);
+              await chrome.tabs.update(tab.id, { url: startUrl });
+
+              // Wait for page to load
+              await new Promise((resolve) => {
+                const onLoad = (tabId, changeInfo) => {
+                  if (tabId === tab.id && changeInfo.status === 'complete') {
+                    chrome.tabs.onUpdated.removeListener(onLoad);
+                    resolve();
+                  }
+                };
+                chrome.tabs.onUpdated.addListener(onLoad);
+                setTimeout(() => { chrome.tabs.onUpdated.removeListener(onLoad); resolve(); }, 10000);
+              });
+
+              // Extra delay for SPA rendering
+              await new Promise(r => setTimeout(r, 1000));
+
+              // Refresh tab reference
+              [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            }
+          } catch {}
+        }
+
+        // Inject and run — if a navigate step triggers mid-replay, the content
+        // script returns partial:true. We re-inject on the new page and continue
+        // with remaining steps (up to 5 continuation attempts to prevent infinite loops).
+        let completedSoFar = 0;
+        let allResults = [];
+        let remainingRecipe = { ...recipe, steps: [...recipe.steps] };
+        const totalSteps = recipe.steps.length;
+        const replayStartTime = Date.now();
+        const MAX_CONTINUATIONS = 5;
+
+        for (let attempt = 0; attempt <= MAX_CONTINUATIONS; attempt++) {
+          // Reset the injection flag so content_replay.js can re-inject on new pages
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              func: () => { window.__enhReplayInjected = false; },
+            });
+          } catch {}
+
+          // Inject content_replay.js — may fail on restricted pages (chrome://, edge://, etc.)
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              files: ['content_replay.js'],
+            });
+          } catch (injectErr) {
+            return {
+              success: false,
+              error: `Cannot inject replay engine into this page: ${injectErr.message}`,
+              completedSteps: completedSoFar,
+              totalSteps,
+            };
+          }
+          await new Promise(r => setTimeout(r, 200));
+
+          // Send replay command — .catch() prevents hang if content script is dead/unresponsive
+          const result = await chrome.tabs.sendMessage(tab.id, {
+            type: 'replay_recipe',
+            recipe: remainingRecipe,
+            variables,
+          }).catch(err => {
+            console.error('[Learning] sendMessage failed:', err.message);
+            return null;
+          });
+
+          if (!result) {
+            return { success: false, error: 'No response from replay engine — content script may have crashed or page is restricted.', completedSteps: completedSoFar, totalSteps };
+          }
+
+          allResults.push(...(result.results || []));
+          completedSoFar += result.completedSteps || 0;
+
+          // Full completion or failure — return immediately
+          if (!result.partial) {
+            return {
+              ...result,
+              completedSteps: completedSoFar,
+              totalSteps,
+              results: allResults,
+              durationMs: Date.now() - replayStartTime,
+            };
+          }
+
+          // Partial — navigate step triggered page change. Wait for new page to load,
+          // then continue with remaining steps.
+          console.log(`[Learning] Partial replay: ${completedSoFar}/${totalSteps} done. Waiting for page load to continue...`);
+
+          // Wait for the tab to finish loading
+          await new Promise((resolve) => {
+            const onLoad = (tabId, changeInfo) => {
+              if (tabId === tab.id && changeInfo.status === 'complete') {
+                chrome.tabs.onUpdated.removeListener(onLoad);
+                resolve();
+              }
+            };
+            chrome.tabs.onUpdated.addListener(onLoad);
+            setTimeout(() => { chrome.tabs.onUpdated.removeListener(onLoad); resolve(); }, 10000);
+          });
+          await new Promise(r => setTimeout(r, 1000)); // SPA render delay
+
+          // Refresh tab reference (URL may have changed)
+          [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          if (!tab) {
+            return { success: false, error: 'Tab closed during navigation.', completedSteps: completedSoFar, totalSteps };
+          }
+
+          // Slice remaining steps and rebuild recipe for continuation
+          const remaining = recipe.steps.slice(completedSoFar);
+          if (remaining.length === 0) {
+            return { success: true, partial: false, completedSteps: completedSoFar, totalSteps, results: allResults, durationMs: Date.now() - replayStartTime };
+          }
+          remainingRecipe = { ...recipe, steps: remaining.map((s, idx) => ({ ...s, stepNumber: idx + 1 })) };
+        }
+
+        // Exhausted continuation attempts
+        return {
+          success: false,
+          error: `Recipe navigated too many times (${MAX_CONTINUATIONS} continuations). ${completedSoFar}/${totalSteps} steps completed.`,
+          completedSteps: completedSoFar,
+          totalSteps,
+          results: allResults,
+          durationMs: Date.now() - replayStartTime,
+        };
+      }
+
+      // ── Multi-tab replay: orchestrate across tabs ──
+      console.log('[Learning] Multi-tab replay starting:', recipe.workflowName);
+
+      // Split steps into segments by switch_tab boundaries
+      const segments = splitIntoSegments(recipe.steps);
+      console.log('[Learning] Recipe split into', segments.length, 'segments');
+
+      const allResults = [];
+      let totalCompleted = 0;
+      // Use full step count including switch_tab — the user recorded them and they
+      // are real steps in the workflow. Filtering them caused "2/4" display mismatches.
+      const totalSteps = recipe.steps.length;
+      const startTime = Date.now();
+
+      for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+        const segment = segments[segIdx];
+
+        // If this segment starts with a tab switch, handle it
+        if (segment.switchTo) {
+          console.log('[Learning] Switching to:', segment.switchTo.domain);
+
+          const targetTabId = await findTabByDomain(
+            segment.switchTo.domain,
+            segment.switchTo.url
+          );
+
+          if (!targetTabId) {
+            return {
+              success: false,
+              failedAtStep: segment.steps[0]?.stepNumber || totalCompleted + 1,
+              failReason: `Could not find or open tab for ${segment.switchTo.domain}`,
+              results: allResults,
+              durationMs: Date.now() - startTime,
+            };
+          }
+
+          // Activate the tab and wait for it to be ready
+          await chrome.tabs.update(targetTabId, { active: true });
+          await new Promise(r => setTimeout(r, 500));
+
+          // Count the switch_tab step itself as completed (it's included in totalSteps now)
+          totalCompleted += 1;
+        }
+
+        // Get the current active tab (should be the right one after switch)
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!activeTab) {
+          return {
+            success: false,
+            failedAtStep: totalCompleted + 1,
+            failReason: 'No active tab found for segment ' + (segIdx + 1),
+            results: allResults,
+            durationMs: Date.now() - startTime,
+          };
+        }
+
+        // Inject replay engine into this tab
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: activeTab.id },
+            files: ['content_replay.js'],
+          });
+        } catch (injectErr) {
+          return {
+            success: false,
+            failedAtStep: totalCompleted + 1,
+            failReason: `Cannot inject into tab: ${injectErr.message}`,
+            results: allResults,
+            durationMs: Date.now() - startTime,
+          };
+        }
+        await new Promise(r => setTimeout(r, 200));
+
+        // Tag each step with total steps count for progress reporting
+        const stepsWithTotal = segment.steps.map(s => ({ ...s, _totalSteps: totalSteps }));
+
+        // Send this segment's steps to the content script
+        // .catch() prevents hang if content script is dead/unresponsive
+        const segResult = await chrome.tabs.sendMessage(activeTab.id, {
+          type: 'replay_steps',
+          steps: stepsWithTotal,
+          variables: variables || {},
+        }).catch(err => {
+          console.error('[Learning] sendMessage to segment failed:', err.message);
+          return null;
+        });
+
+        if (!segResult) {
+          return {
+            success: false,
+            failedAtStep: totalCompleted + 1,
+            failReason: 'No response from replay engine on segment ' + (segIdx + 1) + ' — content script may have crashed.',
+            results: allResults,
+            durationMs: Date.now() - startTime,
+          };
+        }
+
+        allResults.push(...(segResult.results || []));
+        totalCompleted += segResult.completedSteps || 0;
+
+        if (!segResult.success) {
+          return {
+            success: false,
+            failedAtStep: segResult.failedAtStep,
+            failReason: segResult.failReason,
+            results: allResults,
+            durationMs: Date.now() - startTime,
+          };
+        }
+      }
+
+      return {
+        success: true,
+        partial: false,
+        completedSteps: totalCompleted,
+        totalSteps,
+        results: allResults,
+        durationMs: Date.now() - startTime,
+      };
+    } catch (err) {
+      console.error('[Learning] Replay error:', err.message);
+      return { success: false, error: err.message };
+    }
+  }
+
+  // ── LEARNING MODE: Record replay outcome ──
+  if (request.type === 'learning_record_outcome') {
+    const { token } = await chrome.storage.local.get(['token']);
+    if (!token) return { success: false };
+
+    const { recipeId, success, durationMs } = request.data;
+    const endpoint = success ? 'validate' : 'fail';
+
+    try {
+      await fetch(`${API_BASE}/api/recipes/${recipeId}/${endpoint}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ durationMs }),
+      });
+    } catch {}
+    return { success: true };
+  }
+
+  // ── LEARNING MODE: Check for matching recipe before AI call ──
+  if (request.type === 'learning_check_recipe') {
+    const { token } = await chrome.storage.local.get(['token']);
+    if (!token) return { success: false };
+
+    const { siteDomain, task } = request.data;
+    try {
+      const response = await fetch(
+        `${API_BASE}/api/recipes/match?siteDomain=${encodeURIComponent(siteDomain)}&task=${encodeURIComponent(task)}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const result = await response.json();
+      return result;
+    } catch {
+      return { success: false };
+    }
+  }
+
+  // ── RECIPE LLM FILL: Generate text via AI during recipe replay ──
+  // The replay navigator pauses while this runs. No timeout pressure —
+  // the content script has its own 3-minute safety cap.
+  if (request.type === 'recipe_llm_fill') {
+    const { prompt, pageContext, extraContext, fieldDescription } = request.data;
+    const { token } = await chrome.storage.local.get(['token']);
+
+    if (!token) return { success: false, error: 'Not authenticated' };
+
+    try {
+      // Build a focused prompt for the LLM
+      const systemPrompt = [
+        'You are a text generation assistant embedded in a browser automation workflow.',
+        'The user is replaying a recipe and needs you to generate text to fill into a form field.',
+        'Generate ONLY the text content — no explanations, no markdown, no quotes around it.',
+        'Match the tone and style appropriate for the context.',
+        fieldDescription ? `Field: ${fieldDescription}` : '',
+        pageContext ? `Page context (for reference):\n${pageContext.slice(0, 1500)}` : '',
+        Object.keys(extraContext || {}).length > 0
+          ? `Additional context: ${JSON.stringify(extraContext)}`
+          : '',
+      ].filter(Boolean).join('\n');
+
+      const response = await fetch(`${API_BASE}/api/agent/recipe-fill`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          systemPrompt,
+          userPrompt: prompt,
+        }),
+      });
+
+      if (!response.ok) {
+        // Fallback: try the general process endpoint
+        const fallbackResponse = await fetch(`${API_BASE}/api/agent/process`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            userPrompt: `[RECIPE FILL] Generate the following text. Return ONLY the raw text, nothing else.\n\nTask: ${prompt}`,
+            availableTabs: [],
+            skipMemory: true,
+          }),
+        });
+
+        if (!fallbackResponse.ok) {
+          return { success: false, error: `Backend returned ${fallbackResponse.status}` };
+        }
+
+        const fallbackData = await fallbackResponse.json();
+        // Extract text from the agent response
+        const text = fallbackData?.data?.primary_content
+          || fallbackData?.data?.headline
+          || fallbackData?.primary_content
+          || fallbackData?.headline
+          || '';
+
+        return { success: !!text, text, source: 'agent-fallback' };
+      }
+
+      const data = await response.json();
+      return { success: true, text: data.text || data.content || '', source: 'recipe-fill' };
+    } catch (err) {
+      return { success: false, error: err.message };
+    }
+  }
+
+  // ── LEARNING MODE: Forward replay progress to side panel ──
+  if (request.type === 'replay_progress') {
+    try {
+      await chrome.runtime.sendMessage({
+        type: 'replay_progress',
+        data: request.data,
+      });
+    } catch {}
+    return { success: true };
+  }
+
   return { success: false, error: `Unknown message type: ${request.type}` };
 }
 
@@ -4873,4 +6407,115 @@ chrome.action.onClicked.addListener(async (tab) => {
   } catch (err) {
     console.warn('[Enhancivity] Side panel open failed:', err.message);
   }
+});
+
+// ══════════════════════════════════════════════════════════════
+// ── LEARNING MODE: Multi-Tab Recording (Phase 2) ─────────────
+// Detects tab switches during recording, pauses the old tab's
+// recorder, injects into the new tab, and inserts switch_tab steps.
+// ══════════════════════════════════════════════════════════════
+
+chrome.tabs.onActivated.addListener(async (activeInfo) => {
+  try {
+    const { learningSession } = await chrome.storage.session.get('learningSession');
+    if (!learningSession?.active) return;
+
+    const newTabId = activeInfo.tabId;
+    const oldTabId = learningSession.activeTabId;
+
+    // Same tab — ignore
+    if (newTabId === oldTabId) return;
+
+    // Get new tab's info
+    let newTab;
+    try {
+      newTab = await chrome.tabs.get(newTabId);
+    } catch {
+      return; // Tab doesn't exist or was closed
+    }
+
+    // Skip non-injectable pages
+    const newUrl = newTab.url || '';
+    if (!newUrl || newUrl.startsWith('chrome://') || newUrl.startsWith('chrome-extension://') || newUrl.startsWith('about:')) {
+      console.log('[Learning] Tab switch to non-injectable page, ignoring:', newUrl);
+      return;
+    }
+
+    console.log('[Learning] Tab switch detected:', oldTabId, '→', newTabId, '(', newUrl, ')');
+
+    // Step 1: Pause recording on the old tab
+    try {
+      await chrome.tabs.sendMessage(oldTabId, { type: 'learning_pause' });
+    } catch {
+      // Old tab may have been closed or navigated away
+    }
+
+    // Step 2: Insert a switch_tab step into the centralized log
+    const newDomain = new URL(newUrl).hostname.replace(/^www\./, '').toLowerCase();
+    learningSession.steps.push({
+      stepNumber: ++learningSession.stepCounter,
+      action: {
+        type: 'switch_tab',
+        targetUrl: newUrl,
+        targetDomain: newDomain,
+        matchStrategy: 'domain', // Phase 2: match by domain during replay
+        description: `Switch to ${newDomain}`,
+      },
+      url: newUrl,
+      timestamp: Date.now(),
+      tabId: newTabId,
+    });
+
+    // Step 3: Update session state
+    learningSession.activeTabId = newTabId;
+    learningSession.tabDomains[newTabId] = newDomain;
+    await chrome.storage.session.set({ learningSession });
+
+    // Step 4: Inject content_learning.js into the new tab and start recording
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: newTabId },
+        files: ['content_learning.js'],
+      });
+      await new Promise(r => setTimeout(r, 200));
+
+      // Check if the content script is already recording (re-injection case)
+      let statusRes;
+      try {
+        statusRes = await chrome.tabs.sendMessage(newTabId, { type: 'learning_status' });
+      } catch {
+        statusRes = null;
+      }
+
+      if (statusRes?.isRecording) {
+        // Already recording — just resume
+        console.log('[Learning] Content script already active on tab', newTabId);
+      } else {
+        // Start or resume recording on the new tab
+        await chrome.tabs.sendMessage(newTabId, { type: 'learning_resume' });
+        console.log('[Learning] Recorder injected and resumed on tab', newTabId);
+      }
+    } catch (err) {
+      console.warn('[Learning] Failed to inject into new tab:', err.message);
+    }
+  } catch (err) {
+    console.error('[Learning] Tab switch handler error:', err.message);
+  }
+});
+
+// Detect tab closure during recording — note it but don't crash
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  try {
+    const { learningSession } = await chrome.storage.session.get('learningSession');
+    if (!learningSession?.active) return;
+
+    // If the closed tab was the active recording tab, pause recording
+    if (tabId === learningSession.activeTabId) {
+      console.log('[Learning] Active recording tab was closed:', tabId);
+      // Don't end the session — user might switch back to another tab
+      // Just note the tab is gone
+      delete learningSession.tabDomains[tabId];
+      await chrome.storage.session.set({ learningSession });
+    }
+  } catch {}
 });
