@@ -69,6 +69,24 @@
     return trimmed.length > 0 ? trimmed : null;
   }
 
+  function sanitizeLabelText(text) {
+    if (!text) return '';
+    let cleaned = String(text)
+      .replace(/\s+/g, ' ')
+      .replace(/[↕↔↑↓←→]/g, ' ')
+      .trim();
+
+    cleaned = cleaned.replace(/\s+(Ctrl|Cmd|Shift|Alt|Option|Meta)\b.*$/i, '').trim();
+    cleaned = cleaned.replace(/\s+[⌘⌥⇧^].*$/, '').trim();
+
+    const lines = cleaned.split('\n').map(s => s.trim()).filter(Boolean);
+    if (lines.length > 0) {
+      cleaned = lines.sort((a, b) => a.length - b.length)[0];
+    }
+
+    return cleaned.slice(0, 60).trim();
+  }
+
   function buildCssSelector(el) {
     const parts = [];
     let current = el;
@@ -155,8 +173,8 @@
       selectors.push({ strategy: 'placeholder', value: placeholder, priority: priority++ });
     }
 
-    const directText = getDirectText(el);
-    const visibleText = directText || (el.innerText || el.textContent || '').trim();
+    const directText = sanitizeLabelText(getDirectText(el));
+    const visibleText = directText || sanitizeLabelText(el.innerText || el.textContent || '');
     if (visibleText && visibleText.length < 60 && visibleText.length > 0) {
       selectors.push({ strategy: 'text-content', value: visibleText, priority: priority++ });
     }
@@ -176,7 +194,7 @@
       while (ancestor && depth < 5 && ancestor.tagName !== 'BODY') {
         const ancLabel = ancestor.getAttribute('aria-label') || ancestor.getAttribute('data-testid');
         if (ancLabel) {
-          const elText = (el.innerText || el.textContent || '').trim().slice(0, 50);
+          const elText = sanitizeLabelText(el.innerText || el.textContent || '').slice(0, 50);
           if (elText) {
             selectors.push({
               strategy: 'text-content',
@@ -212,16 +230,16 @@
     const type = el.getAttribute('type');
     const role = el.getAttribute('role');
 
-    if (ariaLabel) return ariaLabel;
-    if (placeholder) return placeholder;
-    if (title) return title;
+    if (ariaLabel) return sanitizeLabelText(ariaLabel);
+    if (placeholder) return sanitizeLabelText(placeholder);
+    if (title) return sanitizeLabelText(title);
 
     // Use direct text first (avoids pulling in all nested children text)
-    const directText = getDirectText(el);
+    const directText = sanitizeLabelText(getDirectText(el));
     if (directText && directText.length > 0 && directText.length < 40) return directText;
 
     // Fall back to full textContent but only if short and meaningful
-    const text = el.textContent?.trim().slice(0, 40);
+    const text = sanitizeLabelText(el.textContent || '').slice(0, 40);
     if (text && text.length > 1 && text.length < 40) return text;
 
     // Include role for context (e.g., "button" instead of just "div")
@@ -235,6 +253,56 @@
     if (firstClass) return `${tag}.${firstClass}`;
 
     return tag;
+  }
+
+  function buildSemanticContext(el) {
+    const parent = el.parentElement;
+    const role = el.getAttribute('role') || '';
+    const type = el.getAttribute('type') || '';
+    const aria = el.getAttribute('aria-label') || '';
+    const title = el.getAttribute('title') || '';
+    const placeholder = el.getAttribute('placeholder') || el.getAttribute('aria-placeholder') || '';
+    const contextBits = [];
+
+    if (parent) {
+      const parentText = getDirectText(parent) || (parent.innerText || parent.textContent || '').trim();
+      if (parentText && parentText.length < 140) contextBits.push(parentText);
+    }
+
+    const prev = el.previousElementSibling;
+    if (prev) {
+      const prevText = (prev.innerText || prev.textContent || '').trim();
+      if (prevText && prevText.length < 100) contextBits.push(prevText);
+    }
+
+    const next = el.nextElementSibling;
+    if (next) {
+      const nextText = (next.innerText || next.textContent || '').trim();
+      if (nextText && nextText.length < 100) contextBits.push(nextText);
+    }
+
+    const rect = el.getBoundingClientRect();
+    const position =
+      rect.top < window.innerHeight * 0.25 ? 'top' :
+      rect.top < window.innerHeight * 0.7 ? 'middle' : 'bottom';
+
+    return {
+      label: describeElement(el),
+      tag: el.tagName.toLowerCase(),
+      role: role || undefined,
+      type: type || undefined,
+      ariaLabel: aria || undefined,
+      title: title || undefined,
+      placeholder: placeholder || undefined,
+      context: contextBits.join(' | ').slice(0, 240) || undefined,
+      position,
+      viewport: {
+        x: Math.round(rect.left),
+        y: Math.round(rect.top),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      },
+    };
   }
 
   function generateDescription(action, el) {
@@ -364,6 +432,7 @@
         type: 'click',
         selectors,
         description: generateDescription('click', el),
+        semanticContext: buildSemanticContext(el),
       },
       url: window.location.href,
       timestamp: now,
@@ -414,6 +483,7 @@
         selectors,
         inputType: nextInputIsVariable ? 'variable' : 'fixed',
         description: generateDescription('type', el),
+        semanticContext: buildSemanticContext(el),
       },
       url: window.location.href,
       timestamp: now,
@@ -776,12 +846,17 @@
     }
 
     if (request.type === 'learning_resume') {
+      // Accept stepCount from background.js to show accurate count after navigation
+      if (typeof request.stepCount === 'number' && request.stepCount > localStepCount) {
+        localStepCount = request.stepCount;
+      }
       if (!isRecording) {
         resumeRecording();
         if (!overlayBar) {
           createOverlay();
           attachListeners();
         }
+        updateOverlay();
       }
       sendResponse({ success: true });
       return;

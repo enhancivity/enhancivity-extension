@@ -41,18 +41,28 @@
     // 'dialog' is NOT skipped — modals often contain form fields (login, settings, etc).
   ]);
 
-  const SKIP_CLASS_PATTERN = /nav|footer|sidebar|cookie|banner|popup|modal|overlay|advert|promo|newsletter|subscribe|menu|breadcrumb/i;
+  const SKIP_CLASS_PATTERN = /cookie|banner|advert|promo|newsletter|subscribe|breadcrumb/i;
+
+  function hasRelevantInteractiveDescendant(el) {
+    try {
+      return !!el.querySelector(
+        'button, input, textarea, select, a[href], [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="option"], [role="textbox"], [contenteditable="true"]'
+      );
+    } catch {
+      return false;
+    }
+  }
 
   function shouldSkip(el) {
     if (SKIP_TAGS.has(el.tagName)) return true;
     const role = el.getAttribute('role');
-    if (role && SKIP_ROLES.has(role)) return true;
+    if (role && SKIP_ROLES.has(role) && !hasRelevantInteractiveDescendant(el)) return true;
     const tag = el.tagName;
-    if (tag === 'NAV' || tag === 'FOOTER' || tag === 'HEADER') return true;
+    if ((tag === 'NAV' || tag === 'FOOTER' || tag === 'HEADER') && !hasRelevantInteractiveDescendant(el)) return true;
     const cls = el.className;
-    if (typeof cls === 'string' && SKIP_CLASS_PATTERN.test(cls)) return true;
+    if (typeof cls === 'string' && SKIP_CLASS_PATTERN.test(cls) && !hasRelevantInteractiveDescendant(el)) return true;
     const id = el.id;
-    if (id && SKIP_CLASS_PATTERN.test(id)) return true;
+    if (id && SKIP_CLASS_PATTERN.test(id) && !hasRelevantInteractiveDescendant(el)) return true;
     // Hidden elements (except BODY/HTML, and except elements inside shadow DOM where
     // offsetParent is unreliable). Also exempt contenteditable and role=textbox — these
     // are often reported as offsetParent=null due to CSS position or shadow DOM host.
@@ -79,6 +89,7 @@
     if (tag === 'BUTTON') return 'button';
     if (tag === 'INPUT' && (el.type === 'submit' || el.type === 'button')) return 'button';
     if (el.getAttribute('role') === 'button') return 'button';
+    if (['link', 'tab', 'menuitem', 'option', 'switch', 'radio', 'treeitem'].includes(el.getAttribute('role'))) return 'button';
 
     // Inputs
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
@@ -261,8 +272,20 @@
     const counters = { button: 0, input: 0, link: 0, price: 0, text: 0 };
     const seenTexts = new Set();
 
-    function walk(node) {
+    function walk(node, doc) {
       if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+      if (node.tagName === 'IFRAME') {
+        try {
+          const iframeDoc = node.contentDocument || node.contentWindow?.document;
+          if (iframeDoc?.body) {
+            walk(iframeDoc.body, iframeDoc);
+          }
+        } catch {
+          // Cross-origin iframe: intentionally skipped
+        }
+      }
+
       if (shouldSkip(node)) return;
 
       const type = classifyElement(node);
@@ -291,6 +314,7 @@
             context: getContext(node),
             rect,
             visible: isAboveFold(rect),
+            frameUrl: doc?.location?.href || location.href,
           });
 
           // Stamp the DOM element for later resolution by Ghost-Driver
@@ -304,7 +328,7 @@
 
       // Walk children
       for (const child of node.children) {
-        walk(child);
+        walk(child, doc);
       }
 
       // Pierce shadow DOM — web components (Reddit's <shreddit-*>, Salesforce Lightning,
@@ -312,12 +336,12 @@
       // contenteditable editors and inputs inside shadow DOM are invisible to the scraper.
       if (node.shadowRoot) {
         for (const shadowChild of node.shadowRoot.children) {
-          walk(shadowChild);
+          walk(shadowChild, doc);
         }
       }
     }
 
-    walk(document.body);
+    walk(document.body, document);
 
     // Budget enforcement: if over MAX_ELEMENTS, drop below-fold elements first
     if (elements.length > MAX_ELEMENTS) {

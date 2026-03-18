@@ -636,6 +636,11 @@ const SEMANTIC_SCRAPER = 'content_search_semantic.js';
 // Progress HUD content script
 const HUD_SCRIPT = 'content_hud.js';
 
+// ─── Learning Mode: Navigation Resilience ──────────────────
+// Cleanup function for recording nav listeners + keepAlive.
+// Set when recording starts, called on stop/cancel.
+let learningNavCleanup = null;
+
 // ─── Tab Readiness Helper ──────────────────────────────────
 // Chrome locks tab APIs during tab drag, tab switch animation, and other
 // transient states. This helper polls until the tab is accessible.
@@ -4169,6 +4174,168 @@ async function stageAction(tabId, userGoal, category, token) {
 // Called when recording stops. Transforms the raw step log into
 // a clean recipe ready for review and saving.
 
+function normalizeRecipeText(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+function looksEmailLike(text) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(text || '').trim());
+}
+
+function shouldAutoLlmFill(step) {
+  const action = step?.action || {};
+  if (action.type !== 'type' || action.inputType !== 'fixed') return false;
+
+  const value = normalizeRecipeText(action.fixedValue);
+  if (!value || looksEmailLike(value)) return false;
+
+  const hint = normalizeRecipeText([
+    action.description,
+    action.semanticContext?.label,
+    action.semanticContext?.ariaLabel,
+    action.semanticContext?.placeholder,
+    action.semanticContext?.context,
+    action.semanticContext?.role,
+    action.semanticContext?.tag,
+    action.semanticContext?.type,
+  ].filter(Boolean).join(' ')).toLowerCase();
+
+  const longText = value.length >= 24 || /\s/.test(value);
+  const generativeField = /(message body|body|reply|comment|description|details|summary|post|caption|prompt|content|notes?|headline|subject|title|chat|email)/i.test(hint);
+  const textSurface = ['textarea'].includes(action.semanticContext?.tag) ||
+    action.semanticContext?.role === 'textbox' ||
+    /contenteditable/i.test(JSON.stringify(action.semanticContext || {}));
+
+  return generativeField || (textSurface && longText);
+}
+
+function buildLlmPromptForStep(step) {
+  const action = step.action || {};
+  const sample = normalizeRecipeText(action.fixedValue).slice(0, 240);
+  const label = normalizeRecipeText(
+    action.semanticContext?.label ||
+    action.semanticContext?.ariaLabel ||
+    action.semanticContext?.placeholder ||
+    action.description ||
+    'this field'
+  );
+  const lower = label.toLowerCase();
+
+  if (/(subject|headline|title)/i.test(lower)) {
+    return `Write a concise ${label}. Follow the current task context first. Keep it short and natural. Ignore the original example if it conflicts with the current task. Original example style only: "${sample}"`;
+  }
+
+  if (/(message body|body|reply|comment|description|summary|post|caption|content|notes?|prompt|email)/i.test(lower)) {
+    return `Write the ${label}. Follow the current task context first and use visible page context only as secondary reference. Ignore the original example if it conflicts with the current task. Original example style only: "${sample}"`;
+  }
+
+  return `Generate text for ${label}. Follow the current task context first. Use the original example only as a loose style hint, never as the source of facts or topic: "${sample}"`;
+}
+
+function upgradeRecipeStepForReplay(step, stepNumber) {
+  const upgraded = {
+    ...step,
+    action: step?.action ? { ...step.action } : step.action,
+    stepNumber: stepNumber || step.stepNumber,
+  };
+
+  if (upgraded.action?.type === 'type' && upgraded.action?.inputType === 'fixed') {
+    const normalizedValue = normalizeRecipeText(upgraded.action.fixedValue);
+    if (!normalizedValue) return null;
+    upgraded.action.fixedValue = normalizedValue;
+
+    if (shouldAutoLlmFill(upgraded)) {
+      const llmPrompt = buildLlmPromptForStep(upgraded);
+      upgraded.action = {
+        ...upgraded.action,
+        type: 'llm_fill',
+        llmPrompt,
+        variableDescription: llmPrompt,
+        contextVariables: ['__task_context', '__workflow_name'],
+      };
+      delete upgraded.action.fixedValue;
+      delete upgraded.action.inputType;
+      delete upgraded.action.variableName;
+    }
+  }
+
+  if (upgraded.action?.type === 'llm_fill') {
+    const existing = Array.isArray(upgraded.action.contextVariables) ? upgraded.action.contextVariables : [];
+    upgraded.action.contextVariables = [...new Set([...existing, '__task_context', '__workflow_name'])];
+  }
+
+  return upgraded;
+}
+
+function upgradeRecipeForReplay(recipe) {
+  if (!recipe || !Array.isArray(recipe.steps)) return recipe;
+
+  const upgradedSteps = recipe.steps
+    .map((step, index) => upgradeRecipeStepForReplay(step, index + 1))
+    .filter(Boolean)
+    .map((step, index) => ({ ...step, stepNumber: index + 1 }));
+
+  return {
+    ...recipe,
+    steps: upgradedSteps,
+    stepCount: upgradedSteps.length,
+  };
+}
+
+function hasOpaqueUrlParts(urlString) {
+  try {
+    const url = new URL(urlString);
+    const combined = `${url.pathname} ${url.search} ${url.hash}`;
+    return /[A-Za-z0-9_-]{20,}/.test(combined);
+  } catch {
+    return false;
+  }
+}
+
+function getNormalizedPathSignature(urlString) {
+  try {
+    const url = new URL(urlString);
+    const params = Array.from(url.searchParams.keys()).sort().join('&');
+    return `${url.pathname}${params ? '?' + params : ''}${url.hash || ''}`;
+  } catch {
+    return urlString || '';
+  }
+}
+
+function shouldKeepSameDomainNavigate(step, session, previousKeptStep) {
+  if (step?.action?.type !== 'navigate' || !step.action.url || !session?.startDomain) {
+    return true;
+  }
+
+  try {
+    const navUrl = new URL(step.action.url);
+    const navDomain = navUrl.hostname.replace(/^www\./, '').toLowerCase();
+    const startDomain = session.startDomain.replace(/^www\./, '').toLowerCase();
+    if (navDomain !== startDomain) return true;
+
+    const currentSignature = getNormalizedPathSignature(step.action.url);
+    const startSignature = getNormalizedPathSignature(session.startUrl || '');
+    const previousSignature = previousKeptStep?.action?.url
+      ? getNormalizedPathSignature(previousKeptStep.action.url)
+      : null;
+
+    const meaningfulPathChange = currentSignature && currentSignature !== startSignature;
+    const changedSincePrevious = currentSignature && currentSignature !== previousSignature;
+    const volatileUrl = hasOpaqueUrlParts(step.action.url);
+    const samePageNoise = !meaningfulPathChange || !changedSincePrevious;
+
+    // Keep stable intra-app routes (e.g. /settings/usage), but drop
+    // volatile draft/token URLs and duplicate same-page SPA churn.
+    if (volatileUrl && samePageNoise) return false;
+    if (volatileUrl && step.action.autoDetected && previousKeptStep?.action?.type === 'click') return false;
+    if (!meaningfulPathChange && step.action.autoDetected) return false;
+
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 function buildRecipeFromSession(session) {
   const steps = session.steps;
 
@@ -4200,23 +4367,37 @@ function buildRecipeFromSession(session) {
       continue;
     }
 
-    // Skip same-domain navigate steps — these are SPA URL changes (Gmail compose,
-    // React Router, etc.) that don't actually reload the page. The click that triggered
-    // the SPA navigation is already recorded; replaying a navigate step would cause
-    // the content script to return partial:true and abort remaining steps.
+    const previousKeptStep = cleanedSteps[cleanedSteps.length - 1];
+
     if (step.action.type === 'navigate' && step.action.url && session.startDomain) {
-      try {
-        const navDomain = new URL(step.action.url).hostname.replace(/^www\./, '').toLowerCase();
-        const startDomain = session.startDomain.replace(/^www\./, '').toLowerCase();
-        if (navDomain === startDomain) {
-          console.log('[Learning] Skipping same-domain SPA navigate step:', step.action.url);
-          continue;
-        }
-      } catch {}
+      if (!shouldKeepSameDomainNavigate(step, session, previousKeptStep)) {
+        console.log('[Learning] Skipping volatile same-domain SPA navigate step:', step.action.url);
+        continue;
+      }
+
+      if (previousKeptStep?.action?.type === 'navigate' && previousKeptStep.action.url === step.action.url) {
+        console.log('[Learning] Skipping duplicate navigate step:', step.action.url);
+        continue;
+      }
     }
 
     // Strip internal tracking fields
     const { _elementKey, tabId, ...cleanStep } = step;
+
+    if (cleanStep.action?.type === 'type' && cleanStep.action?.inputType === 'fixed') {
+      const normalizedValue = normalizeRecipeText(cleanStep.action.fixedValue);
+      if (!normalizedValue) {
+        continue;
+      }
+      cleanStep.action.fixedValue = normalizedValue;
+
+      if (shouldAutoLlmFill(cleanStep)) {
+        const upgradedStep = upgradeRecipeStepForReplay(cleanStep, cleanedSteps.length + 1);
+        if (!upgradedStep) continue;
+        cleanStep.action = upgradedStep.action;
+      }
+    }
+
     cleanedSteps.push({
       ...cleanStep,
       stepNumber: cleanedSteps.length + 1,
@@ -4268,7 +4449,12 @@ function splitIntoSegments(steps) {
         steps: [],
       };
     } else {
-      currentSegment.steps.push(step);
+      const previousStep = currentSegment.steps[currentSegment.steps.length - 1];
+      if (previousStep?.action?.type === 'navigate' && step.action.type === 'navigate') {
+        currentSegment.steps[currentSegment.steps.length - 1] = step;
+      } else {
+        currentSegment.steps.push(step);
+      }
     }
   }
 
@@ -5343,7 +5529,12 @@ async function handleMessage(request, sender) {
 
   // ── SEMANTIC SCRAPE: On-demand semantic analysis of any tab ──
   if (request.type === 'semantic_scrape') {
-    const { tabId, userGoal, category, mode } = request.data;
+    const { userGoal, category, mode } = request.data || {};
+    const tabId = request.data?.tabId || sender?.tab?.id;
+
+    if (!tabId) {
+      return { success: false, error: 'Could not determine which tab to semantically analyze.' };
+    }
 
     try {
       const injected = await chrome.scripting.executeScript({
@@ -5687,6 +5878,141 @@ async function handleMessage(request, sender) {
     }
     await chrome.storage.session.set({ learningSession: session });
     console.log('[Learning] Session started:', workflowName, 'on tab', tabId);
+
+    // ── Navigation Resilience: re-inject content_learning.js on page loads ──
+    // Mirrors the EXPLORE pattern (webNavigation listeners + keepAlive).
+    // Without this, full page navigations destroy the content script and
+    // recording silently dies.
+
+    // Clean up any stale listeners from a previous session
+    if (learningNavCleanup) {
+      learningNavCleanup();
+      learningNavCleanup = null;
+    }
+
+    const recordingNavListener = async (details) => {
+      if (details.frameId !== 0) return; // ignore iframes
+      const { learningSession: ls } = await chrome.storage.session.get('learningSession');
+      if (!ls?.active) return;
+      if (ls.activeTabId !== details.tabId) return; // wrong tab
+
+      // Deduplicate: skip if last step is a navigate to the same URL within 2s
+      const lastStep = ls.steps[ls.steps.length - 1];
+      if (lastStep?.action?.type === 'navigate' &&
+          lastStep.action.url === details.url &&
+          Date.now() - lastStep.timestamp < 2000) {
+        console.log('[Learning] Nav dedup — skipping duplicate navigate to', details.url);
+        return;
+      }
+
+      console.log('[Learning] webNavigation.onCompleted — re-injecting recorder on', details.url);
+
+      // Auto-insert navigate step into centralized session
+      ls.steps.push({
+        stepNumber: ++ls.stepCounter,
+        action: {
+          type: 'navigate',
+          url: details.url,
+          waitFor: 'load',
+          description: `Navigate to ${new URL(details.url).pathname}`,
+          autoDetected: true,
+        },
+        url: details.url,
+        timestamp: Date.now(),
+        tabId: details.tabId,
+      });
+      await chrome.storage.session.set({ learningSession: ls });
+
+      // Re-inject content_learning.js on the new page
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: details.tabId },
+          func: () => { window.__enhLearningInjected = false; },
+        });
+        await chrome.scripting.executeScript({
+          target: { tabId: details.tabId },
+          files: ['content_learning.js'],
+        });
+        await new Promise(r => setTimeout(r, 300));
+        await chrome.tabs.sendMessage(details.tabId, {
+          type: 'learning_resume',
+          stepCount: ls.stepCounter,
+        });
+        console.log('[Learning] Recorder re-injected and resumed on', details.url);
+      } catch (err) {
+        console.warn('[Learning] Re-injection failed (restricted page?):', err.message);
+      }
+    };
+
+    const recordingSpaNavListener = async (details) => {
+      if (details.frameId !== 0) return;
+      const { learningSession: ls } = await chrome.storage.session.get('learningSession');
+      if (!ls?.active) return;
+      if (ls.activeTabId !== details.tabId) return;
+
+      // Deduplicate: skip if last step is a navigate to the same URL within 2s
+      const lastStep = ls.steps[ls.steps.length - 1];
+      if (lastStep?.action?.type === 'navigate' &&
+          lastStep.action.url === details.url &&
+          Date.now() - lastStep.timestamp < 2000) {
+        return;
+      }
+
+      console.log('[Learning] SPA navigation (onHistoryStateUpdated) — re-injecting recorder on', details.url);
+
+      // Auto-insert navigate step
+      ls.steps.push({
+        stepNumber: ++ls.stepCounter,
+        action: {
+          type: 'navigate',
+          url: details.url,
+          waitFor: 'load',
+          description: `Navigate to ${new URL(details.url).pathname}`,
+          autoDetected: true,
+        },
+        url: details.url,
+        timestamp: Date.now(),
+        tabId: details.tabId,
+      });
+      await chrome.storage.session.set({ learningSession: ls });
+
+      // SPA navigations don't destroy the content script, but re-inject anyway
+      // to ensure the URL observer picks up the new URL correctly
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: details.tabId },
+          func: () => { window.__enhLearningInjected = false; },
+        });
+        await chrome.scripting.executeScript({
+          target: { tabId: details.tabId },
+          files: ['content_learning.js'],
+        });
+        await new Promise(r => setTimeout(r, 300));
+        await chrome.tabs.sendMessage(details.tabId, {
+          type: 'learning_resume',
+          stepCount: ls.stepCounter,
+        });
+      } catch (err) {
+        console.warn('[Learning] SPA re-injection failed:', err.message);
+      }
+    };
+
+    chrome.webNavigation.onCompleted.addListener(recordingNavListener);
+    chrome.webNavigation.onHistoryStateUpdated.addListener(recordingSpaNavListener);
+
+    // Service worker keepalive during recording
+    const recordingKeepAlive = setInterval(() => {
+      chrome.runtime.getPlatformInfo(() => {});
+    }, 20000);
+
+    // Store cleanup function
+    learningNavCleanup = () => {
+      chrome.webNavigation.onCompleted.removeListener(recordingNavListener);
+      chrome.webNavigation.onHistoryStateUpdated.removeListener(recordingSpaNavListener);
+      clearInterval(recordingKeepAlive);
+      console.log('[Learning] Navigation listeners + keepAlive cleaned up');
+    };
+
     return { success: true };
   }
 
@@ -5732,6 +6058,9 @@ async function handleMessage(request, sender) {
     const { learningSession } = await chrome.storage.session.get('learningSession');
     if (!learningSession) return { success: false };
 
+    // Clean up navigation listeners + keepAlive
+    if (learningNavCleanup) { learningNavCleanup(); learningNavCleanup = null; }
+
     const recipe = buildRecipeFromSession(learningSession);
     console.log('[Learning] Session stopped. Built recipe:', recipe.metadata.totalSteps, 'steps');
 
@@ -5751,6 +6080,9 @@ async function handleMessage(request, sender) {
   }
 
   if (request.type === 'learning_session_cancel') {
+    // Clean up navigation listeners + keepAlive
+    if (learningNavCleanup) { learningNavCleanup(); learningNavCleanup = null; }
+
     await chrome.storage.session.remove('learningSession');
     console.log('[Learning] Session cancelled');
     return { success: true };
@@ -5844,11 +6176,17 @@ async function handleMessage(request, sender) {
 
   // ── LEARNING MODE: Replay a recipe on active tab ──
   if (request.type === 'learning_replay_recipe') {
-    const { recipe, variables } = request.data;
+    const { recipe, variables, taskContext } = request.data;
+    const runtimeRecipe = upgradeRecipeForReplay(recipe);
+    const runtimeVariables = {
+      ...(variables || {}),
+      __task_context: taskContext || runtimeRecipe?.workflowName || '',
+      __workflow_name: runtimeRecipe?.workflowName || '',
+    };
 
     try {
       // Check if this is a multi-tab recipe (has switch_tab steps)
-      const hasSwitchTab = recipe.steps.some(s => s.action.type === 'switch_tab');
+      const hasSwitchTab = runtimeRecipe.steps.some(s => s.action.type === 'switch_tab');
 
       if (!hasSwitchTab) {
         // ── Single-tab replay ──
@@ -5856,8 +6194,8 @@ async function handleMessage(request, sender) {
         if (!tab) return { success: false, error: 'No active tab for replay.' };
 
         // Auto-navigate to startUrl if on the same domain but different page
-        if (recipe.startUrl || recipe.urlPattern) {
-          const startUrl = recipe.startUrl || recipe.urlPattern;
+        if (runtimeRecipe.startUrl || runtimeRecipe.urlPattern) {
+          const startUrl = runtimeRecipe.startUrl || runtimeRecipe.urlPattern;
           try {
             const currentDomain = new URL(tab.url).hostname.replace(/^www\./, '').toLowerCase();
             const startDomain = new URL(startUrl).hostname.replace(/^www\./, '').toLowerCase();
@@ -5892,14 +6230,50 @@ async function handleMessage(request, sender) {
         // Inject and run — if a navigate step triggers mid-replay, the content
         // script returns partial:true. We re-inject on the new page and continue
         // with remaining steps (up to 5 continuation attempts to prevent infinite loops).
+        //
+        // NAVIGATION RESILIENCE: Also detect click-triggered navigations via
+        // webNavigation.onCompleted — if the content script dies before returning
+        // partial:true (race condition), we catch it here and continue.
         let completedSoFar = 0;
         let allResults = [];
-        let remainingRecipe = { ...recipe, steps: [...recipe.steps] };
-        const totalSteps = recipe.steps.length;
+        let remainingRecipe = { ...runtimeRecipe, steps: [...runtimeRecipe.steps] };
+        const totalSteps = runtimeRecipe.steps.length;
         const replayStartTime = Date.now();
         const MAX_CONTINUATIONS = 5;
 
+        // Navigation detection via webNavigation (catches click-triggered page loads)
+        let replayNavDetected = false;
+        const replayNavListener = (details) => {
+          if (details.tabId !== tab.id || details.frameId !== 0) return;
+          replayNavDetected = true;
+          console.log('[Learning] Replay: navigation detected via webNavigation:', details.url);
+        };
+        chrome.webNavigation.onCompleted.addListener(replayNavListener);
+
+        // Track step progress via replay_progress messages
+        let lastReplayProgressStep = 0;
+        const replayProgressTracker = (request) => {
+          if (request.type === 'replay_progress' && request.data?.stepNumber) {
+            lastReplayProgressStep = Math.max(lastReplayProgressStep, request.data.stepNumber);
+          }
+        };
+        chrome.runtime.onMessage.addListener(replayProgressTracker);
+
+        // KeepAlive to prevent service worker death during long replays
+        const replayKeepAlive = setInterval(() => {
+          chrome.runtime.getPlatformInfo(() => {});
+        }, 20000);
+
+        const cleanupReplay = () => {
+          chrome.webNavigation.onCompleted.removeListener(replayNavListener);
+          chrome.runtime.onMessage.removeListener(replayProgressTracker);
+          clearInterval(replayKeepAlive);
+        };
+
+        try {
         for (let attempt = 0; attempt <= MAX_CONTINUATIONS; attempt++) {
+          replayNavDetected = false;
+
           // Reset the injection flag so content_replay.js can re-inject on new pages
           try {
             await chrome.scripting.executeScript({
@@ -5915,6 +6289,7 @@ async function handleMessage(request, sender) {
               files: ['content_replay.js'],
             });
           } catch (injectErr) {
+            cleanupReplay();
             return {
               success: false,
               error: `Cannot inject replay engine into this page: ${injectErr.message}`,
@@ -5928,13 +6303,40 @@ async function handleMessage(request, sender) {
           const result = await chrome.tabs.sendMessage(tab.id, {
             type: 'replay_recipe',
             recipe: remainingRecipe,
-            variables,
+            variables: runtimeVariables,
           }).catch(err => {
             console.error('[Learning] sendMessage failed:', err.message);
             return null;
           });
 
           if (!result) {
+            // Content script died — check if a click-triggered navigation caused it
+            if (replayNavDetected) {
+              // Navigation killed the content script before it could return partial:true.
+              // Use lastReplayProgressStep as best estimate of completed steps.
+              completedSoFar = Math.max(completedSoFar, lastReplayProgressStep);
+              console.log(`[Learning] Click-triggered navigation detected. ~${completedSoFar}/${totalSteps} steps done. Continuing...`);
+
+              // Wait for the new page to settle
+              await new Promise(r => setTimeout(r, 1500));
+
+              // Refresh tab reference
+              [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+              if (!tab) {
+                cleanupReplay();
+                return { success: false, error: 'Tab closed during navigation.', completedSteps: completedSoFar, totalSteps };
+              }
+
+              // Build remaining steps and continue
+              const remaining = runtimeRecipe.steps.slice(completedSoFar);
+              if (remaining.length === 0) {
+                cleanupReplay();
+                return { success: true, partial: false, completedSteps: completedSoFar, totalSteps, results: allResults, durationMs: Date.now() - replayStartTime };
+              }
+              remainingRecipe = { ...runtimeRecipe, steps: remaining.map((s, idx) => ({ ...s, stepNumber: idx + 1 })) };
+              continue;
+            }
+            cleanupReplay();
             return { success: false, error: 'No response from replay engine — content script may have crashed or page is restricted.', completedSteps: completedSoFar, totalSteps };
           }
 
@@ -5943,6 +6345,7 @@ async function handleMessage(request, sender) {
 
           // Full completion or failure — return immediately
           if (!result.partial) {
+            cleanupReplay();
             return {
               ...result,
               completedSteps: completedSoFar,
@@ -5972,18 +6375,21 @@ async function handleMessage(request, sender) {
           // Refresh tab reference (URL may have changed)
           [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
           if (!tab) {
+            cleanupReplay();
             return { success: false, error: 'Tab closed during navigation.', completedSteps: completedSoFar, totalSteps };
           }
 
           // Slice remaining steps and rebuild recipe for continuation
-          const remaining = recipe.steps.slice(completedSoFar);
+          const remaining = runtimeRecipe.steps.slice(completedSoFar);
           if (remaining.length === 0) {
+            cleanupReplay();
             return { success: true, partial: false, completedSteps: completedSoFar, totalSteps, results: allResults, durationMs: Date.now() - replayStartTime };
           }
-          remainingRecipe = { ...recipe, steps: remaining.map((s, idx) => ({ ...s, stepNumber: idx + 1 })) };
+          remainingRecipe = { ...runtimeRecipe, steps: remaining.map((s, idx) => ({ ...s, stepNumber: idx + 1 })) };
         }
 
         // Exhausted continuation attempts
+        cleanupReplay();
         return {
           success: false,
           error: `Recipe navigated too many times (${MAX_CONTINUATIONS} continuations). ${completedSoFar}/${totalSteps} steps completed.`,
@@ -5992,22 +6398,50 @@ async function handleMessage(request, sender) {
           results: allResults,
           durationMs: Date.now() - replayStartTime,
         };
+        } finally {
+          cleanupReplay();
+        }
       }
 
       // ── Multi-tab replay: orchestrate across tabs ──
-      console.log('[Learning] Multi-tab replay starting:', recipe.workflowName);
+      console.log('[Learning] Multi-tab replay starting:', runtimeRecipe.workflowName);
 
       // Split steps into segments by switch_tab boundaries
-      const segments = splitIntoSegments(recipe.steps);
+      const segments = splitIntoSegments(runtimeRecipe.steps);
       console.log('[Learning] Recipe split into', segments.length, 'segments');
 
       const allResults = [];
       let totalCompleted = 0;
-      // Use full step count including switch_tab — the user recorded them and they
-      // are real steps in the workflow. Filtering them caused "2/4" display mismatches.
-      const totalSteps = recipe.steps.length;
+      const totalSteps = runtimeRecipe.steps.length;
       const startTime = Date.now();
 
+      // Navigation detection for multi-tab replay (same pattern as single-tab)
+      let mtNavDetected = false;
+      let mtLastProgressStep = 0;
+      let mtCurrentTabId = null;
+
+      const mtNavListener = (details) => {
+        if (details.frameId !== 0) return;
+        if (mtCurrentTabId && details.tabId !== mtCurrentTabId) return;
+        mtNavDetected = true;
+        console.log('[Learning] Multi-tab replay: navigation detected via webNavigation:', details.url);
+      };
+      const mtProgressTracker = (request) => {
+        if (request.type === 'replay_progress' && request.data?.stepNumber) {
+          mtLastProgressStep = Math.max(mtLastProgressStep, request.data.stepNumber);
+        }
+      };
+      chrome.webNavigation.onCompleted.addListener(mtNavListener);
+      chrome.runtime.onMessage.addListener(mtProgressTracker);
+      const mtKeepAlive = setInterval(() => { chrome.runtime.getPlatformInfo(() => {}); }, 20000);
+
+      const cleanupMultiTab = () => {
+        chrome.webNavigation.onCompleted.removeListener(mtNavListener);
+        chrome.runtime.onMessage.removeListener(mtProgressTracker);
+        clearInterval(mtKeepAlive);
+      };
+
+      try {
       for (let segIdx = 0; segIdx < segments.length; segIdx++) {
         const segment = segments[segIdx];
 
@@ -6021,6 +6455,7 @@ async function handleMessage(request, sender) {
           );
 
           if (!targetTabId) {
+            cleanupMultiTab();
             return {
               success: false,
               failedAtStep: segment.steps[0]?.stepNumber || totalCompleted + 1,
@@ -6041,6 +6476,7 @@ async function handleMessage(request, sender) {
         // Get the current active tab (should be the right one after switch)
         const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
         if (!activeTab) {
+          cleanupMultiTab();
           return {
             success: false,
             failedAtStep: totalCompleted + 1,
@@ -6050,13 +6486,21 @@ async function handleMessage(request, sender) {
           };
         }
 
+        mtCurrentTabId = activeTab.id;
+        mtNavDetected = false;
+
         // Inject replay engine into this tab
         try {
+          await chrome.scripting.executeScript({
+            target: { tabId: activeTab.id },
+            func: () => { window.__enhReplayInjected = false; },
+          });
           await chrome.scripting.executeScript({
             target: { tabId: activeTab.id },
             files: ['content_replay.js'],
           });
         } catch (injectErr) {
+          cleanupMultiTab();
           return {
             success: false,
             failedAtStep: totalCompleted + 1,
@@ -6071,17 +6515,28 @@ async function handleMessage(request, sender) {
         const stepsWithTotal = segment.steps.map(s => ({ ...s, _totalSteps: totalSteps }));
 
         // Send this segment's steps to the content script
-        // .catch() prevents hang if content script is dead/unresponsive
         const segResult = await chrome.tabs.sendMessage(activeTab.id, {
           type: 'replay_steps',
           steps: stepsWithTotal,
-          variables: variables || {},
+          variables: runtimeVariables,
         }).catch(err => {
           console.error('[Learning] sendMessage to segment failed:', err.message);
           return null;
         });
 
         if (!segResult) {
+          // Content script died — check if navigation caused it
+          if (mtNavDetected) {
+            const stepsInSegment = mtLastProgressStep > 0 ? mtLastProgressStep : 0;
+            totalCompleted += stepsInSegment;
+            console.log(`[Learning] Multi-tab: click-triggered nav in segment ${segIdx + 1}. ~${totalCompleted}/${totalSteps} done.`);
+
+            // Wait for new page to settle, then let the loop continue to next segment
+            await new Promise(r => setTimeout(r, 1500));
+            continue;
+          }
+
+          cleanupMultiTab();
           return {
             success: false,
             failedAtStep: totalCompleted + 1,
@@ -6095,6 +6550,7 @@ async function handleMessage(request, sender) {
         totalCompleted += segResult.completedSteps || 0;
 
         if (!segResult.success) {
+          cleanupMultiTab();
           return {
             success: false,
             failedAtStep: segResult.failedAtStep,
@@ -6105,6 +6561,7 @@ async function handleMessage(request, sender) {
         }
       }
 
+      cleanupMultiTab();
       return {
         success: true,
         partial: false,
@@ -6113,6 +6570,9 @@ async function handleMessage(request, sender) {
         results: allResults,
         durationMs: Date.now() - startTime,
       };
+      } finally {
+        cleanupMultiTab();
+      }
     } catch (err) {
       console.error('[Learning] Replay error:', err.message);
       return { success: false, error: err.message };
@@ -6165,63 +6625,85 @@ async function handleMessage(request, sender) {
     if (!token) return { success: false, error: 'Not authenticated' };
 
     try {
-      // Build a focused prompt for the LLM
-      const systemPrompt = [
-        'You are a text generation assistant embedded in a browser automation workflow.',
-        'The user is replaying a recipe and needs you to generate text to fill into a form field.',
-        'Generate ONLY the text content — no explanations, no markdown, no quotes around it.',
-        'Match the tone and style appropriate for the context.',
-        fieldDescription ? `Field: ${fieldDescription}` : '',
-        pageContext ? `Page context (for reference):\n${pageContext.slice(0, 1500)}` : '',
-        Object.keys(extraContext || {}).length > 0
-          ? `Additional context: ${JSON.stringify(extraContext)}`
-          : '',
-      ].filter(Boolean).join('\n');
+      const taskContext = extraContext?.taskContext || '';
+      const workflowName = extraContext?.workflowName || '';
 
-      const response = await fetch(`${API_BASE}/api/agent/recipe-fill`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          systemPrompt,
-          userPrompt: prompt,
-        }),
-      });
+      const buildRecipeFillRequest = (strict = false) => {
+        const systemPrompt = [
+          'You are a text generation assistant embedded in a browser automation workflow.',
+          'The user is replaying a recipe and needs you to generate text to fill into a form field.',
+          'Your highest priority is the current task context, not stale page text from previous screens.',
+          'Generate ONLY the text content for the target field.',
+          'Do not return JSON, markdown, labels, commentary, or explanation unless the user explicitly asked for that exact format.',
+          'If page context conflicts with task context, follow the task context.',
+          strict ? 'This is a retry because the previous output was invalid. Return plain natural language text only.' : '',
+          fieldDescription ? `Field: ${fieldDescription}` : '',
+          workflowName ? `Workflow: ${workflowName}` : '',
+          taskContext ? `Current task context:\n${taskContext}` : '',
+          pageContext ? `Visible page context (secondary reference only):\n${pageContext.slice(0, 1200)}` : '',
+        ].filter(Boolean).join('\n');
 
-      if (!response.ok) {
-        // Fallback: try the general process endpoint
-        const fallbackResponse = await fetch(`${API_BASE}/api/agent/process`, {
+        const userPrompt = [
+          prompt,
+          taskContext ? `Current task: ${taskContext}` : '',
+          strict ? 'Return only the final text that should be typed into the field.' : '',
+        ].filter(Boolean).join('\n\n');
+
+        return { systemPrompt, userPrompt };
+      };
+
+      const looksBadOutput = (text) => {
+        const trimmed = String(text || '').trim();
+        if (!trimmed) return true;
+        if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) return true;
+        if (/"title"\s*:|"description"\s*:|"dueDate"\s*:|"priority"\s*:/i.test(trimmed)) return true;
+        if (/^action_type\s*:|^headline\s*:/i.test(trimmed)) return true;
+
+        if (taskContext) {
+          const taskWords = taskContext.toLowerCase().match(/[a-z]{4,}/g) || [];
+          const distinctiveWords = [...new Set(taskWords)].filter(w => !['that', 'with', 'then', 'check', 'write', 'email', 'launching'].includes(w)).slice(0, 4);
+          if (distinctiveWords.length > 0) {
+            const lower = trimmed.toLowerCase();
+            const hitCount = distinctiveWords.filter(w => lower.includes(w)).length;
+            if (hitCount === 0 && trimmed.length > 30) return true;
+          }
+        }
+
+        return false;
+      };
+
+      const callRecipeFill = async (strict = false) => {
+        const payload = buildRecipeFillRequest(strict);
+        const response = await fetch(`${API_BASE}/api/agent/recipe-fill`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${token}`,
           },
-          body: JSON.stringify({
-            userPrompt: `[RECIPE FILL] Generate the following text. Return ONLY the raw text, nothing else.\n\nTask: ${prompt}`,
-            availableTabs: [],
-            skipMemory: true,
-          }),
+          body: JSON.stringify(payload),
         });
 
-        if (!fallbackResponse.ok) {
-          return { success: false, error: `Backend returned ${fallbackResponse.status}` };
+        if (!response.ok) {
+          return { success: false, error: `Backend returned ${response.status}` };
         }
 
-        const fallbackData = await fallbackResponse.json();
-        // Extract text from the agent response
-        const text = fallbackData?.data?.primary_content
-          || fallbackData?.data?.headline
-          || fallbackData?.primary_content
-          || fallbackData?.headline
-          || '';
+        const data = await response.json();
+        const text = data.text || data.content || '';
+        return { success: true, text, source: strict ? 'recipe-fill-retry' : 'recipe-fill' };
+      };
 
-        return { success: !!text, text, source: 'agent-fallback' };
+      let result = await callRecipeFill(false);
+      if (!result.success) return result;
+
+      if (looksBadOutput(result.text)) {
+        result = await callRecipeFill(true);
       }
 
-      const data = await response.json();
-      return { success: true, text: data.text || data.content || '', source: 'recipe-fill' };
+      if (!result.success || looksBadOutput(result.text)) {
+        return { success: false, error: 'AI generated invalid text for this field.' };
+      }
+
+      return result;
     } catch (err) {
       return { success: false, error: err.message };
     }
@@ -6492,7 +6974,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
         console.log('[Learning] Content script already active on tab', newTabId);
       } else {
         // Start or resume recording on the new tab
-        await chrome.tabs.sendMessage(newTabId, { type: 'learning_resume' });
+        await chrome.tabs.sendMessage(newTabId, { type: 'learning_resume', stepCount: learningSession.stepCounter });
         console.log('[Learning] Recorder injected and resumed on tab', newTabId);
       }
     } catch (err) {

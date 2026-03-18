@@ -15,7 +15,190 @@
 
   // ── Element Finding (Multi-Strategy Selector Resolution) ─────
 
-  function findElement(selectors, description) {
+  function getAllReachableDocuments() {
+    const docs = [document];
+    try {
+      const iframes = document.querySelectorAll('iframe');
+      for (const iframe of iframes) {
+        try {
+          const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+          if (iframeDoc) docs.push(iframeDoc);
+        } catch {
+          // Cross-origin iframe: intentionally skipped
+        }
+      }
+    } catch {}
+    return docs;
+  }
+
+  function isVisibleInDocument(el, doc) {
+    if (!el || !doc) return false;
+    const view = doc.defaultView || window;
+    const style = view.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function resolveElementBySemanticId(semanticId) {
+    if (!semanticId) return null;
+
+    for (const doc of getAllReachableDocuments()) {
+      try {
+        const el = doc.querySelector(`[data-enh-sid="${CSS.escape(semanticId)}"]`);
+        if (el && isVisibleInDocument(el, doc)) {
+          return {
+            element: el,
+            usedStrategy: 'semantic-fallback',
+            iframe: doc === document ? null : doc.defaultView?.frameElement || null,
+          };
+        }
+      } catch {}
+    }
+
+    return null;
+  }
+
+  function normalizeMatchText(text) {
+    if (!text) return '';
+    return String(text)
+      .replace(/\s+/g, ' ')
+      .replace(/[↕↔↑↓←→]/g, ' ')
+      .replace(/\s+(Ctrl|Cmd|Shift|Alt|Option|Meta)\b.*$/i, '')
+      .replace(/\s+[⌘⌥⇧^].*$/, '')
+      .trim()
+      .toLowerCase();
+  }
+
+  async function resolveViaSemanticFallback(description, semanticContext) {
+    const goalParts = [];
+    if (description) goalParts.push(description);
+    if (semanticContext?.label) goalParts.push(`Target label: ${semanticContext.label}`);
+    if (semanticContext?.tag) goalParts.push(`Element tag: ${semanticContext.tag}`);
+    if (semanticContext?.role) goalParts.push(`ARIA role: ${semanticContext.role}`);
+    if (semanticContext?.type) goalParts.push(`Input type: ${semanticContext.type}`);
+    if (semanticContext?.ariaLabel) goalParts.push(`Aria label: ${semanticContext.ariaLabel}`);
+    if (semanticContext?.placeholder) goalParts.push(`Placeholder: ${semanticContext.placeholder}`);
+    if (semanticContext?.title) goalParts.push(`Title: ${semanticContext.title}`);
+    if (semanticContext?.context) goalParts.push(`Nearby context: ${semanticContext.context}`);
+    if (semanticContext?.position) goalParts.push(`Viewport area: ${semanticContext.position}`);
+    if (semanticContext?.previousStep) goalParts.push(`Previous step: ${semanticContext.previousStep}`);
+    if (semanticContext?.nextStep) goalParts.push(`Next step: ${semanticContext.nextStep}`);
+    if (semanticContext?.workflowName) goalParts.push(`Workflow: ${semanticContext.workflowName}`);
+
+    const userGoal = goalParts.filter(Boolean).join('\n');
+    if (!userGoal) return null;
+
+    try {
+      const response = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({
+          type: 'semantic_scrape',
+          data: {
+            userGoal,
+            category: 'general',
+            mode: 'find_element',
+          },
+        }, (result) => {
+          if (chrome.runtime.lastError) {
+            resolve({ success: false, error: chrome.runtime.lastError.message });
+            return;
+          }
+          resolve(result || { success: false, error: 'No semantic response.' });
+        });
+      });
+
+      if (!response?.success || !response?.data?.target?.semanticId) {
+        return null;
+      }
+
+      const resolved = resolveElementBySemanticId(response.data.target.semanticId);
+      if (resolved) {
+        console.log('[Enhancivity Replay] Recovered element via semantic fallback:', response.data.target.rationale || response.data.target.semanticId);
+      }
+      return resolved;
+    } catch (err) {
+      console.warn('[Enhancivity Replay] Semantic fallback failed:', err.message);
+      return null;
+    }
+  }
+
+  function getVisibleMatches(doc, selectors) {
+    const matches = [];
+    for (const selector of selectors) {
+      try {
+        const found = Array.from(doc.querySelectorAll(selector))
+          .filter(el => isVisibleInDocument(el, doc));
+        matches.push(...found);
+      } catch {}
+    }
+    return matches;
+  }
+
+  function findGmailSpecialElement(description, semanticContext) {
+    const host = window.location.hostname.toLowerCase();
+    if (!host.includes('mail.google.com')) return null;
+
+    const hint = `${description || ''} ${semanticContext?.label || ''} ${semanticContext?.ariaLabel || ''}`.toLowerCase();
+    if (!hint.trim()) return null;
+
+    const docs = getAllReachableDocuments();
+
+    const resolveLastVisible = (selectors, strategy) => {
+      for (const doc of docs) {
+        const matches = getVisibleMatches(doc, selectors);
+        if (matches.length > 0) {
+          const el = matches[matches.length - 1];
+          return {
+            element: el,
+            usedStrategy: strategy,
+            iframe: doc === document ? null : doc.defaultView?.frameElement || null,
+          };
+        }
+      }
+      return null;
+    };
+
+    if (hint.includes('compose')) {
+      return resolveLastVisible([
+        '.T-I.T-I-KE.L3',
+        'div[role="button"][gh="cm"]',
+        '[gh="cm"]',
+        '[data-tooltip="Compose"]',
+      ], 'gmail-compose');
+    }
+
+    if (hint.includes('subject')) {
+      return resolveLastVisible([
+        'input[name="subjectbox"]',
+        'input[placeholder="Subject"]',
+      ], 'gmail-subject');
+    }
+
+    if (hint.includes('message body') || hint.includes('body') || hint.includes('compose body')) {
+      return resolveLastVisible([
+        '.Am.Al.editable[role="textbox"]',
+        'div[aria-label="Message Body"]',
+        'div[aria-label*="Message Body" i][contenteditable="true"]',
+        '[g_editable="true"][role="textbox"]',
+        '[role="textbox"][contenteditable="true"]',
+      ], 'gmail-body');
+    }
+
+    if (hint.includes('to') || hint.includes('recipient')) {
+      return resolveLastVisible([
+        'textarea[name="to"]',
+        'input[name="to"]',
+        'input[aria-label*="recipients" i]',
+      ], 'gmail-to');
+    }
+
+    return null;
+  }
+
+  function findElement(selectors, description, semanticContext) {
+    const gmailSpecial = findGmailSpecialElement(description, semanticContext);
+    if (gmailSpecial) return gmailSpecial;
+
     // Try selectors in priority order
     const sorted = [...selectors].sort((a, b) => a.priority - b.priority);
 
@@ -50,18 +233,18 @@
             const textCandidates = document.querySelectorAll(
               'button, a, span, div, label, h1, h2, h3, h4, p, li, td, nav, summary, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="option"]'
             );
-            const target = sel.value.trim().toLowerCase();
+            const target = normalizeMatchText(sel.value);
 
             // Pass 1: Exact match on innerText (visible text only)
             for (const c of textCandidates) {
-              const inner = (c.innerText || c.textContent || '').trim();
-              if (inner === sel.value && isVisible(c)) { el = c; break; }
+              const inner = normalizeMatchText(c.innerText || c.textContent || '');
+              if (inner === target && isVisible(c)) { el = c; break; }
             }
 
             // Pass 2: Case-insensitive match
             if (!el) {
               for (const c of textCandidates) {
-                const inner = (c.innerText || c.textContent || '').trim().toLowerCase();
+                const inner = normalizeMatchText(c.innerText || c.textContent || '');
                 if (inner === target && isVisible(c)) { el = c; break; }
               }
             }
@@ -69,8 +252,8 @@
             // Pass 3: Direct text nodes only (skip nested child text)
             if (!el) {
               for (const c of textCandidates) {
-                const directText = getDirectText(c);
-                if (directText && directText.toLowerCase() === target && isVisible(c)) { el = c; break; }
+                const directText = normalizeMatchText(getDirectText(c));
+                if (directText && directText === target && isVisible(c)) { el = c; break; }
               }
             }
 
@@ -78,7 +261,7 @@
             // (handles cases where textContent has extra whitespace or minor additions)
             if (!el && target.length >= 3) {
               for (const c of textCandidates) {
-                const inner = (c.innerText || c.textContent || '').trim().toLowerCase();
+                const inner = normalizeMatchText(c.innerText || c.textContent || '');
                 // Must be a close match — inner starts or ends with target, or target is the majority
                 if (inner.includes(target) && inner.length < target.length * 3 && isVisible(c)) {
                   // Prefer the most specific (smallest) matching element
@@ -96,9 +279,9 @@
             try {
               const { role, text } = JSON.parse(sel.value);
               const roleCandidates = document.querySelectorAll(`[role="${role}"]`);
-              const targetText = text.trim().toLowerCase();
+              const targetText = normalizeMatchText(text);
               for (const c of roleCandidates) {
-                const inner = (c.innerText || c.textContent || '').trim().toLowerCase();
+                const inner = normalizeMatchText(c.innerText || c.textContent || '');
                 if ((inner === targetText || inner.includes(targetText)) && isVisible(c)) {
                   el = c;
                   break;
@@ -124,10 +307,10 @@
           if ((sel.strategy === 'css' || sel.strategy === 'xpath') && description) {
             const labelMatch = description.match(/["'](.+?)["']/);
             if (labelMatch) {
-              const expectedLabel = labelMatch[1].trim().toLowerCase();
-              const elText = (el.innerText || el.textContent || '').trim().toLowerCase();
-              const elAria = (el.getAttribute('aria-label') || '').toLowerCase();
-              const elPlaceholder = (el.getAttribute('placeholder') || '').toLowerCase();
+              const expectedLabel = normalizeMatchText(labelMatch[1]);
+              const elText = normalizeMatchText(el.innerText || el.textContent || '');
+              const elAria = normalizeMatchText(el.getAttribute('aria-label') || '');
+              const elPlaceholder = normalizeMatchText(el.getAttribute('placeholder') || '');
 
               const matches = elText.includes(expectedLabel) ||
                               elAria.includes(expectedLabel) ||
@@ -155,14 +338,14 @@
     if (description) {
       const labelMatch = description.match(/["'](.+?)["']/);
       if (labelMatch) {
-        const label = labelMatch[1].trim().toLowerCase();
+        const label = normalizeMatchText(labelMatch[1]);
         const allClickable = document.querySelectorAll(
           'a, button, input, select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="option"], [contenteditable], label, summary'
         );
 
         // Pass 1: innerText exact (case-insensitive)
         for (const c of allClickable) {
-          const inner = (c.innerText || c.textContent || '').trim().toLowerCase();
+          const inner = normalizeMatchText(c.innerText || c.textContent || '');
           if (inner === label && isVisible(c)) {
             console.log('[Enhancivity Replay] Found via description fallback (exact):', label);
             return { element: c, usedStrategy: 'description-fallback' };
@@ -171,8 +354,8 @@
 
         // Pass 2: direct text match
         for (const c of allClickable) {
-          const direct = getDirectText(c);
-          if (direct && direct.toLowerCase() === label && isVisible(c)) {
+          const direct = normalizeMatchText(getDirectText(c));
+          if (direct && direct === label && isVisible(c)) {
             console.log('[Enhancivity Replay] Found via description fallback (direct-text):', label);
             return { element: c, usedStrategy: 'description-fallback' };
           }
@@ -180,7 +363,7 @@
 
         // Pass 3: aria-label match
         for (const c of allClickable) {
-          const aria = (c.getAttribute('aria-label') || '').toLowerCase();
+          const aria = normalizeMatchText(c.getAttribute('aria-label') || '');
           if (aria === label && isVisible(c)) {
             console.log('[Enhancivity Replay] Found via description fallback (aria):', label);
             return { element: c, usedStrategy: 'description-fallback' };
@@ -190,7 +373,7 @@
         // Pass 4: contains match (smallest matching element wins)
         let bestFallback = null;
         for (const c of allClickable) {
-          const inner = (c.innerText || c.textContent || '').trim().toLowerCase();
+          const inner = normalizeMatchText(c.innerText || c.textContent || '');
           if (inner.includes(label) && inner.length < label.length * 4 && isVisible(c)) {
             if (!bestFallback || c.textContent.length < bestFallback.textContent.length) {
               bestFallback = c;
@@ -202,6 +385,66 @@
           return { element: bestFallback, usedStrategy: 'description-fallback' };
         }
       }
+    }
+
+    // ── Iframe fallback: search inside same-origin iframes ──
+    // Gmail compose body, Outlook editor, and other apps render input fields
+    // inside iframes. document.querySelector can't reach them.
+    try {
+      const iframes = document.querySelectorAll('iframe');
+      for (const iframe of iframes) {
+        let iframeDoc;
+        try {
+          iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+        } catch {
+          continue; // cross-origin — skip
+        }
+        if (!iframeDoc) continue;
+
+        // Try selectors inside this iframe
+        const sorted = [...selectors].sort((a, b) => a.priority - b.priority);
+        for (const sel of sorted) {
+          try {
+            let el = null;
+            if (sel.strategy === 'aria-label') {
+              el = iframeDoc.querySelector(`[aria-label="${CSS.escape(sel.value)}"]`);
+            } else if (sel.strategy === 'css-id' || sel.strategy === 'css') {
+              el = iframeDoc.querySelector(sel.value);
+            } else if (sel.strategy === 'name') {
+              el = iframeDoc.querySelector(`[name="${CSS.escape(sel.value)}"]`);
+            } else if (sel.strategy === 'placeholder') {
+              el = iframeDoc.querySelector(`[placeholder="${CSS.escape(sel.value)}"]`);
+            } else if (sel.strategy === 'data-testid') {
+              el = iframeDoc.querySelector(sel.value);
+            }
+            if (el) {
+              console.log(`[Enhancivity Replay] Found in iframe via ${sel.strategy}:`, sel.value);
+              return { element: el, usedStrategy: `iframe-${sel.strategy}`, iframe };
+            }
+          } catch { continue; }
+        }
+
+        // Try description fallback inside iframe
+        if (description) {
+          const labelMatch = description.match(/["'](.+?)["']/);
+          if (labelMatch) {
+            const label = normalizeMatchText(labelMatch[1]);
+            const candidates = iframeDoc.querySelectorAll(
+              'a, button, input, select, textarea, [role="button"], [role="textbox"], [contenteditable], label'
+            );
+            for (const c of candidates) {
+              const aria = normalizeMatchText(c.getAttribute('aria-label') || '');
+              const inner = normalizeMatchText(c.innerText || c.textContent || '');
+              if ((aria === label || inner === label) && isVisibleInDocument(c, iframeDoc)) {
+                console.log('[Enhancivity Replay] Found in iframe via description:', label);
+                return { element: c, usedStrategy: 'iframe-description', iframe };
+              }
+            }
+          }
+        }
+      }
+    } catch (iframeErr) {
+      console.warn('[Enhancivity Replay] Iframe search failed:', iframeErr.message);
     }
 
     return null;
@@ -231,11 +474,11 @@
   // Default 30s — pages can take 10-20s to load after SPA transitions.
   // Polls every 500ms (first 5s) then every 800ms (remaining time) to avoid CPU thrash.
 
-  async function waitForElement(selectors, timeoutMs = 15000, description) {
+  async function waitForElement(selectors, timeoutMs = 25000, description, semanticContext) {
     const startTime = Date.now();
     let attempts = 0;
     while (Date.now() - startTime < timeoutMs) {
-      const found = findElement(selectors, description);
+      const found = findElement(selectors, description, semanticContext);
       if (found) {
         console.log(`[Enhancivity Replay] Found element after ${attempts} attempts (${Date.now() - startTime}ms) using "${found.usedStrategy}"`);
         return found;
@@ -252,16 +495,45 @@
     if (description) {
       console.warn('[Enhancivity Replay] Step description:', description);
     }
+
+    const semanticFound = await resolveViaSemanticFallback(description, semanticContext);
+    if (semanticFound) {
+      console.log('[Enhancivity Replay] Found element via semantic fallback after deterministic failure.');
+      return semanticFound;
+    }
+
     return null;
   }
 
   // ── Action Executors ──────────────────────────────────────────
 
+  async function warmNextStepTarget(action) {
+    if (!Array.isArray(action.nextStepSelectors) || action.nextStepSelectors.length === 0) return;
+    if (action.nextStepActionType === 'navigate') return;
+
+    try {
+      const nextFound = await waitForElement(
+        action.nextStepSelectors,
+        12000,
+        action.nextStepDescription,
+        action.nextStepSemanticContext
+      );
+      if (nextFound) {
+        console.log('[Enhancivity Replay] Next UI state became available after click:', action.nextStepDescription || action.nextStepActionType);
+      }
+    } catch (_) {
+      // Best-effort only
+    }
+  }
+
   async function executeClick(action) {
-    const found = await waitForElement(action.selectors, 15000, action.description);
+    const found = await waitForElement(action.selectors, 25000, action.description, action.semanticContext);
     if (!found) return { success: false, error: `Element not found for click: "${action.description || 'unknown'}"` };
 
     const el = found.element;
+    const clickHint = `${action.description || ''} ${action.semanticContext?.label || ''}`.toLowerCase();
+    const isGmailComposeClick = window.location.hostname.includes('mail.google.com') &&
+      (found.usedStrategy === 'gmail-compose' || clickHint.includes('compose'));
 
     // Scroll into view
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -304,6 +576,20 @@
       await waitForPageStable();
     }
 
+    await warmNextStepTarget(action);
+
+    if (isGmailComposeClick) {
+      const composeReady = await waitForElement([
+        { strategy: 'css', value: '.Am.Al.editable[role="textbox"]', priority: 1 },
+        { strategy: 'aria-label', value: 'Message Body', priority: 2 },
+        { strategy: 'css', value: 'input[name="subjectbox"]', priority: 3 },
+      ], 12000, 'Type into "Message Body"', { label: 'Message Body' });
+
+      if (!composeReady) {
+        return { success: false, error: 'Compose window did not finish opening after click.' };
+      }
+    }
+
     return { success: true, usedStrategy: found.usedStrategy };
   }
 
@@ -331,7 +617,7 @@
   }
 
   async function executeType(action, variables) {
-    const found = await waitForElement(action.selectors, 15000, action.description);
+    const found = await waitForElement(action.selectors, 25000, action.description, action.semanticContext);
     if (!found) return { success: false, error: `Element not found for type: "${action.description || 'unknown'}"` };
 
     const el = found.element;
@@ -355,9 +641,11 @@
     }
 
     // Tier 1: execCommand insertText (works on most fields)
+    // Use the element's ownerDocument (handles iframe elements correctly)
     let typed = false;
     try {
-      document.execCommand('insertText', false, value);
+      const execDoc = el.ownerDocument || document;
+      execDoc.execCommand('insertText', false, value);
       // Check if it actually worked
       const currentVal = el.value || el.textContent || '';
       if (currentVal.includes(value)) typed = true;
@@ -367,10 +655,12 @@
     if (!typed) {
       if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
         // Use native setter to trigger React's synthetic event system
+        const inputCtor = el.ownerDocument?.defaultView?.HTMLInputElement || window.HTMLInputElement;
+        const textAreaCtor = el.ownerDocument?.defaultView?.HTMLTextAreaElement || window.HTMLTextAreaElement;
         const nativeSetter = Object.getOwnPropertyDescriptor(
-          window.HTMLInputElement.prototype, 'value'
+          inputCtor?.prototype || {}, 'value'
         )?.set || Object.getOwnPropertyDescriptor(
-          window.HTMLTextAreaElement.prototype, 'value'
+          textAreaCtor?.prototype || {}, 'value'
         )?.set;
 
         if (nativeSetter) {
@@ -457,7 +747,7 @@
       const startTime = Date.now();
 
       while (Date.now() - startTime < timeout) {
-        const found = findElement(action.selectors, action.description);
+        const found = findElement(action.selectors, action.description, action.semanticContext);
         if (found) return { success: true };
         await delay(500);
       }
@@ -477,7 +767,7 @@
 
   async function executeLlmFill(action, variables) {
     // Find the target input element
-    const found = await waitForElement(action.selectors, 15000, action.description);
+    const found = await waitForElement(action.selectors, 25000, action.description, action.semanticContext);
     if (!found) return { success: false, error: `Element not found for AI fill: "${action.description || 'unknown'}"` };
 
     const el = found.element;
@@ -502,6 +792,8 @@
 
     // Include any user-provided variable overrides (e.g., tone, topic)
     const extraContext = {};
+    if (variables?.__task_context) extraContext.taskContext = variables.__task_context;
+    if (variables?.__workflow_name) extraContext.workflowName = variables.__workflow_name;
     if (action.contextVariables && variables) {
       for (const varName of action.contextVariables) {
         if (variables[varName]) extraContext[varName] = variables[varName];
@@ -571,7 +863,8 @@
 
     // Tier 1: execCommand insertText
     try {
-      document.execCommand('insertText', false, generatedText);
+      const execDoc = el.ownerDocument || document;
+      execDoc.execCommand('insertText', false, generatedText);
       const currentVal = el.value || el.textContent || '';
       if (currentVal.includes(generatedText.slice(0, 20))) typed = true;
     } catch {}
@@ -579,10 +872,12 @@
     // Tier 2: Direct assignment + input event
     if (!typed) {
       if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+        const inputCtor = el.ownerDocument?.defaultView?.HTMLInputElement || window.HTMLInputElement;
+        const textAreaCtor = el.ownerDocument?.defaultView?.HTMLTextAreaElement || window.HTMLTextAreaElement;
         const nativeSetter = Object.getOwnPropertyDescriptor(
-          window.HTMLInputElement.prototype, 'value'
+          inputCtor?.prototype || {}, 'value'
         )?.set || Object.getOwnPropertyDescriptor(
-          window.HTMLTextAreaElement.prototype, 'value'
+          textAreaCtor?.prototype || {}, 'value'
         )?.set;
 
         if (nativeSetter) {
@@ -628,6 +923,27 @@
 
   // ── Main Replay Function ──────────────────────────────────────
 
+  function withReplayContext(action, prevStep, nextStep, workflowName) {
+    return {
+      ...action,
+      semanticContext: {
+        ...(action.semanticContext || {}),
+        previousStep: prevStep?.action?.description || undefined,
+        nextStep: nextStep?.action?.description || undefined,
+        workflowName: workflowName || undefined,
+      },
+      nextStepDescription: nextStep?.action?.description || undefined,
+      nextStepSelectors: Array.isArray(nextStep?.action?.selectors) ? nextStep.action.selectors : undefined,
+      nextStepActionType: nextStep?.action?.type || undefined,
+      nextStepSemanticContext: nextStep?.action?.semanticContext
+        ? {
+            ...nextStep.action.semanticContext,
+            workflowName: workflowName || undefined,
+          }
+        : undefined,
+    };
+  }
+
   async function replayRecipe(recipe, variables) {
     const results = [];
     const startTime = Date.now();
@@ -636,7 +952,12 @@
 
     for (let i = 0; i < recipe.steps.length; i++) {
       const step = recipe.steps[i];
-      const action = step.action;
+      const action = withReplayContext(
+        step.action,
+        i > 0 ? recipe.steps[i - 1] : null,
+        i + 1 < recipe.steps.length ? recipe.steps[i + 1] : null,
+        recipe.workflowName
+      );
 
       console.log(`[Enhancivity Replay] Step ${i + 1}/${recipe.steps.length}: ${action.type} — ${action.description || ''}`);
 
@@ -652,9 +973,14 @@
 
       let result;
 
-      // Per-step timeout: 45s for LLM steps (AI generation), 20s for everything else.
+      // Per-step timeout: dynamic by action type.
       // Prevents any single step from hanging the entire replay.
-      const stepTimeoutMs = action.type === 'llm_fill' ? 45000 : 20000;
+      const stepTimeoutMs =
+        action.type === 'llm_fill' ? 180000 :
+        action.type === 'click' ? 45000 :
+        action.type === 'type' ? 45000 :
+        action.type === 'wait' ? Math.max(30000, action.timeout || 0) :
+        35000;
 
       try {
         const stepPromise = (async () => {
@@ -758,7 +1084,12 @@
 
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
-      const action = step.action;
+      const action = withReplayContext(
+        step.action,
+        i > 0 ? steps[i - 1] : null,
+        i + 1 < steps.length ? steps[i + 1] : null,
+        null
+      );
 
       console.log(`[Enhancivity Replay] Step ${step.stepNumber}: ${action.type} — ${action.description || ''}`);
 
@@ -773,8 +1104,13 @@
 
       let result;
 
-      // Per-step timeout: 45s for LLM steps, 20s for everything else
-      const stepTimeoutMs = action.type === 'llm_fill' ? 45000 : 20000;
+      // Per-step timeout: dynamic by action type.
+      const stepTimeoutMs =
+        action.type === 'llm_fill' ? 180000 :
+        action.type === 'click' ? 45000 :
+        action.type === 'type' ? 45000 :
+        action.type === 'wait' ? Math.max(30000, action.timeout || 0) :
+        35000;
 
       try {
         const stepPromise = (async () => {

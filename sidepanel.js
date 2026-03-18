@@ -867,6 +867,7 @@ function renderRecipeMatch(data) {
       const res = await sendToBackground('learning_replay_recipe', {
         recipe,
         variables: varValues,
+        taskContext: lastUserPrompt || recipe.workflowName || '',
       }, 120000);
 
       chrome.runtime.onMessage.removeListener(progressListener);
@@ -2885,6 +2886,7 @@ function setupLearningMode() {
     const res = await sendToBackground('learning_replay_recipe', {
       recipe,
       variables,
+      taskContext: lastUserPrompt || recipe.workflowName || '',
     }, 300000); // 5 min timeout for replay (LLM steps can take time)
 
     $('#learning-replay-progress').classList.add('hidden');
