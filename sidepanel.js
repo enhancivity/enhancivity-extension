@@ -39,8 +39,11 @@ let currentTabUrl = '';
 let currentSite = 'general';
 let orchestrationListener = null;
 let explorationListener = null;
+let replayActivityListener = null;
 let conversationMessages = [];
 let lastUserPrompt = '';
+let primaryLoadingActive = false;
+let replayActivityState = null;
 
 // ── DOM Refs ─────────────────────────────────────────────────
 
@@ -177,6 +180,56 @@ function showView(viewId) {
   $(viewId).classList.remove('hidden');
 }
 
+function getReplayActivityLabel(progress) {
+  if (!progress?.active) return '';
+  const stepNumber = Number(progress.stepNumber) || 0;
+  const totalSteps = Number(progress.totalSteps) || 0;
+  const prefix = stepNumber > 0 && totalSteps > 0 ? `Step ${stepNumber}/${totalSteps}: ` : '';
+  return `${prefix}${progress.description || 'Enhancivity is working...'}`;
+}
+
+function syncLoadingBar() {
+  const shouldShow = primaryLoadingActive || replayActivityState?.active;
+  loadingBar.classList.toggle('hidden', !shouldShow);
+  submitBtn.disabled = primaryLoadingActive;
+
+  const label = document.querySelector('.loading-label');
+  if (!primaryLoadingActive && replayActivityState?.active) {
+    if (label) label.textContent = getReplayActivityLabel(replayActivityState);
+    if (greeting) greeting.style.display = 'none';
+  } else if (label) {
+    label.textContent = STAGE_LABELS.STAGE_BACKEND;
+  }
+}
+
+function applyReplayActivity(progress) {
+  replayActivityState = progress?.active ? progress : null;
+  if (!primaryLoadingActive && !replayActivityState) {
+    setStage('');
+  }
+  syncLoadingBar();
+}
+
+async function initReplayActivityListener() {
+  if (replayActivityListener) {
+    chrome.storage.onChanged.removeListener(replayActivityListener);
+  }
+
+  replayActivityListener = (changes, areaName) => {
+    if (areaName !== 'session' || !changes.replayActivity) return;
+    applyReplayActivity(changes.replayActivity.newValue);
+  };
+
+  chrome.storage.onChanged.addListener(replayActivityListener);
+
+  try {
+    const { replayActivity } = await chrome.storage.session.get(['replayActivity']);
+    applyReplayActivity(replayActivity || null);
+  } catch {
+    applyReplayActivity(null);
+  }
+}
+
 // ── Context Detection ────────────────────────────────────────
 
 function detectSite(url) {
@@ -268,6 +321,7 @@ async function initMainView() {
 
   currentSite = detectSite(currentTabUrl);
   applyContext(currentSite);
+  await initReplayActivityListener();
 
   // Memory indicator
   const { userMemory } = await chrome.storage.local.get(['userMemory']);
@@ -450,9 +504,9 @@ async function handleSubmit() {
     return;
   }
 
-  // RECIPE_MATCH: offer to replay a learned recipe
-  if (res.data?.action_type === 'RECIPE_MATCH' && res.data?.recipe) {
-    renderRecipeMatch(res.data);
+  // RECIPE_REPLAY_COMPLETE: recipe was auto-replayed by background.js (no user choice needed)
+  if (res.data?.action_type === 'RECIPE_REPLAY_COMPLETE') {
+    renderResults(res.data);
     return;
   }
 
@@ -773,201 +827,6 @@ function renderResults(data) {
   const wrapper = document.createElement('div');
   wrapper.className = 'msg msg-assistant';
   renderResultsInto(wrapper, data);
-  resultsArea.appendChild(wrapper);
-  resultsArea.classList.remove('hidden');
-  chatArea.scrollTop = chatArea.scrollHeight;
-}
-
-function renderRecipeMatch(data) {
-  const recipe = data.recipe;
-  const variables = Array.isArray(recipe.variables) ? recipe.variables : [];
-  const wrapper = document.createElement('div');
-  wrapper.className = 'msg msg-assistant';
-
-  const card = document.createElement('div');
-  card.className = 'action-card';
-  card.style.borderLeft = '3px solid #34d399';
-
-  const headline = document.createElement('p');
-  headline.className = 'action-headline';
-  headline.textContent = data.headline || 'Learned recipe found!';
-  card.appendChild(headline);
-
-  const desc = document.createElement('p');
-  desc.className = 'action-summary';
-  desc.textContent = data.primary_content || `${recipe.stepCount} steps, ${Math.round(recipe.confidence * 100)}% confidence`;
-  card.appendChild(desc);
-
-  // If recipe has variables, show input fields inline
-  if (variables.length > 0) {
-    const varsDiv = document.createElement('div');
-    varsDiv.style.cssText = 'margin-top: 10px;';
-    for (const v of variables) {
-      const field = document.createElement('div');
-      field.style.cssText = 'margin-bottom: 8px;';
-      field.innerHTML = `
-        <label style="display:block;font-size:11px;font-weight:500;color:#a5b4fc;margin-bottom:3px;">${escapeHtml(v.description || v.name)}</label>
-        <input type="text" data-var-name="${escapeHtml(v.name)}" placeholder="${escapeHtml(v.description || v.name)}"
-          style="width:100%;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:6px 10px;color:#ededef;font-size:12px;font-family:inherit;outline:none;">
-      `;
-      varsDiv.appendChild(field);
-    }
-    card.appendChild(varsDiv);
-  }
-
-  const btnRow = document.createElement('div');
-  btnRow.style.cssText = 'display: flex; gap: 8px; margin-top: 10px;';
-
-  const replayBtn = document.createElement('button');
-  replayBtn.className = 'btn btn-primary btn-sm';
-  replayBtn.textContent = 'Replay Recipe';
-  replayBtn.addEventListener('click', async () => {
-    // Collect variables if any
-    const varValues = {};
-    const varInputs = card.querySelectorAll('input[data-var-name]');
-    for (const input of varInputs) {
-      varValues[input.dataset.varName] = input.value;
-    }
-
-    // Pre-check: verify current tab matches recipe domain
-    try {
-      const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (currentTab?.url) {
-        const currentDomain = new URL(currentTab.url).hostname.replace(/^www\./, '').toLowerCase();
-        const recipeDomain = (recipe.siteDomain || '').replace(/^www\./, '').toLowerCase();
-        if (recipeDomain && currentDomain !== recipeDomain) {
-          const mismatchEl = document.createElement('p');
-          mismatchEl.style.cssText = 'font-size: 12px; color: #fbbf24; margin-top: 8px;';
-          mismatchEl.textContent = `This recipe was recorded on ${recipeDomain}. You're currently on ${currentDomain}. Navigate to ${recipeDomain} first, then retry.`;
-          card.appendChild(mismatchEl);
-          return;
-        }
-      }
-    } catch {}
-
-    // Disable buttons, show progress inline
-    replayBtn.disabled = true;
-    replayBtn.textContent = 'Running...';
-    skipBtn.disabled = true;
-
-    const progressEl = document.createElement('p');
-    progressEl.style.cssText = 'font-size: 12px; color: #a5b4fc; margin-top: 8px;';
-    progressEl.textContent = 'Starting replay...';
-    card.appendChild(progressEl);
-
-    // Listen for progress updates
-    const progressListener = (msg) => {
-      if (msg.type === 'replay_progress' && msg.data) {
-        progressEl.textContent = `Step ${msg.data.stepNumber}/${msg.data.totalSteps}: ${msg.data.description || ''}`;
-      }
-    };
-    chrome.runtime.onMessage.addListener(progressListener);
-
-    try {
-      const res = await sendToBackground('learning_replay_recipe', {
-        recipe,
-        variables: varValues,
-        taskContext: lastUserPrompt || recipe.workflowName || '',
-      }, 120000);
-
-      chrome.runtime.onMessage.removeListener(progressListener);
-
-      if (res?.success && !res?.partial) {
-        // Full completion — all steps ran successfully
-        sendToBackground('learning_record_outcome', { recipeId: recipe.id, success: true, durationMs: res.durationMs });
-        progressEl.style.color = '#34d399';
-        progressEl.textContent = `Done! ${res.completedSteps}/${res.totalSteps} steps in ${((res.durationMs || 0) / 1000).toFixed(1)}s — 0 EU used`;
-        replayBtn.textContent = 'Completed';
-      } else if (res?.success && res?.partial) {
-        // Partial — some steps ran but replay stopped (page navigated away, etc.)
-        // This should rarely happen now that background.js handles continuation,
-        // but guard against it just in case.
-        sendToBackground('learning_record_outcome', { recipeId: recipe.id, success: false });
-        progressEl.style.color = '#fbbf24';
-        progressEl.textContent = `Partial: ${res.completedSteps}/${res.totalSteps} steps completed. Page navigated away before finishing.`;
-        replayBtn.textContent = 'Retry';
-        replayBtn.disabled = false;
-        skipBtn.disabled = false;
-        skipBtn.textContent = 'Try AI Instead';
-      } else {
-        // Only penalize confidence if the failure is NOT "element not found" on step 1
-        // Step 1 failures almost always mean wrong page/wrong site — not a bad recipe
-        const isPageMismatch = res?.failedAtStep === 1 && (res?.failReason || '').includes('Element not found');
-        if (!isPageMismatch) {
-          sendToBackground('learning_record_outcome', { recipeId: recipe.id, success: false });
-        }
-        progressEl.style.color = '#f87171';
-        if (isPageMismatch) {
-          // Check if user is on the right domain but wrong page
-          try {
-            const [curTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-            const curDomain = curTab?.url ? new URL(curTab.url).hostname.replace(/^www\./, '').toLowerCase() : '';
-            const recDomain = (recipe.siteDomain || '').replace(/^www\./, '').toLowerCase();
-            if (curDomain === recDomain) {
-              // Right domain, wrong page — give helpful guidance
-              const startPath = recipe.startUrl ? new URL(recipe.startUrl).pathname : '';
-              progressEl.textContent = `Step 1 element not found. This recipe starts from a specific page${startPath ? ' (' + startPath + ')' : ''}. Navigate there and retry.`;
-            } else {
-              progressEl.textContent = `Wrong site — this recipe was recorded on ${recipe.siteDomain}. Navigate there first.`;
-            }
-          } catch {
-            progressEl.textContent = `Step 1 element not found — you may need to navigate to the right page first.`;
-          }
-        } else {
-          progressEl.textContent = `Failed at step ${res?.failedAtStep || '?'}: ${res?.failReason || res?.error || 'Unknown error'}`;
-        }
-        replayBtn.textContent = 'Failed';
-        replayBtn.disabled = false;
-        skipBtn.disabled = false;
-        skipBtn.textContent = 'Try AI Instead';
-      }
-    } catch (err) {
-      chrome.runtime.onMessage.removeListener(progressListener);
-      progressEl.style.color = '#f87171';
-      progressEl.textContent = `Error: ${err.message}`;
-      replayBtn.disabled = false;
-      replayBtn.textContent = 'Retry';
-      skipBtn.disabled = false;
-    }
-  });
-
-  const skipBtn = document.createElement('button');
-  skipBtn.className = 'btn btn-ghost btn-sm';
-  skipBtn.textContent = 'Use AI Instead';
-  skipBtn.addEventListener('click', async () => {
-    wrapper.remove();
-    setLoading(true);
-    setStage('STAGE_BACKEND');
-
-    const siteHint = extractSiteHint(lastUserPrompt);
-    let availableTabs = [];
-    try {
-      const triageRes = await sendToBackground('GET_TAB_TRIAGE_MAP', {}, 5000);
-      if (triageRes?.success) availableTabs = triageRes.tabs;
-    } catch {}
-
-    const res = await sendToBackground('process_request_skip_recipe', {
-      userPrompt: lastUserPrompt,
-      tabId: currentTabId,
-      url: currentTabUrl,
-      availableTabs,
-      conversationHistory: conversationMessages.slice(-10).map(m => ({ role: m.role, content: m.content })),
-      siteHint,
-    });
-
-    setLoading(false);
-    if (!res?.success) {
-      showError((res?.errorType ? `[${res.errorType}] ` : '') + (res?.error || 'Something went wrong.'));
-      return;
-    }
-    renderResults(res.data);
-  });
-
-  btnRow.appendChild(replayBtn);
-  btnRow.appendChild(skipBtn);
-  card.appendChild(btnRow);
-
-  wrapper.appendChild(card);
   resultsArea.appendChild(wrapper);
   resultsArea.classList.remove('hidden');
   chatArea.scrollTop = chatArea.scrollHeight;
@@ -2622,18 +2481,27 @@ function renderLoginRequired(pauseReason, resumeStateKey, authType) {
 // ── UI Helpers ───────────────────────────────────────────────
 
 function setLoading(on) {
-  loadingBar.classList.toggle('hidden', !on);
-  submitBtn.disabled = on;
+  primaryLoadingActive = on;
+  syncLoadingBar();
   if (on) {
     requestAnimationFrame(() => { requestAnimationFrame(() => { chatArea.scrollTop = chatArea.scrollHeight; }); });
   } else {
-    setStage('');
+    if (!replayActivityState?.active) {
+      setStage('');
+    }
   }
 }
 
 function setStage(stage) {
   const label = document.querySelector('.loading-label');
-  if (label) label.textContent = STAGE_LABELS[stage] || 'Thinking with your memory...';
+  if (!label) return;
+  if (!stage) {
+    label.textContent = replayActivityState?.active
+      ? getReplayActivityLabel(replayActivityState)
+      : 'Thinking with your memory...';
+    return;
+  }
+  label.textContent = STAGE_LABELS[stage] || 'Thinking with your memory...';
 }
 
 function clearResults() {
@@ -3126,7 +2994,13 @@ async function loadMyRecipes() {
   const container = $('#learning-my-recipes');
   const res = await sendToBackground('learning_get_recipes', {});
 
-  if (!res?.success || !res.recipes?.length) {
+  if (!res?.success) {
+    const errMsg = res?.error || 'Could not load recipes.';
+    console.warn('[Learning] loadMyRecipes failed:', errMsg);
+    container.innerHTML = `<p class="settings-section-desc" style="opacity: 0.5; color: #f87171;">${escapeHtml(errMsg)}</p>`;
+    return;
+  }
+  if (!res.recipes?.length) {
     container.innerHTML = '<p class="settings-section-desc" style="opacity: 0.5;">No recipes yet. Teach me something!</p>';
     return;
   }

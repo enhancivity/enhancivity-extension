@@ -27,6 +27,63 @@ const BADGE_CONFIG = {
 let currentTabId   = null;
 let currentTabUrl  = '';
 let currentSite    = 'general';
+let replayActivityListener = null;
+let primaryLoadingActive = false;
+let replayActivityState = null;
+
+function getReplayActivityLabel(progress) {
+  if (!progress?.active) return '';
+  const stepNumber = Number(progress.stepNumber) || 0;
+  const totalSteps = Number(progress.totalSteps) || 0;
+  const prefix = stepNumber > 0 && totalSteps > 0 ? `Step ${stepNumber}/${totalSteps}: ` : '';
+  return `${prefix}${progress.description || 'Enhancivity is working...'}`;
+}
+
+function syncLoadingBar() {
+  const bar = document.getElementById('loading-bar');
+  const label = document.querySelector('.loading-label');
+  const submitBtn = document.getElementById('submit-btn');
+  const greeting = document.getElementById('chat-greeting');
+  const shouldShow = primaryLoadingActive || replayActivityState?.active;
+
+  if (bar) bar.classList.toggle('hidden', !shouldShow);
+  if (submitBtn) submitBtn.disabled = primaryLoadingActive;
+
+  if (!primaryLoadingActive && replayActivityState?.active) {
+    if (label) label.textContent = getReplayActivityLabel(replayActivityState);
+    if (greeting) greeting.style.display = 'none';
+  } else if (label) {
+    label.textContent = 'Thinking with your memory...';
+  }
+}
+
+function applyReplayActivity(progress) {
+  replayActivityState = progress?.active ? progress : null;
+  if (!primaryLoadingActive && !replayActivityState) {
+    setStage('');
+  }
+  syncLoadingBar();
+}
+
+async function initReplayActivityListener() {
+  if (replayActivityListener) {
+    chrome.storage.onChanged.removeListener(replayActivityListener);
+  }
+
+  replayActivityListener = (changes, areaName) => {
+    if (areaName !== 'session' || !changes.replayActivity) return;
+    applyReplayActivity(changes.replayActivity.newValue);
+  };
+
+  chrome.storage.onChanged.addListener(replayActivityListener);
+
+  try {
+    const { replayActivity } = await chrome.storage.session.get(['replayActivity']);
+    applyReplayActivity(replayActivity || null);
+  } catch {
+    applyReplayActivity(null);
+  }
+}
 
 // ── Init ─────────────────────────────────────────────────────
 
@@ -96,6 +153,7 @@ async function initMainView() {
   }
 
   applyContext(currentSite);
+  await initReplayActivityListener();
 
   // Show memory indicator if memory is cached
   const { userMemory } = await chrome.storage.local.get(['userMemory']);
@@ -1601,9 +1659,9 @@ function showView(id) {
 }
 
 function setLoading(on) {
-  document.getElementById('loading-bar').classList.toggle('hidden', !on);
-  document.getElementById('submit-btn').disabled = on;
-  if (!on) setStage(''); // Clear stage when loading stops
+  primaryLoadingActive = on;
+  syncLoadingBar();
+  if (!on && !replayActivityState?.active) setStage(''); // Clear stage when loading stops
 }
 
 // ── Stage Tracker: visual feedback during pipeline ───────────
@@ -1617,9 +1675,14 @@ const STAGE_LABELS = {
 
 function setStage(stage) {
   const label = document.querySelector('.loading-label');
-  if (label) {
-    label.textContent = STAGE_LABELS[stage] || 'Thinking with your memory...';
+  if (!label) return;
+  if (!stage) {
+    label.textContent = replayActivityState?.active
+      ? getReplayActivityLabel(replayActivityState)
+      : 'Thinking with your memory...';
+    return;
   }
+  label.textContent = STAGE_LABELS[stage] || 'Thinking with your memory...';
 }
 
 function clearResults() {

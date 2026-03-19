@@ -640,6 +640,7 @@ const HUD_SCRIPT = 'content_hud.js';
 // Cleanup function for recording nav listeners + keepAlive.
 // Set when recording starts, called on stop/cancel.
 let learningNavCleanup = null;
+let learningPendingSwitch = null;
 
 // ─── Tab Readiness Helper ──────────────────────────────────
 // Chrome locks tab APIs during tab drag, tab switch animation, and other
@@ -678,6 +679,282 @@ async function waitForTabReady(tabId, maxWaitMs = 10000, { requireComplete = fal
   }
   console.warn(`[waitForTabReady] Tab ${tabId} not ready after ${maxWaitMs}ms`);
   return { ready: false, reason: 'TIMEOUT' };
+}
+
+const PRODUCT_CATEGORY_GROUPS = {
+  desktop: ['desktop', 'desktop pc', 'desktop computer', 'tower', 'workstation', 'mini pc', 'all-in-one', 'aio', 'pc', 'computer'],
+  laptop: ['laptop', 'notebook', 'ultrabook', 'macbook', 'chromebook'],
+};
+
+function normalizeSearchText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function detectProductCategory(value) {
+  const text = normalizeSearchText(value);
+  if (!text) return null;
+
+  for (const [name, aliases] of Object.entries(PRODUCT_CATEGORY_GROUPS)) {
+    for (const alias of aliases) {
+      if (new RegExp(`\\b${escapeRegex(normalizeSearchText(alias))}\\b`, 'i').test(text)) {
+        return name;
+      }
+    }
+  }
+
+  return null;
+}
+
+function parseNumericPrice(text) {
+  if (!text) return null;
+  let candidate = String(text).replace(/\s/g, '');
+  const match = candidate.match(/(\d[\d.,]*)/);
+  if (!match) return null;
+
+  candidate = match[1];
+  const lastComma = candidate.lastIndexOf(',');
+  const lastDot = candidate.lastIndexOf('.');
+
+  if (lastComma > -1 && lastDot > -1) {
+    candidate = lastComma > lastDot
+      ? candidate.replace(/\./g, '').replace(',', '.')
+      : candidate.replace(/,/g, '');
+  } else if (lastComma > -1) {
+    const decimalDigits = candidate.length - lastComma - 1;
+    candidate = decimalDigits === 2
+      ? candidate.replace(/\./g, '').replace(',', '.')
+      : candidate.replace(/,/g, '');
+  } else {
+    candidate = candidate.replace(/,/g, '');
+  }
+
+  const parsed = Number(candidate);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseBudgetValue(text) {
+  if (!text) return null;
+
+  const match = String(text).match(
+    /(?:under|below|less than|up to|max(?:imum)?(?: price)?|budget(?: of)?)\s*[:=-]?\s*([$€£]?\s*\d[\d.,]*|\d[\d.,]*\s*(?:usd|eur|gbp|dollars?|euros?|pounds?))/i
+  );
+  if (match) return parseNumericPrice(match[1]);
+
+  if (/[$€£]|\b(?:usd|eur|gbp|dollars?|euros?|pounds?)\b/i.test(String(text))) {
+    return parseNumericPrice(text);
+  }
+
+  return null;
+}
+
+function inferRequestedObject(searchPlan, userPrompt) {
+  if (searchPlan?.object && String(searchPlan.object).trim()) return String(searchPlan.object).trim();
+
+  const sources = [
+    userPrompt,
+    ...Object.values(searchPlan?.queries || {}),
+  ];
+
+  for (const source of sources) {
+    const category = detectProductCategory(source);
+    if (category) return category;
+  }
+
+  return '';
+}
+
+function extractBudgetLimit(searchPlan, userPrompt) {
+  const sources = [
+    searchPlan?.constraints?.maxPrice,
+    ...Object.values(searchPlan?.queries || {}),
+    userPrompt,
+  ];
+
+  for (const source of sources) {
+    const parsed = parseBudgetValue(source);
+    if (parsed !== null) return parsed;
+  }
+
+  return null;
+}
+
+function normalizeProductSearchPlan(searchPlan, userPrompt) {
+  const normalized = {
+    ...searchPlan,
+    queries: { ...(searchPlan?.queries || {}) },
+    constraints: { ...(searchPlan?.constraints || {}) },
+  };
+
+  const requestedObject = inferRequestedObject(normalized, userPrompt);
+  if (requestedObject) normalized.object = requestedObject;
+
+  const requestedCategory = detectProductCategory(requestedObject || userPrompt);
+  const replacement = requestedObject || requestedCategory || '';
+
+  for (const [site, query] of Object.entries(normalized.queries)) {
+    let updated = String(query || '').trim();
+    const queryCategory = detectProductCategory(updated);
+
+    if (requestedCategory && queryCategory && queryCategory !== requestedCategory) {
+      for (const alias of PRODUCT_CATEGORY_GROUPS[queryCategory]) {
+        updated = updated.replace(new RegExp(`\\b${escapeRegex(alias)}\\b`, 'ig'), replacement);
+      }
+    }
+
+    if (requestedCategory && !detectProductCategory(updated) && replacement) {
+      updated = `${replacement} ${updated}`.trim();
+    }
+
+    normalized.queries[site] = updated.replace(/\s+/g, ' ').trim();
+  }
+
+  if (!normalized.constraints.maxPrice) {
+    const budget = extractBudgetLimit(normalized, userPrompt);
+    if (budget !== null) normalized.constraints.maxPrice = String(budget);
+  }
+
+  return normalized;
+}
+
+function resultMatchesRequestedProduct(title, searchPlan, userPrompt) {
+  const requestedCategory = detectProductCategory(searchPlan?.object || userPrompt);
+  if (!requestedCategory) return true;
+
+  const titleCategory = detectProductCategory(title);
+  if (titleCategory && titleCategory !== requestedCategory) return false;
+
+  const normalizedTitle = normalizeSearchText(title);
+  return PRODUCT_CATEGORY_GROUPS[requestedCategory].some(alias => normalizedTitle.includes(normalizeSearchText(alias)));
+}
+
+function filterSearchResults(siteResults, searchPlan, userPrompt) {
+  const budgetLimit = extractBudgetLimit(searchPlan, userPrompt);
+
+  return (siteResults || []).filter((item) => {
+    if (budgetLimit !== null) {
+      const parsedPrice = parseNumericPrice(item?.price);
+      if (parsedPrice !== null && parsedPrice > budgetLimit) return false;
+    }
+
+    return resultMatchesRequestedProduct(item?.title || '', searchPlan, userPrompt);
+  });
+}
+
+async function waitForReplayReady(tabId, maxWaitMs = 1500) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, { type: 'ping_replay' });
+      if (response?.alive) return true;
+    } catch {}
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return false;
+}
+
+async function ensureReplayScriptReady(tabId, { forceReinject = false, waitMs = 2000 } = {}) {
+  if (!forceReinject) {
+    try {
+      const existing = await chrome.tabs.sendMessage(tabId, { type: 'ping_replay' });
+      if (existing?.alive) return { success: true, reused: true };
+    } catch {}
+  }
+
+  try {
+    if (forceReinject) {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => { window.__enhReplayInjected = false; },
+      }).catch(() => {});
+    }
+
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content_replay.js'],
+    });
+  } catch (injectErr) {
+    return { success: false, error: injectErr.message };
+  }
+
+  const ready = await waitForReplayReady(tabId, waitMs);
+  if (!ready) {
+    return { success: false, error: 'Replay engine did not become ready on this page.' };
+  }
+
+  return { success: true, reused: false };
+}
+
+async function resolveReplayStartTab(recipe, fallbackTabId = null) {
+  const startUrl = recipe?.startUrl || recipe?.urlPattern;
+  if (!startUrl) {
+    if (fallbackTabId) return { tabId: fallbackTabId, navigated: false };
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    return activeTab?.id ? { tabId: activeTab.id, navigated: false } : { tabId: null, navigated: false };
+  }
+
+  let startDomain = '';
+  let startPath = '';
+  try {
+    const parsed = new URL(startUrl);
+    startDomain = parsed.hostname.replace(/^www\./, '').toLowerCase();
+    startPath = parsed.pathname;
+  } catch {
+    return fallbackTabId ? { tabId: fallbackTabId, navigated: false } : { tabId: null, navigated: false };
+  }
+
+  let targetTabId = fallbackTabId;
+  let targetTab = null;
+
+  if (targetTabId) {
+    try {
+      targetTab = await chrome.tabs.get(targetTabId);
+    } catch {
+      targetTab = null;
+    }
+  }
+
+  const currentDomain = targetTab?.url ? (() => {
+    try { return new URL(targetTab.url).hostname.replace(/^www\./, '').toLowerCase(); } catch { return ''; }
+  })() : '';
+
+  if (!targetTab || currentDomain !== startDomain) {
+    targetTabId = await findTabByDomain(startDomain, startUrl);
+    if (!targetTabId) return { tabId: null, navigated: false };
+    targetTab = await chrome.tabs.get(targetTabId).catch(() => null);
+  }
+
+  if (!targetTab) return { tabId: null, navigated: false };
+
+  await chrome.tabs.update(targetTabId, { active: true });
+  if (targetTab.windowId) {
+    await chrome.windows.update(targetTab.windowId, { focused: true }).catch(() => {});
+  }
+
+  let navigated = false;
+  try {
+    const currentUrl = targetTab.url || '';
+    const currentParsed = new URL(currentUrl);
+    const currentTabDomain = currentParsed.hostname.replace(/^www\./, '').toLowerCase();
+    const currentTabPath = currentParsed.pathname;
+
+    if (currentTabDomain !== startDomain || currentTabPath !== startPath || currentUrl !== startUrl) {
+      console.log('[Learning] Auto-navigating replay start tab to:', startUrl);
+      await chrome.tabs.update(targetTabId, { url: startUrl });
+      await waitForTabLoad(targetTabId, 10000, 400);
+      await new Promise(r => setTimeout(r, 350));
+      navigated = true;
+    }
+  } catch {}
+
+  return { tabId: targetTabId, navigated };
 }
 
 // ─── HUD Helpers (inject + send messages) ─────────────────
@@ -1366,12 +1643,13 @@ async function spawnSearchTab(site, query, category, token) {
 
 async function runOrchestration(userPrompt, searchPlan, token) {
   try {
-    await updateOrchestrationProgress('searching', `Searching ${searchPlan.sites.length} sites...`);
+    const normalizedPlan = normalizeProductSearchPlan(searchPlan, userPrompt);
+    await updateOrchestrationProgress('searching', `Searching ${normalizedPlan.sites.length} sites...`);
 
     // Parallel search across all sites (now using semantic scraper)
-    const searchPromises = searchPlan.sites.map(site => {
-      const query = searchPlan.queries[site] || searchPlan.queries.default || userPrompt;
-      return spawnSearchTab(site, query, searchPlan.category, token);
+    const searchPromises = normalizedPlan.sites.map(site => {
+      const query = normalizedPlan.queries[site] || normalizedPlan.queries.default || userPrompt;
+      return spawnSearchTab(site, query, normalizedPlan.category, token);
     });
 
     const searchResults = await Promise.allSettled(searchPromises);
@@ -1380,11 +1658,15 @@ async function runOrchestration(userPrompt, searchPlan, token) {
     const allResults = searchResults
       .filter(r => r.status === 'fulfilled')
       .map(r => r.value)
+      .map(r => ({
+        ...r,
+        results: filterSearchResults(r.results || [], normalizedPlan, userPrompt),
+      }))
       .filter(r => r.results && r.results.length > 0);
 
     if (allResults.length === 0) {
-      await updateOrchestrationProgress('error', 'No results found across any site.');
-      return { success: false, error: 'No results found. Try rephrasing your search.' };
+      await updateOrchestrationProgress('error', 'No matching products stayed within the requested constraints.');
+      return { success: false, error: 'No products matched your requested type and budget. Try raising the budget or broadening the search.' };
     }
 
     const totalProducts = allResults.reduce((sum, r) => sum + r.results.length, 0);
@@ -1397,9 +1679,10 @@ async function runOrchestration(userPrompt, searchPlan, token) {
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({
         results: allResults,
-        criteria: searchPlan.criteria,
-        category: searchPlan.category,
+        criteria: normalizedPlan.criteria,
+        category: normalizedPlan.category,
         userPrompt,
+        searchPlan: normalizedPlan,
         ...byokPayload(compareByokConfig),
       }),
     });
@@ -1431,6 +1714,27 @@ async function updateParallelExploreProgress(phase, tabStates) {
   }));
   await chrome.storage.session.set({
     parallelExploreProgress: { phase, tabs, timestamp: Date.now() },
+  });
+}
+
+async function updateReplayActivity(activity = {}) {
+  await chrome.storage.session.set({
+    replayActivity: {
+      active: true,
+      mode: 'recipe_replay',
+      ...activity,
+      timestamp: Date.now(),
+    },
+  });
+}
+
+async function clearReplayActivity(status = 'idle') {
+  await chrome.storage.session.set({
+    replayActivity: {
+      active: false,
+      status,
+      timestamp: Date.now(),
+    },
   });
 }
 
@@ -4466,6 +4770,123 @@ function splitIntoSegments(steps) {
   return segments;
 }
 
+function getLearningTabUrl(tab) {
+  return tab?.pendingUrl || tab?.url || '';
+}
+
+function isInjectableLearningUrl(url) {
+  return !!url &&
+    !url.startsWith('chrome://') &&
+    !url.startsWith('chrome-extension://') &&
+    !url.startsWith('about:');
+}
+
+function hasRecentLearningSwitch(session, tabId, url) {
+  const lastStep = session?.steps?.[session.steps.length - 1];
+  return lastStep?.action?.type === 'switch_tab' &&
+    lastStep.tabId === tabId &&
+    lastStep.action.targetUrl === url &&
+    Date.now() - lastStep.timestamp < 3000;
+}
+
+async function waitForInjectableLearningUrl(tabId, maxWaitMs = 4000) {
+  const start = Date.now();
+
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const url = getLearningTabUrl(tab);
+      if (isInjectableLearningUrl(url)) {
+        return { tab, url };
+      }
+    } catch {
+      return null;
+    }
+
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  return null;
+}
+
+async function resumeLearningOnTab(tabId, stepCount) {
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['content_learning.js'],
+  });
+  await new Promise(r => setTimeout(r, 200));
+
+  let statusRes;
+  try {
+    statusRes = await chrome.tabs.sendMessage(tabId, { type: 'learning_status' });
+  } catch {
+    statusRes = null;
+  }
+
+  if (statusRes?.isRecording) {
+    console.log('[Learning] Content script already active on tab', tabId);
+    return true;
+  }
+
+  await chrome.tabs.sendMessage(tabId, { type: 'learning_resume', stepCount });
+  console.log('[Learning] Recorder injected and resumed on tab', tabId);
+  return true;
+}
+
+async function finalizeLearningTabSwitch(session, oldTabId, newTabId, newUrl, source = 'tabs.onActivated') {
+  if (!session?.active || !newTabId || !isInjectableLearningUrl(newUrl)) return false;
+
+  if (newTabId === oldTabId && session.activeTabId === newTabId) {
+    return false;
+  }
+
+  if (hasRecentLearningSwitch(session, newTabId, newUrl)) {
+    session.activeTabId = newTabId;
+    session.tabDomains[newTabId] = new URL(newUrl).hostname.replace(/^www\./, '').toLowerCase();
+    await chrome.storage.session.set({ learningSession: session });
+    learningPendingSwitch = null;
+    return true;
+  }
+
+  console.log('[Learning] Tab switch detected via', source + ':', oldTabId, '→', newTabId, '(', newUrl, ')');
+
+  if (oldTabId) {
+    try {
+      await chrome.tabs.sendMessage(oldTabId, { type: 'learning_pause' });
+    } catch {
+      // Old tab may have been closed or navigated away
+    }
+  }
+
+  const newDomain = new URL(newUrl).hostname.replace(/^www\./, '').toLowerCase();
+  session.steps.push({
+    stepNumber: ++session.stepCounter,
+    action: {
+      type: 'switch_tab',
+      targetUrl: newUrl,
+      targetDomain: newDomain,
+      matchStrategy: 'domain',
+      description: `Switch to ${newDomain}`,
+    },
+    url: newUrl,
+    timestamp: Date.now(),
+    tabId: newTabId,
+  });
+
+  session.activeTabId = newTabId;
+  session.tabDomains[newTabId] = newDomain;
+  await chrome.storage.session.set({ learningSession: session });
+  learningPendingSwitch = null;
+
+  try {
+    await resumeLearningOnTab(newTabId, session.stepCounter);
+  } catch (err) {
+    console.warn('[Learning] Failed to inject into new tab:', err.message);
+  }
+
+  return true;
+}
+
 // Find an existing tab by domain, or create a new one.
 // Returns tabId or null.
 async function findTabByDomain(domain, fallbackUrl) {
@@ -5089,6 +5510,8 @@ async function handleMessage(request, sender) {
   }
 
   // ── MAIN: Process a user request with 3-Tier Memory ─────
+  // Note: 'process_request_skip_recipe' kept for backward compat but behaves identically
+  // now that recipe selection is automatic (no user choice UI).
   if (request.type === 'process_request' || request.type === 'process_request_skip_recipe') {
     const skipRecipeCheck = request.type === 'process_request_skip_recipe';
     const { userPrompt, tabId, url, availableTabs, conversationHistory, siteHint } = request.data;
@@ -5169,9 +5592,9 @@ async function handleMessage(request, sender) {
       } catch { /* Some pages block injection — proceed without */ }
     }
 
-    // ── LEARNING MODE: Check for a matching recipe before AI call ──
-    // If a learned recipe exists for this site + task, offer to replay it
-    // instead of spending credits on an AI call.
+    // ── LEARNING MODE: Auto-replay matching recipe (zero-token, silent) ──
+    // If a learned recipe exists for this site + task, replay it automatically
+    // without asking the user. If replay fails, silently fall through to AI.
     if (!skipRecipeCheck) try {
       const siteDomain = url ? new URL(url).hostname : '';
       if (siteDomain && userPrompt) {
@@ -5181,23 +5604,201 @@ async function handleMessage(request, sender) {
         );
         const recipeMatch = await recipeRes.json();
         if (recipeMatch?.success && recipeMatch?.found && recipeMatch?.recipe) {
-          // Return a special action type that tells the side panel to offer replay
-          return {
-            success: true,
-            data: {
-              action_type: 'RECIPE_MATCH',
-              headline: `I know how to do this! "${recipeMatch.recipe.workflowName}" (${Math.round(recipeMatch.recipe.confidence * 100)}% confidence)`,
-              primary_content: `I have a learned recipe for this with ${recipeMatch.recipe.stepCount} steps. Would you like me to replay it?`,
-              recipe: recipeMatch.recipe,
-              matchType: recipeMatch.matchType,
-              consent_level: 'confirm',
-            },
-          };
+          const recipe = recipeMatch.recipe;
+          const matchScore = recipeMatch.score || 0;
+          console.log(`[BG] Recipe auto-match: "${recipe.workflowName}" (score=${matchScore}, confidence=${recipe.confidence})`);
+
+          // Determine if recipe has unfilled variables that we can't resolve from the prompt
+          const variables = Array.isArray(recipe.variables) ? recipe.variables : [];
+          const hasUnfilledVars = variables.length > 0;
+
+          // If recipe requires user-provided variables, we can't auto-replay silently.
+          // Fall through to AI which can handle the full request intelligently.
+          if (!hasUnfilledVars) {
+            // Auto-replay: dispatch internally to the replay handler
+            try {
+              const replayResult = await handleMessage({
+                type: 'learning_replay_recipe',
+                data: {
+                  recipe,
+                  variables: {},
+                  taskContext: userPrompt,
+                },
+              }, {} /* no sender — internal call */);
+
+              if (replayResult?.success && !replayResult?.partial) {
+                // Replay succeeded — record outcome and return success
+                try {
+                  await fetch(`${API_BASE}/api/recipes/${recipe.id}/validate`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                    body: JSON.stringify({ durationMs: replayResult.durationMs }),
+                  });
+                } catch { /* non-critical */ }
+
+                return {
+                  success: true,
+                  data: {
+                    action_type: 'RECIPE_REPLAY_COMPLETE',
+                    headline: `Done! Used community workflow "${recipe.autoDescription || recipe.workflowName}"`,
+                    primary_content: `Completed ${replayResult.completedSteps}/${replayResult.totalSteps} steps in ${((replayResult.durationMs || 0) / 1000).toFixed(1)}s — 0 credits used.`,
+                    recipe_used: { id: recipe.id, name: recipe.autoDescription || recipe.workflowName, confidence: recipe.confidence },
+                    consent_level: 'none',
+                  },
+                };
+              }
+
+              // Replay failed or partial — record failure and fall through to AI
+              console.warn('[BG] Recipe auto-replay failed, falling through to AI:', replayResult?.error || replayResult?.failReason || 'unknown');
+              try {
+                // Don't penalize confidence for step-1 page mismatch failures
+                const isPageMismatch = replayResult?.failedAtStep === 1 && (replayResult?.failReason || '').includes('Element not found');
+                if (!isPageMismatch) {
+                  await fetch(`${API_BASE}/api/recipes/${recipe.id}/fail`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                  });
+                }
+              } catch { /* non-critical */ }
+            } catch (replayErr) {
+              console.warn('[BG] Recipe auto-replay threw, falling through to AI:', replayErr.message);
+            }
+          } else {
+            console.log(`[BG] Recipe has ${variables.length} variable(s), skipping auto-replay — AI will handle`);
+          }
         }
       }
     } catch (recipeErr) {
       // Non-critical — fall through to normal AI flow
       console.warn('[BG] Recipe check failed (non-fatal):', recipeErr.message);
+    }
+
+    // ── CHAIN EXECUTION: Multi-site request decomposition ──
+    // If the user's request involves multiple sites (e.g., "search Amazon and email the link"),
+    // ask the backend to decompose it and execute sub-tasks sequentially.
+    if (!skipRecipeCheck) try {
+      const chainPlanRes = await fetch(`${API_BASE}/api/agent/chain/plan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ userRequest: userPrompt, currentDomain: url ? new URL(url).hostname : null }),
+      });
+      const chainPlan = await chainPlanRes.json();
+
+      if (chainPlan?.success && chainPlan?.isChain && chainPlan.subTasks?.length > 1) {
+        console.log(`[BG] Chain detected: ${chainPlan.totalSteps} sub-tasks (${chainPlan.recipeCount} recipes, ${chainPlan.aiCount} AI)`);
+
+        const chainResults = [];
+        const outputStore = {};
+        let chainSuccess = true;
+
+        for (const subTask of chainPlan.subTasks) {
+          // Resolve pending inputs (previous_step references + AI-generated content)
+          let resolvedInputs = { ...subTask.resolvedInputs };
+          if (subTask.pendingInputs && subTask.pendingInputs.length > 0 && Object.keys(outputStore).length > 0) {
+            try {
+              const resolveRes = await fetch(`${API_BASE}/api/agent/chain/resolve-inputs`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                body: JSON.stringify({ subTask, outputStore }),
+              });
+              const resolved = await resolveRes.json();
+              if (resolved?.success) {
+                resolvedInputs = { ...resolvedInputs, ...resolved.resolvedInputs };
+              }
+            } catch { /* use what we have */ }
+          }
+
+          let stepResult;
+
+          if (subTask.executionMethod === 'recipe_replay' && subTask.recipe) {
+            // RECIPE REPLAY — free, deterministic
+            try {
+              stepResult = await handleMessage({
+                type: 'learning_replay_recipe',
+                data: {
+                  recipe: subTask.recipe,
+                  variables: resolvedInputs,
+                  taskContext: subTask.intent,
+                },
+              }, {});
+
+              if (stepResult?.success && !stepResult?.partial) {
+                // Record success
+                try {
+                  await fetch(`${API_BASE}/api/recipes/${subTask.recipe.id}/validate`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                    body: JSON.stringify({ durationMs: stepResult.durationMs }),
+                  });
+                } catch { /* non-critical */ }
+              } else {
+                // Recipe failed — mark for AI fallback reporting
+                stepResult = { success: false, error: stepResult?.error || 'Recipe replay failed' };
+              }
+            } catch (replayErr) {
+              stepResult = { success: false, error: replayErr.message };
+            }
+          } else {
+            // AI REASONING — expensive but necessary (no recipe available)
+            // For now, mark as needing AI; the full chain returns partial so the
+            // AI call below handles the remaining request.
+            stepResult = { success: false, error: 'No recipe available — needs AI reasoning' };
+          }
+
+          // Capture page outputs after this sub-task (URL + title from active tab)
+          if (stepResult?.success) {
+            try {
+              const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+              outputStore[subTask.order] = {
+                page_url: activeTab?.url || '',
+                page_title: activeTab?.title || '',
+              };
+            } catch {
+              outputStore[subTask.order] = {};
+            }
+          }
+
+          chainResults.push({
+            order: subTask.order,
+            intent: subTask.intent,
+            domain: subTask.domain,
+            method: subTask.executionMethod,
+            recipeName: subTask.recipe?.autoDescription || subTask.recipe?.workflowName || null,
+            success: !!stepResult?.success,
+            duration: stepResult?.durationMs || 0,
+            error: stepResult?.error || null,
+          });
+
+          // If a critical sub-task failed, stop the chain
+          if (!stepResult?.success) {
+            chainSuccess = false;
+            break;
+          }
+        }
+
+        // If all recipe sub-tasks succeeded, return the chain result
+        if (chainSuccess) {
+          const totalDuration = chainResults.reduce((sum, r) => sum + (r.duration || 0), 0);
+          const recipesUsed = chainResults.filter(r => r.method === 'recipe_replay' && r.success).length;
+          return {
+            success: true,
+            data: {
+              action_type: 'RECIPE_REPLAY_COMPLETE',
+              headline: `Chain complete! ${chainResults.length} tasks done`,
+              primary_content: chainResults.map(r =>
+                `${r.order}. ${r.intent} (${r.domain}) — ${r.success ? 'Done' : 'Failed'}${r.recipeName ? ' via "' + r.recipeName + '"' : ''}`
+              ).join('\n'),
+              chain_results: chainResults,
+              consent_level: 'none',
+            },
+          };
+        }
+        // If chain failed partway, fall through to AI for the remaining request
+        console.log('[BG] Chain execution incomplete, falling through to AI');
+      }
+    } catch (chainErr) {
+      // Non-critical — fall through to normal AI flow
+      console.warn('[BG] Chain execution check failed (non-fatal):', chainErr.message);
     }
 
     // Send enriched payload to backend agent endpoint (dual-provider BYOK)
@@ -5872,6 +6473,7 @@ async function handleMessage(request, sender) {
       tabDomains: {},
       startedAt: Date.now(),
     };
+    learningPendingSwitch = null;
     if (tabUrl) {
       const domain = new URL(tabUrl).hostname.replace(/^www\./, '').toLowerCase();
       session.tabDomains[tabId] = domain;
@@ -6060,6 +6662,7 @@ async function handleMessage(request, sender) {
 
     // Clean up navigation listeners + keepAlive
     if (learningNavCleanup) { learningNavCleanup(); learningNavCleanup = null; }
+    learningPendingSwitch = null;
 
     const recipe = buildRecipeFromSession(learningSession);
     console.log('[Learning] Session stopped. Built recipe:', recipe.metadata.totalSteps, 'steps');
@@ -6082,6 +6685,7 @@ async function handleMessage(request, sender) {
   if (request.type === 'learning_session_cancel') {
     // Clean up navigation listeners + keepAlive
     if (learningNavCleanup) { learningNavCleanup(); learningNavCleanup = null; }
+    learningPendingSwitch = null;
 
     await chrome.storage.session.remove('learningSession');
     console.log('[Learning] Session cancelled');
@@ -6108,36 +6712,72 @@ async function handleMessage(request, sender) {
   // ── LEARNING MODE: Save recorded recipe to backend ──
   if (request.type === 'learning_save_recipe') {
     const { token } = await chrome.storage.local.get(['token']);
-    if (!token) return { success: false, error: 'Not authenticated.' };
+    if (!token) return { success: false, error: 'Not authenticated. Please sign in again.' };
+
+    // Pre-validate before sending to backend
+    const recipe = request.data;
+    if (!recipe || !Array.isArray(recipe.steps) || recipe.steps.length === 0) {
+      console.warn('[Learning] Save blocked: recipe has no steps after filtering.');
+      return { success: false, error: 'Recording produced no usable steps. Try recording a longer workflow with clicks and typing.' };
+    }
+    if (!recipe.workflowName || !recipe.siteDomain) {
+      return { success: false, error: 'Recipe is missing a name or site domain.' };
+    }
 
     try {
       const response = await fetch(`${API_BASE}/api/recipes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify(request.data),
+        body: JSON.stringify(recipe),
       });
-      const result = await response.json();
+
+      let result;
+      try {
+        result = await response.json();
+      } catch (parseErr) {
+        console.error('[Learning] Save recipe: non-JSON response, status:', response.status);
+        return { success: false, error: `Server error (HTTP ${response.status}). Backend may be down.` };
+      }
+
+      if (!response.ok) {
+        console.error('[Learning] Save recipe failed:', response.status, result?.error);
+        return { success: false, error: result?.error || `Server rejected recipe (HTTP ${response.status}).` };
+      }
+
       return result;
     } catch (err) {
       console.error('[Learning] Save recipe error:', err.message);
-      return { success: false, error: 'Failed to save recipe to server.' };
+      return { success: false, error: 'Failed to save recipe to server. Check your connection.' };
     }
   }
 
   // ── LEARNING MODE: Get user's recipes ──
   if (request.type === 'learning_get_recipes') {
     const { token } = await chrome.storage.local.get(['token']);
-    if (!token) return { success: false, error: 'Not authenticated.' };
+    if (!token) return { success: false, error: 'Not authenticated. Please sign in again.' };
 
     try {
       const response = await fetch(`${API_BASE}/api/recipes/mine`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      const result = await response.json();
+
+      let result;
+      try {
+        result = await response.json();
+      } catch (parseErr) {
+        console.error('[Learning] Get recipes: non-JSON response, status:', response.status);
+        return { success: false, error: `Server error (HTTP ${response.status}). Backend may be down.` };
+      }
+
+      if (!response.ok) {
+        console.error('[Learning] Get recipes failed:', response.status, result?.error);
+        return { success: false, error: result?.error || `Failed to fetch recipes (HTTP ${response.status}).` };
+      }
+
       return result;
     } catch (err) {
       console.error('[Learning] Get recipes error:', err.message);
-      return { success: false, error: 'Failed to fetch recipes.' };
+      return { success: false, error: 'Failed to fetch recipes. Check your connection.' };
     }
   }
 
@@ -6151,7 +6791,18 @@ async function handleMessage(request, sender) {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` },
       });
-      const result = await response.json();
+
+      let result;
+      try {
+        result = await response.json();
+      } catch {
+        return { success: false, error: `Server error (HTTP ${response.status}).` };
+      }
+
+      if (!response.ok) {
+        return { success: false, error: result?.error || `Delete failed (HTTP ${response.status}).` };
+      }
+
       return result;
     } catch (err) {
       console.error('[Learning] Delete recipe error:', err.message);
@@ -6183,48 +6834,26 @@ async function handleMessage(request, sender) {
       __task_context: taskContext || runtimeRecipe?.workflowName || '',
       __workflow_name: runtimeRecipe?.workflowName || '',
     };
+    const hasSwitchTab = runtimeRecipe.steps.some(s => s.action.type === 'switch_tab');
 
     try {
-      // Check if this is a multi-tab recipe (has switch_tab steps)
-      const hasSwitchTab = runtimeRecipe.steps.some(s => s.action.type === 'switch_tab');
+      await updateReplayActivity({
+        mode: hasSwitchTab ? 'multi_tab_replay' : 'recipe_replay',
+        workflowName: runtimeRecipe?.workflowName || '',
+        stepNumber: 0,
+        totalSteps: runtimeRecipe?.steps?.length || 0,
+        description: hasSwitchTab ? 'Preparing multi-tab action...' : 'Preparing action...',
+        phase: 'preparing',
+      });
 
       if (!hasSwitchTab) {
         // ── Single-tab replay ──
         let [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         if (!tab) return { success: false, error: 'No active tab for replay.' };
 
-        // Auto-navigate to startUrl if on the same domain but different page
-        if (runtimeRecipe.startUrl || runtimeRecipe.urlPattern) {
-          const startUrl = runtimeRecipe.startUrl || runtimeRecipe.urlPattern;
-          try {
-            const currentDomain = new URL(tab.url).hostname.replace(/^www\./, '').toLowerCase();
-            const startDomain = new URL(startUrl).hostname.replace(/^www\./, '').toLowerCase();
-            const currentPath = new URL(tab.url).pathname;
-            const startPath = new URL(startUrl).pathname;
-
-            if (currentDomain === startDomain && currentPath !== startPath) {
-              console.log('[Learning] Auto-navigating to recipe start page:', startUrl);
-              await chrome.tabs.update(tab.id, { url: startUrl });
-
-              // Wait for page to load
-              await new Promise((resolve) => {
-                const onLoad = (tabId, changeInfo) => {
-                  if (tabId === tab.id && changeInfo.status === 'complete') {
-                    chrome.tabs.onUpdated.removeListener(onLoad);
-                    resolve();
-                  }
-                };
-                chrome.tabs.onUpdated.addListener(onLoad);
-                setTimeout(() => { chrome.tabs.onUpdated.removeListener(onLoad); resolve(); }, 10000);
-              });
-
-              // Extra delay for SPA rendering
-              await new Promise(r => setTimeout(r, 1000));
-
-              // Refresh tab reference
-              [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-            }
-          } catch {}
+        const startResolution = await resolveReplayStartTab(runtimeRecipe, tab.id);
+        if (startResolution?.tabId) {
+          tab = await chrome.tabs.get(startResolution.tabId).catch(() => tab);
         }
 
         // Inject and run — if a navigate step triggers mid-replay, the content
@@ -6297,10 +6926,19 @@ async function handleMessage(request, sender) {
               totalSteps,
             };
           }
-          await new Promise(r => setTimeout(r, 200));
+          const replayReady = await waitForReplayReady(tab.id, 5000);
+          if (!replayReady) {
+            cleanupReplay();
+            return {
+              success: false,
+              error: 'Replay engine did not become ready on this page.',
+              completedSteps: completedSoFar,
+              totalSteps,
+            };
+          }
 
           // Send replay command — .catch() prevents hang if content script is dead/unresponsive
-          const result = await chrome.tabs.sendMessage(tab.id, {
+          let result = await chrome.tabs.sendMessage(tab.id, {
             type: 'replay_recipe',
             recipe: remainingRecipe,
             variables: runtimeVariables,
@@ -6308,6 +6946,27 @@ async function handleMessage(request, sender) {
             console.error('[Learning] sendMessage failed:', err.message);
             return null;
           });
+
+          if (!result && !replayNavDetected) {
+            try {
+              await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                func: () => { window.__enhReplayInjected = false; },
+              });
+              await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                files: ['content_replay.js'],
+              });
+            } catch {}
+
+            if (await waitForReplayReady(tab.id, 3000)) {
+              result = await chrome.tabs.sendMessage(tab.id, {
+                type: 'replay_recipe',
+                recipe: remainingRecipe,
+                variables: runtimeVariables,
+              }).catch(() => null);
+            }
+          }
 
           if (!result) {
             // Content script died — check if a click-triggered navigation caused it
@@ -6414,6 +7073,7 @@ async function handleMessage(request, sender) {
       let totalCompleted = 0;
       const totalSteps = runtimeRecipe.steps.length;
       const startTime = Date.now();
+      const initialStartTab = await resolveReplayStartTab(runtimeRecipe);
 
       // Navigation detection for multi-tab replay (same pattern as single-tab)
       let mtNavDetected = false;
@@ -6441,15 +7101,25 @@ async function handleMessage(request, sender) {
         clearInterval(mtKeepAlive);
       };
 
-      try {
+        try {
       for (let segIdx = 0; segIdx < segments.length; segIdx++) {
         const segment = segments[segIdx];
+
+        let targetTabId = null;
 
         // If this segment starts with a tab switch, handle it
         if (segment.switchTo) {
           console.log('[Learning] Switching to:', segment.switchTo.domain);
+          await updateReplayActivity({
+            mode: 'multi_tab_replay',
+            workflowName: runtimeRecipe?.workflowName || '',
+            stepNumber: Math.min(totalCompleted + 1, totalSteps),
+            totalSteps,
+            description: `Switching to ${segment.switchTo.domain}...`,
+            phase: 'switching_tab',
+          });
 
-          const targetTabId = await findTabByDomain(
+          targetTabId = await findTabByDomain(
             segment.switchTo.domain,
             segment.switchTo.url
           );
@@ -6471,10 +7141,23 @@ async function handleMessage(request, sender) {
 
           // Count the switch_tab step itself as completed (it's included in totalSteps now)
           totalCompleted += 1;
+        } else if (segIdx === 0 && initialStartTab?.tabId) {
+          targetTabId = initialStartTab.tabId;
+          await chrome.tabs.update(targetTabId, { active: true });
+          const startTab = await chrome.tabs.get(targetTabId).catch(() => null);
+          if (startTab?.windowId) {
+            await chrome.windows.update(startTab.windowId, { focused: true }).catch(() => {});
+          }
         }
 
-        // Get the current active tab (should be the right one after switch)
-        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        // Get the current active tab (should be the right one after switch/start resolution)
+        let activeTab = null;
+        if (targetTabId) {
+          activeTab = await chrome.tabs.get(targetTabId).catch(() => null);
+        }
+        if (!activeTab) {
+          [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        }
         if (!activeTab) {
           cleanupMultiTab();
           return {
@@ -6488,6 +7171,14 @@ async function handleMessage(request, sender) {
 
         mtCurrentTabId = activeTab.id;
         mtNavDetected = false;
+        await updateReplayActivity({
+          mode: 'multi_tab_replay',
+          workflowName: runtimeRecipe?.workflowName || '',
+          stepNumber: Math.min(totalCompleted + 1, totalSteps),
+          totalSteps,
+          description: `Working in ${segment.switchTo?.domain || new URL(activeTab.url || runtimeRecipe.startUrl || 'https://example.com').hostname}...`,
+          phase: 'running_segment',
+        });
 
         // Inject replay engine into this tab
         try {
@@ -6509,13 +7200,23 @@ async function handleMessage(request, sender) {
             durationMs: Date.now() - startTime,
           };
         }
-        await new Promise(r => setTimeout(r, 200));
+        const segmentReady = await waitForReplayReady(activeTab.id, 5000);
+        if (!segmentReady) {
+          cleanupMultiTab();
+          return {
+            success: false,
+            failedAtStep: totalCompleted + 1,
+            failReason: 'Replay engine did not become ready on the target tab.',
+            results: allResults,
+            durationMs: Date.now() - startTime,
+          };
+        }
 
         // Tag each step with total steps count for progress reporting
         const stepsWithTotal = segment.steps.map(s => ({ ...s, _totalSteps: totalSteps }));
 
         // Send this segment's steps to the content script
-        const segResult = await chrome.tabs.sendMessage(activeTab.id, {
+        let segResult = await chrome.tabs.sendMessage(activeTab.id, {
           type: 'replay_steps',
           steps: stepsWithTotal,
           variables: runtimeVariables,
@@ -6523,6 +7224,27 @@ async function handleMessage(request, sender) {
           console.error('[Learning] sendMessage to segment failed:', err.message);
           return null;
         });
+
+        if (!segResult && !mtNavDetected) {
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId: activeTab.id },
+              func: () => { window.__enhReplayInjected = false; },
+            });
+            await chrome.scripting.executeScript({
+              target: { tabId: activeTab.id },
+              files: ['content_replay.js'],
+            });
+          } catch {}
+
+          if (await waitForReplayReady(activeTab.id, 3000)) {
+            segResult = await chrome.tabs.sendMessage(activeTab.id, {
+              type: 'replay_steps',
+              steps: stepsWithTotal,
+              variables: runtimeVariables,
+            }).catch(() => null);
+          }
+        }
 
         if (!segResult) {
           // Content script died — check if navigation caused it
@@ -6576,6 +7298,8 @@ async function handleMessage(request, sender) {
     } catch (err) {
       console.error('[Learning] Replay error:', err.message);
       return { success: false, error: err.message };
+    } finally {
+      await clearReplayActivity('done');
     }
   }
 
@@ -6712,6 +7436,11 @@ async function handleMessage(request, sender) {
   // ── LEARNING MODE: Forward replay progress to side panel ──
   if (request.type === 'replay_progress') {
     try {
+      await updateReplayActivity({
+        mode: 'recipe_replay',
+        ...(request.data || {}),
+        phase: request.data?.isLlmStep ? 'generating' : 'running_step',
+      });
       await chrome.runtime.sendMessage({
         type: 'replay_progress',
         data: request.data,
@@ -6917,7 +7646,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
     }
 
     // Skip non-injectable pages
-    const newUrl = newTab.url || '';
+    const newUrl = getLearningTabUrl(newTab);
     if (!newUrl || newUrl.startsWith('chrome://') || newUrl.startsWith('chrome-extension://') || newUrl.startsWith('about:')) {
       console.log('[Learning] Tab switch to non-injectable page, ignoring:', newUrl);
       return;
@@ -6986,6 +7715,30 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
 });
 
 // Detect tab closure during recording — note it but don't crash
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  try {
+    const { learningSession } = await chrome.storage.session.get('learningSession');
+    if (!learningSession?.active) return;
+
+    const candidateUrl = changeInfo.url || getLearningTabUrl(tab);
+    if (!isInjectableLearningUrl(candidateUrl)) return;
+
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!activeTab?.id || activeTab.id !== tabId) return;
+    if (tabId === learningSession.activeTabId) return;
+
+    await finalizeLearningTabSwitch(
+      learningSession,
+      learningSession.activeTabId,
+      tabId,
+      candidateUrl,
+      'tabs.onUpdated-active'
+    );
+  } catch (err) {
+    console.error('[Learning] Active tab update handler error:', err.message);
+  }
+});
+
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   try {
     const { learningSession } = await chrome.storage.session.get('learningSession');

@@ -1194,6 +1194,11 @@
   // ── Message Listener ──────────────────────────────────────────
 
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.type === 'ping_replay') {
+      sendResponse({ alive: true });
+      return false;
+    }
+
     if (request.type === 'replay_recipe') {
       const { recipe, variables } = request;
 
