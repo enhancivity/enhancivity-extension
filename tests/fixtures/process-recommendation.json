@@ -1,0 +1,7 @@
+{
+  "action_type": "RECOMMENDATION",
+  "headline": "Here's what I found",
+  "rationale": "Based on your browsing context, this is the most relevant answer.",
+  "primary_content": "This is a test recommendation response from the mock server. The AI analyzed your request and determined the best course of action.",
+  "consent_level": "auto"
+}

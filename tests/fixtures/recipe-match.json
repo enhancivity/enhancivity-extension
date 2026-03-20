@@ -1,0 +1,47 @@
+{
+  "success": true,
+  "found": true,
+  "recipe": {
+    "id": "recipe-test-001",
+    "workflowName": "Fill test form",
+    "siteDomain": "localhost",
+    "stepCount": 3,
+    "confidence": 0.95,
+    "validationCount": 5,
+    "contributorCount": 1,
+    "status": "VALIDATED",
+    "averageDuration": 3500,
+    "startUrl": "http://localhost:3099/harness/form-page.html",
+    "steps": [
+      {
+        "type": "click",
+        "selectors": [
+          { "strategy": "css-id", "value": "#first-name" },
+          { "strategy": "placeholder", "value": "First Name" },
+          { "strategy": "data-enh-sid", "value": "s1" }
+        ],
+        "description": "Click the First Name field"
+      },
+      {
+        "type": "type",
+        "selectors": [
+          { "strategy": "css-id", "value": "#first-name" },
+          { "strategy": "placeholder", "value": "First Name" },
+          { "strategy": "data-enh-sid", "value": "s1" }
+        ],
+        "value": "{{name}}",
+        "description": "Type the name"
+      },
+      {
+        "type": "click",
+        "selectors": [
+          { "strategy": "css-id", "value": "#submit-btn" },
+          { "strategy": "text-content", "value": "Submit" },
+          { "strategy": "data-enh-sid", "value": "s5" }
+        ],
+        "description": "Click Submit"
+      }
+    ],
+    "variables": ["name"]
+  }
+}

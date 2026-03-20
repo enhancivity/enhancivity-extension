@@ -31,7 +31,7 @@
 
   // ── Constants ────────────────────────────────────────────────
 
-  const PIPELINE_TIMEOUT_MS = 30000;
+  const PIPELINE_TIMEOUT_MS = 90000;
 
   const PLACEHOLDERS = {
     gmail:   'Analyze this email...',
@@ -2973,6 +2973,23 @@
 
       sendResponse({ ok: true });
       return true;
+    }
+
+    // ── ONE-INCH RULE: Notify user when replay pauses at a consequential action ──
+    if (message.type === 'replay_consent_notify') {
+      const actionName = message.data?.action || 'Action';
+      console.log(`[Panel] Replay paused at consequential action: "${actionName}"`);
+      // Show a brief notification in the results area
+      const resultArea = panel?.querySelector('.enh-results');
+      if (resultArea) {
+        const notice = document.createElement('div');
+        notice.className = 'enh-result-card';
+        notice.style.cssText = 'border-left: 3px solid #f59e0b; padding: 8px 12px; margin: 6px 0; font-size: 13px; color: #f59e0b;';
+        notice.textContent = `Replay paused — click the highlighted "${actionName}" button on the page.`;
+        resultArea.appendChild(notice);
+        notice.scrollIntoView({ behavior: 'smooth' });
+      }
+      return;
     }
   };
   chrome.runtime.onMessage.addListener(window.__enhPanelMessageListener);

@@ -474,7 +474,7 @@
   // Default 30s — pages can take 10-20s to load after SPA transitions.
   // Polls every 500ms (first 5s) then every 800ms (remaining time) to avoid CPU thrash.
 
-  async function waitForElement(selectors, timeoutMs = 25000, description, semanticContext) {
+  async function waitForElement(selectors, timeoutMs = 12000, description, semanticContext) {
     const startTime = Date.now();
     let attempts = 0;
     while (Date.now() - startTime < timeoutMs) {
@@ -514,7 +514,7 @@
     try {
       const nextFound = await waitForElement(
         action.nextStepSelectors,
-        12000,
+        5000,
         action.nextStepDescription,
         action.nextStepSemanticContext
       );
@@ -526,11 +526,216 @@
     }
   }
 
+  // Consequential action patterns — clicking these requires user consent (ONE-INCH RULE).
+  // The replay pauses BEFORE clicking these, highlights the button, and waits for user action.
+  const CONSEQUENTIAL_CLICK_PATTERNS = /\b(send|submit|purchase|buy\s*now|place\s*order|confirm\s*order|pay\s*now|checkout|delete|remove|unsubscribe|cancel\s*subscription|sign\s*out|log\s*out)\b/i;
+  const CONSEQUENTIAL_ARIA_PATTERNS = /\b(send|submit|purchase|buy|place.order|pay|delete|remove)\b/i;
+
+  // Category-specific keywords for timeout assignment
+  const PURCHASE_KEYWORDS = /\b(buy|purchase|place\s*order|confirm\s*order|checkout)\b/i;
+  const PAYMENT_KEYWORDS = /\b(pay|confirm\s*payment|authorize|transfer|wire)\b/i;
+  const SEND_KEYWORDS = /\b(send|reply|forward|post|publish|tweet|share)\b/i;
+  const DELETE_KEYWORDS = /\b(delete|remove|unsubscribe|cancel\s*subscription|close\s*account|deactivate)\b/i;
+
+  function classifyConsequentialCategory(hints) {
+    if (PURCHASE_KEYWORDS.test(hints)) return 'purchase';
+    if (PAYMENT_KEYWORDS.test(hints)) return 'payment';
+    if (DELETE_KEYWORDS.test(hints)) return 'delete';
+    if (SEND_KEYWORDS.test(hints)) return 'send';
+    return 'confirm';
+  }
+
+  function getTimeoutForCategory(category) {
+    switch (category) {
+      case 'purchase': return 0;     // No auto-timeout for purchases — wait indefinitely
+      case 'payment':  return 0;     // No auto-timeout for payments
+      case 'delete':   return 20000; // 20 seconds for destructive actions
+      case 'send':     return 15000; // 15 seconds for send buttons
+      default:         return 15000;
+    }
+  }
+
+  function getCriticalMessage(category, actionName) {
+    switch (category) {
+      case 'purchase': return `Ready to purchase — click "${actionName}" when you want to buy`;
+      case 'payment':  return `Payment ready — click "${actionName}" to confirm`;
+      case 'send':     return `Message ready — click "${actionName}" when you want to send`;
+      case 'delete':   return `Ready to delete — click "${actionName}" to confirm`;
+      default:         return `Action ready — click "${actionName}" to confirm`;
+    }
+  }
+
+  function isConsequentialClick(action, element) {
+    // Check action description and semantic context
+    const hints = [
+      action.description,
+      action.semanticContext?.label,
+      action.semanticContext?.ariaLabel,
+      action.semanticContext?.text,
+      action.semanticContext?.placeholder,
+    ].filter(Boolean).join(' ');
+
+    if (CONSEQUENTIAL_CLICK_PATTERNS.test(hints)) return true;
+
+    // Check the actual element's visible text and ARIA attributes
+    if (element) {
+      const elText = (element.textContent || '').trim().slice(0, 50);
+      const elAriaLabel = element.getAttribute('aria-label') || '';
+      const elType = (element.getAttribute('type') || '').toLowerCase();
+
+      if (CONSEQUENTIAL_CLICK_PATTERNS.test(elText)) return true;
+      if (CONSEQUENTIAL_ARIA_PATTERNS.test(elAriaLabel)) return true;
+      if (elType === 'submit' && CONSEQUENTIAL_CLICK_PATTERNS.test(elText + ' ' + elAriaLabel)) return true;
+
+      // Gmail-specific: Send button detection
+      if (element.closest('[role="button"]')?.getAttribute('aria-label')?.toLowerCase().includes('send')) return true;
+      if (element.closest('[data-tooltip]')?.getAttribute('data-tooltip')?.toLowerCase().includes('send')) return true;
+    }
+
+    return false;
+  }
+
+  // Wait for user to click the consequential element, skip, or timeout
+  function waitForHumanDecision(element, category, timeoutMs) {
+    return new Promise((resolve) => {
+      let resolved = false;
+      let timeoutId = null;
+      let countdownInterval = null;
+
+      const actionName = (element.textContent || '').trim().slice(0, 30) || 'Action';
+      const message = getCriticalMessage(category, actionName);
+
+      // ── Create overlay banner ──
+      const overlay = document.createElement('div');
+      overlay.id = 'enhancivity-critical-overlay';
+      overlay.style.cssText = `
+        position: fixed; top: 0; left: 0; right: 0; z-index: 2147483647;
+        background: rgba(18, 18, 24, 0.95); backdrop-filter: blur(12px);
+        border-bottom: 2px solid #f59e0b;
+        padding: 12px 20px; display: flex; align-items: center; justify-content: center; gap: 16px;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+        font-size: 14px; color: #fff;
+      `;
+
+      const msgSpan = document.createElement('span');
+      msgSpan.textContent = message;
+      overlay.appendChild(msgSpan);
+
+      // Countdown display (only if timeout > 0)
+      const countdownSpan = document.createElement('span');
+      countdownSpan.style.cssText = 'color: #f59e0b; font-weight: 600; min-width: 30px;';
+      if (timeoutMs > 0) {
+        let remaining = Math.ceil(timeoutMs / 1000);
+        countdownSpan.textContent = `${remaining}s`;
+        overlay.appendChild(countdownSpan);
+        countdownInterval = setInterval(() => {
+          remaining--;
+          countdownSpan.textContent = remaining > 0 ? `${remaining}s` : '';
+        }, 1000);
+      }
+
+      // Skip button
+      const skipBtn = document.createElement('button');
+      skipBtn.textContent = 'Skip';
+      skipBtn.style.cssText = `
+        padding: 6px 16px; background: rgba(255,255,255,0.15);
+        border: 1px solid rgba(255,255,255,0.3); border-radius: 6px;
+        color: #fff; cursor: pointer; font-size: 13px; font-weight: 500;
+      `;
+      skipBtn.addEventListener('mouseenter', () => { skipBtn.style.background = 'rgba(255,255,255,0.25)'; });
+      skipBtn.addEventListener('mouseleave', () => { skipBtn.style.background = 'rgba(255,255,255,0.15)'; });
+      overlay.appendChild(skipBtn);
+
+      document.body.appendChild(overlay);
+
+      // ── Pulsing highlight on the target element ──
+      element.style.outline = '3px solid #f59e0b';
+      element.style.boxShadow = '0 0 12px rgba(245, 158, 11, 0.5)';
+      element.style.animation = 'enh-consent-pulse 1.5s ease-in-out infinite';
+      const pulseStyle = document.createElement('style');
+      pulseStyle.id = 'enh-consent-pulse-style';
+      pulseStyle.textContent = `@keyframes enh-consent-pulse { 0%,100% { outline-color: #f59e0b; } 50% { outline-color: #ef4444; } }`;
+      document.head.appendChild(pulseStyle);
+
+      function cleanup() {
+        if (resolved) return;
+        resolved = true;
+        if (timeoutId) clearTimeout(timeoutId);
+        if (countdownInterval) clearInterval(countdownInterval);
+        overlay.remove();
+        pulseStyle.remove();
+        element.style.outline = '';
+        element.style.boxShadow = '';
+        element.style.animation = '';
+      }
+
+      // ── User clicks the consequential element ──
+      element.addEventListener('click', function handler() {
+        element.removeEventListener('click', handler);
+        cleanup();
+        resolve({ action: 'clicked' });
+      }, { once: true });
+
+      // ── User clicks Skip ──
+      skipBtn.addEventListener('click', () => {
+        cleanup();
+        resolve({ action: 'skipped' });
+      });
+
+      // ── Timeout (only if > 0; purchases/payments wait indefinitely) ──
+      if (timeoutMs > 0) {
+        timeoutId = setTimeout(() => {
+          cleanup();
+          resolve({ action: 'timeout' });
+        }, timeoutMs);
+      }
+    });
+  }
+
   async function executeClick(action) {
-    const found = await waitForElement(action.selectors, 25000, action.description, action.semanticContext);
+    const found = await waitForElement(action.selectors, 12000, action.description, action.semanticContext);
     if (!found) return { success: false, error: `Element not found for click: "${action.description || 'unknown'}"` };
 
     const el = found.element;
+
+    // ONE-INCH RULE: Pause before consequential actions (Send, Buy, Delete, Submit)
+    // The agent does 99% of the work, the user clicks the final action button.
+    if (isConsequentialClick(action, el)) {
+      const hints = [action.description, action.semanticContext?.label, (el.textContent || '').trim().slice(0, 50)].filter(Boolean).join(' ');
+      const category = classifyConsequentialCategory(hints);
+      const timeoutMs = getTimeoutForCategory(category);
+      const actionName = action.description || action.semanticContext?.label || 'Action';
+
+      console.log(`[Enhancivity Replay] CONSEQUENTIAL ACTION: "${actionName}" (${category}, timeout: ${timeoutMs || 'none'}). Waiting for user...`);
+
+      // Scroll the element into view
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+      // Notify the side panel / floating panel
+      try {
+        chrome.runtime.sendMessage({
+          type: 'replay_consent_required',
+          data: { action: actionName, category, reason: getCriticalMessage(category, actionName) },
+        });
+      } catch {}
+
+      // Wait for user to click, skip, or timeout
+      const decision = await waitForHumanDecision(el, category, timeoutMs);
+
+      if (decision.action === 'clicked') {
+        console.log(`[Enhancivity Replay] User clicked "${actionName}" — action confirmed.`);
+        return { success: true, humanConfirmed: true, note: `User clicked "${actionName}".` };
+      } else {
+        const reason = decision.action === 'skipped' ? 'User skipped' : 'Timed out';
+        console.log(`[Enhancivity Replay] ${reason} for "${actionName}".`);
+        return {
+          success: true,
+          skippedConsequential: true,
+          note: `${reason} — "${actionName}" not clicked.`,
+        };
+      }
+    }
+
     const clickHint = `${action.description || ''} ${action.semanticContext?.label || ''}`.toLowerCase();
     const isGmailComposeClick = window.location.hostname.includes('mail.google.com') &&
       (found.usedStrategy === 'gmail-compose' || clickHint.includes('compose'));
@@ -617,13 +822,19 @@
   }
 
   async function executeType(action, variables) {
-    const found = await waitForElement(action.selectors, 25000, action.description, action.semanticContext);
+    const found = await waitForElement(action.selectors, 12000, action.description, action.semanticContext);
     if (!found) return { success: false, error: `Element not found for type: "${action.description || 'unknown'}"` };
 
     const el = found.element;
-    const value = action.inputType === 'variable'
+    let value = action.inputType === 'variable'
       ? (variables[action.variableName] || '')
       : (action.fixedValue || '');
+
+    // Fallback: if variable is empty but we have the original recorded value, use it
+    if (!value && action.originalFixedValue) {
+      console.log(`[Enhancivity Replay] Variable "${action.variableName}" empty, falling back to original: "${action.originalFixedValue}"`);
+      value = action.originalFixedValue;
+    }
 
     if (!value) return { success: true, usedStrategy: found.usedStrategy, note: 'Empty value — skipped' };
 
@@ -767,7 +978,7 @@
 
   async function executeLlmFill(action, variables) {
     // Find the target input element
-    const found = await waitForElement(action.selectors, 25000, action.description, action.semanticContext);
+    const found = await waitForElement(action.selectors, 12000, action.description, action.semanticContext);
     if (!found) return { success: false, error: `Element not found for AI fill: "${action.description || 'unknown'}"` };
 
     const el = found.element;
@@ -944,6 +1155,53 @@
     };
   }
 
+  // ── Safety: detect if we've accidentally navigated to a login/auth page ──
+  function isOnAuthPage() {
+    const url = window.location.href.toLowerCase();
+    const path = window.location.pathname.toLowerCase();
+    const AUTH_PATTERNS = [
+      /\/signin\b/, /\/sign-in\b/, /\/login\b/, /\/log-in\b/,
+      /\/register\b/, /\/signup\b/, /\/sign-up\b/, /\/createaccount\b/,
+      /\/ap\/signin/, /\/ap\/register/, // Amazon-specific
+      /\/auth\//, /\/oauth\//, /\/sso\//,
+      /\/accounts\/login/, /\/accounts\/signup/,
+    ];
+    if (AUTH_PATTERNS.some(p => p.test(url) || p.test(path))) return true;
+
+    // Also check page content for sign-in forms
+    const hasPasswordField = document.querySelector('input[type="password"]');
+    const title = (document.title || '').toLowerCase();
+    if (hasPasswordField && (/sign in|log in|create account|register/i.test(title))) return true;
+
+    return false;
+  }
+
+  // ── Safety: detect if current domain matches the recipe's expected domain ──
+  function isDomainMismatch(recipe) {
+    if (!recipe?.siteDomain) return false;
+    const currentHost = window.location.hostname.toLowerCase().replace(/^www\./, '');
+    const expectedDomain = recipe.siteDomain.toLowerCase().replace(/^www\./, '');
+
+    // Exact match
+    if (currentHost === expectedDomain) return false;
+
+    // Domain family match (amazon.de vs amazon.com)
+    const currentRoot = currentHost.split('.').slice(-2).join('.');
+    const expectedRoot = expectedDomain.split('.').slice(-2).join('.');
+    const currentBase = currentHost.split('.')[0];
+    const expectedBase = expectedDomain.split('.')[0];
+
+    // Same base domain (amazon.de ↔ amazon.com, mail.google.com ↔ gmail.com)
+    if (currentBase === expectedBase) return false;
+    if (currentRoot === expectedRoot) return false;
+
+    // Special cases: mail.google.com ↔ gmail
+    if ((currentHost.includes('google.com') && expectedDomain.includes('google.com')) ||
+        (currentHost.includes('google.com') && expectedDomain.includes('gmail'))) return false;
+
+    return true;
+  }
+
   async function replayRecipe(recipe, variables) {
     const results = [];
     const startTime = Date.now();
@@ -951,6 +1209,31 @@
     console.log('[Enhancivity Replay] Starting recipe:', recipe.workflowName, '— steps:', recipe.steps.length);
 
     for (let i = 0; i < recipe.steps.length; i++) {
+      // Safety check: stop if we've navigated to a login/auth page
+      if (i > 0 && isOnAuthPage()) {
+        console.warn('[Enhancivity Replay] STOPPED: navigated to auth/login page. Recipe replay aborted to prevent unintended actions.');
+        return {
+          success: false,
+          failedAtStep: i + 1,
+          failReason: 'Navigated to login/authentication page — replay stopped for safety.',
+          results,
+          durationMs: Date.now() - startTime,
+        };
+      }
+
+      // Safety check: stop if we've drifted to a completely different domain
+      if (i > 0 && isDomainMismatch(recipe)) {
+        const currentHost = window.location.hostname;
+        console.warn(`[Enhancivity Replay] STOPPED: domain mismatch. Expected "${recipe.siteDomain}", on "${currentHost}". Recipe replay aborted.`);
+        return {
+          success: false,
+          failedAtStep: i + 1,
+          failReason: `Domain mismatch: expected "${recipe.siteDomain}" but on "${currentHost}".`,
+          results,
+          durationMs: Date.now() - startTime,
+        };
+      }
+
       const step = recipe.steps[i];
       const action = withReplayContext(
         step.action,
@@ -976,11 +1259,11 @@
       // Per-step timeout: dynamic by action type.
       // Prevents any single step from hanging the entire replay.
       const stepTimeoutMs =
-        action.type === 'llm_fill' ? 180000 :
-        action.type === 'click' ? 45000 :
-        action.type === 'type' ? 45000 :
-        action.type === 'wait' ? Math.max(30000, action.timeout || 0) :
-        35000;
+        action.type === 'llm_fill' ? 120000 :
+        action.type === 'click' ? 20000 :
+        action.type === 'type' ? 20000 :
+        action.type === 'wait' ? Math.max(15000, action.timeout || 0) :
+        15000;
 
       try {
         const stepPromise = (async () => {
@@ -1050,6 +1333,22 @@
 
       console.log(`[Enhancivity Replay] Step ${i + 1} OK (${result.usedStrategy || 'n/a'})`);
 
+      // ONE-INCH RULE: If this step was a consequential action that was skipped,
+      // stop the replay immediately. The user must click the highlighted button manually.
+      if (result.skippedConsequential) {
+        console.log(`[Enhancivity Replay] Stopping at consequential action (step ${i + 1}). User must confirm.`);
+        return {
+          success: true,
+          partial: false,
+          skippedConsequential: true,
+          consequentialStep: action.description || 'Final action',
+          completedSteps: i + 1,
+          totalSteps: recipe.steps.length,
+          results,
+          durationMs: Date.now() - startTime,
+        };
+      }
+
       // Human-like delay between steps (200-600ms)
       if (i < recipe.steps.length - 1) {
         await delay(200 + Math.random() * 400);
@@ -1083,6 +1382,18 @@
     console.log('[Enhancivity Replay] Starting segment replay:', steps.length, 'steps');
 
     for (let i = 0; i < steps.length; i++) {
+      // Safety check: stop if we've navigated to a login/auth page
+      if (i > 0 && isOnAuthPage()) {
+        console.warn('[Enhancivity Replay] STOPPED: navigated to auth/login page during segment replay.');
+        return {
+          success: false,
+          failedAtStep: steps[i]?.stepNumber || i + 1,
+          failReason: 'Navigated to login/authentication page — replay stopped for safety.',
+          results,
+          durationMs: Date.now() - startTime,
+        };
+      }
+
       const step = steps[i];
       const action = withReplayContext(
         step.action,
@@ -1106,11 +1417,11 @@
 
       // Per-step timeout: dynamic by action type.
       const stepTimeoutMs =
-        action.type === 'llm_fill' ? 180000 :
-        action.type === 'click' ? 45000 :
-        action.type === 'type' ? 45000 :
-        action.type === 'wait' ? Math.max(30000, action.timeout || 0) :
-        35000;
+        action.type === 'llm_fill' ? 120000 :
+        action.type === 'click' ? 20000 :
+        action.type === 'type' ? 20000 :
+        action.type === 'wait' ? Math.max(15000, action.timeout || 0) :
+        15000;
 
       try {
         const stepPromise = (async () => {
@@ -1176,6 +1487,21 @@
 
       console.log(`[Enhancivity Replay] Step ${step.stepNumber} OK (${result.usedStrategy || 'n/a'})`);
 
+      // ONE-INCH RULE: Stop at consequential actions — user must confirm manually
+      if (result.skippedConsequential) {
+        console.log(`[Enhancivity Replay] Stopping at consequential action (step ${step.stepNumber}). User must confirm.`);
+        return {
+          success: true,
+          partial: false,
+          skippedConsequential: true,
+          consequentialStep: action.description || 'Final action',
+          completedSteps: i + 1,
+          totalSteps: steps.length,
+          results,
+          durationMs: Date.now() - startTime,
+        };
+      }
+
       if (i < steps.length - 1) {
         await delay(200 + Math.random() * 400);
       }
@@ -1221,6 +1547,18 @@
       });
 
       return true; // Async response
+    }
+
+    // ── Probe: check if an element exists on the current page (no execution) ──
+    if (request.type === 'replay_probe') {
+      const { selectors, description, semanticContext } = request;
+      if (!selectors?.length) {
+        sendResponse({ found: false });
+        return false;
+      }
+      const result = findElement(selectors, description, semanticContext);
+      sendResponse({ found: !!result });
+      return false; // Synchronous response
     }
   });
 

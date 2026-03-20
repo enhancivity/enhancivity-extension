@@ -9,7 +9,7 @@
 
 // ── Constants ────────────────────────────────────────────────
 
-const PIPELINE_TIMEOUT_MS = 30000;
+const PIPELINE_TIMEOUT_MS = 90000;
 
 const PLACEHOLDERS = {
   gmail:   'Analyze this email...',
@@ -2598,20 +2598,18 @@ function setupLearningMode() {
       const tab = await getActiveTab();
       if (!tab) { showLearningError('No active tab found. Open a website first.'); startBtn.disabled = false; startBtn.textContent = 'Start Recording'; return; }
 
-      // Block chrome:// and extension pages (can't inject content scripts)
+      // Detect if this is a non-injectable page (chrome://, extension://, about:, empty)
       const tabUrl = tab.url || '';
-      if (tabUrl.startsWith('chrome://') || tabUrl.startsWith('chrome-extension://') || tabUrl.startsWith('about:') || tabUrl === '') {
-        showLearningError('Cannot record on this page. Navigate to a website first (e.g., gmail.com, amazon.com).');
-        startBtn.disabled = false;
-        startBtn.textContent = 'Start Recording';
-        return;
-      }
+      const isNonInjectablePage = tabUrl.startsWith('chrome://') || tabUrl.startsWith('chrome-extension://') || tabUrl.startsWith('about:') || tabUrl === '';
 
       // Step 1: Initialize centralized session in background.js
+      // Recording can start on ANY page — including empty tabs and chrome://newtab.
+      // The webNavigation listener in background.js will capture the first navigation
+      // and inject content_learning.js when the user navigates to a real website.
       const sessionRes = await sendToBackground('learning_session_start', {
         workflowName: name,
         tabId: tab.id,
-        tabUrl: tab.url,
+        tabUrl: isNonInjectablePage ? '' : tab.url, // empty string signals "started from non-injectable page"
       });
       if (!sessionRes?.success) {
         showLearningError('Failed to initialize recording session.');
@@ -2620,34 +2618,38 @@ function setupLearningMode() {
         return;
       }
 
-      // Step 2: Inject content_learning.js into the active tab
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ['content_learning.js'],
-      });
+      if (!isNonInjectablePage) {
+        // Step 2: Inject content_learning.js into the active tab (normal page)
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['content_learning.js'],
+        });
 
-      // Small delay for script injection
-      await new Promise(r => setTimeout(r, 300));
+        // Small delay for script injection
+        await new Promise(r => setTimeout(r, 300));
 
-      // Step 3: Tell content script to start recording
-      let res;
-      try {
-        res = await chrome.tabs.sendMessage(tab.id, { type: 'learning_start' });
-      } catch (msgErr) {
-        showLearningError('Could not connect to the page. Try refreshing the tab and clicking Start again.');
-        await sendToBackground('learning_session_cancel', {});
-        startBtn.disabled = false;
-        startBtn.textContent = 'Start Recording';
-        return;
+        // Step 3: Tell content script to start recording
+        let res;
+        try {
+          res = await chrome.tabs.sendMessage(tab.id, { type: 'learning_start' });
+        } catch (msgErr) {
+          showLearningError('Could not connect to the page. Try refreshing the tab and clicking Start again.');
+          await sendToBackground('learning_session_cancel', {});
+          startBtn.disabled = false;
+          startBtn.textContent = 'Start Recording';
+          return;
+        }
+
+        if (!res?.success) {
+          showLearningError('Failed to start recording. Try refreshing the tab.');
+          await sendToBackground('learning_session_cancel', {});
+          startBtn.disabled = false;
+          startBtn.textContent = 'Start Recording';
+          return;
+        }
       }
-
-      if (!res?.success) {
-        showLearningError('Failed to start recording. Try refreshing the tab.');
-        await sendToBackground('learning_session_cancel', {});
-        startBtn.disabled = false;
-        startBtn.textContent = 'Start Recording';
-        return;
-      }
+      // If non-injectable page: skip injection. The recording overlay will appear
+      // when the user navigates to a real website (background.js re-injects on navigation).
 
       learningState.recording = true;
       learningState.active = true;
@@ -2661,11 +2663,17 @@ function setupLearningMode() {
       $('#learning-replay').classList.add('hidden');
       $('#learning-recording-name').textContent = `Teaching: "${name}"`;
 
+      // If recording started from empty/chrome tab, show guidance message
+      if (isNonInjectablePage) {
+        const stepStatus = $('#learning-step-status');
+        if (stepStatus) stepStatus.textContent = 'Navigate to any website to begin recording';
+      }
+
       // Start polling background.js for step count
       startLearningPoll();
     } catch (err) {
       console.error('[Learning] Start recording error:', err);
-      showLearningError(`Failed to start: ${err.message}. Make sure you're on a regular website.`);
+      showLearningError(`Failed to start: ${err.message}`);
     }
 
     startBtn.disabled = false;
@@ -2810,6 +2818,15 @@ function setupLearningMode() {
       const bar = $('#learning-replay-progress-bar');
       if (label) label.textContent = `Step ${stepNumber}/${totalSteps}: ${description || ''}`;
       if (bar) bar.style.width = `${Math.round((stepNumber / totalSteps) * 100)}%`;
+    }
+
+    // ONE-INCH RULE: Notify user when replay pauses at a consequential action
+    if (msg.type === 'replay_consent_notify') {
+      const label = $('#learning-replay-step-label');
+      if (label) {
+        label.textContent = `Paused: "${msg.data?.action || 'Action'}" requires your click`;
+        label.style.color = '#f59e0b';
+      }
     }
   });
 }

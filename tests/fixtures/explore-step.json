@@ -1,0 +1,14 @@
+{
+  "nextAction": {
+    "type": "scrape_page",
+    "target": null,
+    "description": "Final scan to confirm all data has been collected"
+  },
+  "reasoning": "All necessary data has been gathered from the page. Completing exploration.",
+  "revisedStrategy": null,
+  "isGoalComplete": true,
+  "goalResult": "Successfully extracted the requested information from the test page. Found 5 items matching your criteria.",
+  "extractedData": "Item 1: Product A ($29.99)\nItem 2: Product B ($39.99)\nItem 3: Product C ($19.99)",
+  "needsConsent": false,
+  "consentReason": null
+}

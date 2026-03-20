@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "token": "PLACEHOLDER_GENERATED_AT_RUNTIME",
+  "user": {
+    "id": "test-user-001",
+    "email": "test@enhancivity.com",
+    "name": "Test User",
+    "accountType": "EMAIL",
+    "isVerified": true
+  }
+}

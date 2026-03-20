@@ -1611,7 +1611,7 @@ function renderComparison(container, data) {
 
 // ── Defensive Pipeline: typed errors + timeout ───────────────
 
-const PIPELINE_TIMEOUT_MS = 30000; // 30 seconds
+const PIPELINE_TIMEOUT_MS = 90000; // 90 seconds
 
 function sendToBackground(type, data, timeoutMs = PIPELINE_TIMEOUT_MS) {
   return new Promise((resolve) => {

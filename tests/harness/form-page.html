@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Test Form Page — Enhancivity Harness</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #6366f1; font-size: 20px; }
+    label { display: block; margin-top: 16px; font-size: 13px; color: #a5b4fc; }
+    input, textarea, select { display: block; width: 100%; padding: 10px; margin-top: 4px; border: 1px solid #333; border-radius: 6px; background: #12121a; color: #e0e0e0; font-size: 14px; box-sizing: border-box; }
+    button { margin-top: 20px; padding: 12px 24px; background: #6366f1; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+    button:hover { background: #5558e6; }
+    #result { margin-top: 20px; padding: 16px; background: #12121a; border-radius: 8px; border: 1px solid #333; display: none; }
+    #result h3 { color: #4ade80; margin: 0 0 8px; font-size: 14px; }
+    #result pre { color: #a5b4fc; font-size: 12px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Test Form</h1>
+
+  <form id="test-form">
+    <label for="first-name">First Name</label>
+    <input
+      type="text"
+      id="first-name"
+      name="firstName"
+      placeholder="First Name"
+      data-enh-sid="s1"
+      role="textbox"
+      aria-label="First Name"
+    />
+
+    <label for="email">Email</label>
+    <input
+      type="email"
+      id="email"
+      name="email"
+      placeholder="Email address"
+      data-enh-sid="s2"
+      role="textbox"
+      aria-label="Email"
+    />
+
+    <label for="message">Message</label>
+    <textarea
+      id="message"
+      name="message"
+      placeholder="Type your message..."
+      data-enh-sid="s3"
+      role="textbox"
+      aria-label="Message"
+      rows="4"
+    ></textarea>
+
+    <label for="subject">Subject</label>
+    <input
+      type="text"
+      id="subject"
+      name="subject"
+      placeholder="Subject line"
+      data-enh-sid="s4"
+      role="textbox"
+      aria-label="Subject"
+    />
+
+    <label for="country">Country</label>
+    <select id="country" name="country" data-enh-sid="s6" aria-label="Country">
+      <option value="">Select...</option>
+      <option value="US">United States</option>
+      <option value="DE">Germany</option>
+      <option value="GB">United Kingdom</option>
+      <option value="ER">Eritrea</option>
+      <option value="JP">Japan</option>
+    </select>
+
+    <label>
+      <input type="checkbox" id="agree" name="agree" data-enh-sid="s7" />
+      I agree to the terms
+    </label>
+
+    <button type="submit" id="submit-btn" data-enh-sid="s5">Submit</button>
+  </form>
+
+  <div id="result">
+    <h3>Form Submitted!</h3>
+    <pre id="result-data"></pre>
+  </div>
+
+  <script>
+    document.getElementById('test-form').addEventListener('submit', function(e) {
+      e.preventDefault();
+      const data = Object.fromEntries(new FormData(this));
+      document.getElementById('result').style.display = 'block';
+      document.getElementById('result-data').textContent = JSON.stringify(data, null, 2);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "action_type": "EXPLORE",
+  "headline": "Let me check that for you",
+  "rationale": "This requires navigating and reading from the page.",
+  "primary_content": "I'll explore the page to find what you need.",
+  "consent_level": "auto",
+  "explore_plan": {
+    "goal": "Find and extract information from the test page",
+    "strategy": "Navigate to the page, read elements, extract data",
+    "maxSteps": 5,
+    "creditBudget": 5,
+    "startAction": {
+      "type": "scrape_page",
+      "description": "Read the current page to understand its structure"
+    }
+  }
+}

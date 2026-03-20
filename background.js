@@ -945,16 +945,62 @@ async function resolveReplayStartTab(recipe, fallbackTabId = null) {
     const currentTabDomain = currentParsed.hostname.replace(/^www\./, '').toLowerCase();
     const currentTabPath = currentParsed.pathname;
 
-    if (currentTabDomain !== startDomain || currentTabPath !== startPath || currentUrl !== startUrl) {
-      console.log('[Learning] Auto-navigating replay start tab to:', startUrl);
+    if (currentTabDomain !== startDomain) {
+      // Completely different domain — navigate immediately, no probe
+      console.log('[Learning] Different domain — navigating to:', startUrl);
       await chrome.tabs.update(targetTabId, { url: startUrl });
       await waitForTabLoad(targetTabId, 10000, 400);
       await new Promise(r => setTimeout(r, 350));
       navigated = true;
+    } else if (currentTabPath !== startPath || currentUrl !== startUrl) {
+      // Same domain, different path (SPA case) — probe first
+      // If the first step's element already exists on this page, skip navigation entirely
+      const probe = await probeFirstStepElement(targetTabId, recipe);
+      if (probe.found) {
+        console.log('[Learning] Probe found first step element on current page — skipping navigation');
+        // Element exists here — no navigation needed, saves 1-2 seconds
+      } else {
+        console.log('[Learning] Probe: element not found — navigating to startUrl:', startUrl);
+        await chrome.tabs.update(targetTabId, { url: startUrl });
+        await waitForTabLoad(targetTabId, 10000, 400);
+        await new Promise(r => setTimeout(r, 350));
+        navigated = true;
+      }
     }
   } catch {}
 
   return { tabId: targetTabId, navigated };
+}
+
+// ─── Probe: check if the first step's element exists on the current page ──
+// Used by resolveReplayStartTab to skip unnecessary navigation on SPAs.
+// Returns { found: true/false }. Never executes any action.
+async function probeFirstStepElement(tabId, recipe) {
+  // Find the first real DOM action (skip navigate, wait, scroll)
+  const firstActionStep = recipe.steps?.find(s =>
+    s.action?.type !== 'navigate' && s.action?.type !== 'wait' && s.action?.type !== 'scroll'
+  );
+  if (!firstActionStep?.action?.selectors?.length) return { found: false };
+
+  // Ensure content_replay.js is injected (reuses existing helper)
+  const readyResult = await ensureReplayScriptReady(tabId, { waitMs: 1500 });
+  if (!readyResult.success) return { found: false };
+
+  // Send probe with 2-second cap
+  try {
+    const result = await Promise.race([
+      chrome.tabs.sendMessage(tabId, {
+        type: 'replay_probe',
+        selectors: firstActionStep.action.selectors,
+        description: firstActionStep.action.description,
+        semanticContext: firstActionStep.action.semanticContext,
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('probe_timeout')), 2000))
+    ]);
+    return { found: !!result?.found };
+  } catch {
+    return { found: false };
+  }
 }
 
 // ─── HUD Helpers (inject + send messages) ─────────────────
@@ -4486,12 +4532,63 @@ function looksEmailLike(text) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(text || '').trim());
 }
 
+/**
+ * Detect search/query input fields that should become auto-variables.
+ * These get their value from the user's NEW prompt at replay time — no AI call needed.
+ * Fast path: variable extraction from prompt, zero latency.
+ */
+function shouldAutoVariable(step) {
+  const action = step?.action || {};
+  if (action.type !== 'type' || action.inputType !== 'fixed') return false;
+
+  const value = normalizeRecipeText(action.fixedValue);
+  if (!value || looksEmailLike(value)) return false;
+
+  const hint = normalizeRecipeText([
+    action.description,
+    action.semanticContext?.label,
+    action.semanticContext?.ariaLabel,
+    action.semanticContext?.placeholder,
+    action.semanticContext?.context,
+    action.semanticContext?.role,
+    action.semanticContext?.tag,
+    action.semanticContext?.type,
+    action.semanticContext?.name,
+    action.semanticContext?.id,
+  ].filter(Boolean).join(' ')).toLowerCase();
+
+  // EXCLUSION: Email-related fields (To, Cc, Bcc, recipient) are NOT search fields
+  // Gmail's To field is a combobox but for email addresses, not product search
+  const isEmailField = /(to\b|cc\b|bcc\b|recipient|email.*address|compose.*to|mail.*to|addressee)/i.test(hint);
+  if (isEmailField) return false;
+
+  // EXCLUSION: Subject/title fields are for LLM generation, not variable extraction
+  const isSubjectField = /(subject|title|headline)/i.test(hint);
+  if (isSubjectField) return false;
+
+  // Search box heuristics: field name/placeholder/label contains search-related keywords
+  const searchField = /(search|query|keyword|find|lookup|filter|q\b|search.?box|search.?bar|search.?input|search.?field|search.?term)/i.test(hint);
+
+  // Also detect by input type="search" or common search element patterns
+  // Note: combobox alone is too broad (Gmail To field is combobox) — require "search" hint too
+  const isSearchInput = action.semanticContext?.type === 'search' ||
+    action.semanticContext?.role === 'searchbox' ||
+    (action.semanticContext?.role === 'combobox' && /search/i.test(hint)) ||
+    /search/i.test(action.semanticContext?.name || '') ||
+    /search/i.test(action.semanticContext?.id || '');
+
+  return searchField || isSearchInput;
+}
+
 function shouldAutoLlmFill(step) {
   const action = step?.action || {};
   if (action.type !== 'type' || action.inputType !== 'fixed') return false;
 
   const value = normalizeRecipeText(action.fixedValue);
   if (!value || looksEmailLike(value)) return false;
+
+  // Search fields are handled by shouldAutoVariable — skip them here
+  if (shouldAutoVariable(step)) return false;
 
   const hint = normalizeRecipeText([
     action.description,
@@ -4548,7 +4645,17 @@ function upgradeRecipeStepForReplay(step, stepNumber) {
     if (!normalizedValue) return null;
     upgraded.action.fixedValue = normalizedValue;
 
-    if (shouldAutoLlmFill(upgraded)) {
+    if (shouldAutoVariable(upgraded)) {
+      // Search/query fields: upgrade to variable type for fast prompt extraction
+      // No AI call needed — value comes directly from user's new prompt
+      upgraded.action = {
+        ...upgraded.action,
+        inputType: 'variable',
+        variableName: '__search_query',
+        originalFixedValue: normalizedValue, // Keep original as fallback
+      };
+      delete upgraded.action.fixedValue;
+    } else if (shouldAutoLlmFill(upgraded)) {
       const llmPrompt = buildLlmPromptForStep(upgraded);
       upgraded.action = {
         ...upgraded.action,
@@ -4695,7 +4802,12 @@ function buildRecipeFromSession(session) {
       }
       cleanStep.action.fixedValue = normalizedValue;
 
-      if (shouldAutoLlmFill(cleanStep)) {
+      if (shouldAutoVariable(cleanStep)) {
+        // Search/query fields: save as variable at recording time
+        const upgradedStep = upgradeRecipeStepForReplay(cleanStep, cleanedSteps.length + 1);
+        if (!upgradedStep) continue;
+        cleanStep.action = upgradedStep.action;
+      } else if (shouldAutoLlmFill(cleanStep)) {
         const upgradedStep = upgradeRecipeStepForReplay(cleanStep, cleanedSteps.length + 1);
         if (!upgradedStep) continue;
         cleanStep.action = upgradedStep.action;
@@ -4708,8 +4820,42 @@ function buildRecipeFromSession(session) {
     });
   }
 
+  // After cleanup, collect any new variables introduced by auto-upgrade (e.g., __search_query)
+  for (const step of cleanedSteps) {
+    if (step.action?.inputType === 'variable' && step.action.variableName) {
+      if (!seenVars.has(step.action.variableName)) {
+        seenVars.add(step.action.variableName);
+        variables.push({
+          name: step.action.variableName,
+          description: step.action.variableDescription || `Value for ${step.action.variableName}`,
+          fieldType: 'text',
+        });
+      }
+    }
+  }
+
   // Collect all unique domains touched
   const allDomains = [...new Set(Object.values(session.tabDomains))];
+
+  // Ensure the recipe always starts with a navigate step so replay knows WHERE to go.
+  // If the user started recording while already on a page (not from empty tab),
+  // the first step is an action (click/type), not a navigate. Add an implicit one.
+  if (session.startUrl && cleanedSteps.length > 0 && cleanedSteps[0].action?.type !== 'navigate') {
+    cleanedSteps.unshift({
+      stepNumber: 0,
+      action: {
+        type: 'navigate',
+        url: session.startUrl,
+        waitFor: 'load',
+        description: `Navigate to ${session.startDomain || 'start page'}`,
+        isImplicit: true, // System-generated, not user-recorded
+      },
+      url: session.startUrl,
+      timestamp: session.startedAt,
+    });
+    // Re-number all steps
+    cleanedSteps.forEach((step, idx) => { step.stepNumber = idx + 1; });
+  }
 
   return {
     workflowName: session.workflowName,
@@ -4893,19 +5039,39 @@ async function findTabByDomain(domain, fallbackUrl) {
   try {
     const allTabs = await chrome.tabs.query({ currentWindow: true });
 
-    // Pass 1: exact domain match
+    // Pass 1: exact URL match (best case — tab already has the right page)
+    if (fallbackUrl) {
+      for (const tab of allTabs) {
+        if (!tab.url) continue;
+        try {
+          if (new URL(tab.url).href === new URL(fallbackUrl).href) {
+            console.log('[Learning] Found exact URL match for', fallbackUrl, '→ tab', tab.id);
+            return tab.id;
+          }
+        } catch {}
+      }
+    }
+
+    // Pass 2: domain match (good enough — recipe will navigate within the site)
     for (const tab of allTabs) {
       if (!tab.url) continue;
       try {
         const tabDomain = new URL(tab.url).hostname.replace(/^www\./, '').toLowerCase();
         if (tabDomain === domain) {
-          console.log('[Learning] Found existing tab for', domain, '→ tab', tab.id);
+          // Skip tabs that are on login/auth pages — they need fresh navigation
+          const tabPath = new URL(tab.url).pathname.toLowerCase();
+          const isAuthPage = /\/(signin|sign-in|login|log-in|register|signup|sign-up|auth|oauth|sso)\b/.test(tabPath);
+          if (isAuthPage) {
+            console.log('[Learning] Skipping auth-page tab for', domain, '→ tab', tab.id);
+            continue;
+          }
+          console.log('[Learning] Found domain match for', domain, '→ tab', tab.id);
           return tab.id;
         }
       } catch {}
     }
 
-    // Pass 2: no existing tab found — open the fallback URL
+    // Pass 3: no existing tab found — open the fallback URL in a new tab
     if (fallbackUrl) {
       console.log('[Learning] No tab found for', domain, '— opening:', fallbackUrl);
       const newTab = await chrome.tabs.create({ url: fallbackUrl, active: true });
@@ -4950,7 +5116,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   };
 
   // Long-running handlers get extended timeouts
-  const LONG_RUNNING_TYPES = ['learning_replay_recipe', 'explore_start', 'explore_resume'];
+  const LONG_RUNNING_TYPES = [
+    'learning_replay_recipe',
+    'explore_start',
+    'explore_resume',
+    'process_request',
+    'process_request_skip_recipe',
+  ];
   const timeoutMs = LONG_RUNNING_TYPES.includes(request.type) ? 300000 : 30000; // 5 min for replays/explore, 30s for others
 
   const timeoutId = setTimeout(() => {
@@ -5592,10 +5764,39 @@ async function handleMessage(request, sender) {
       } catch { /* Some pages block injection — proceed without */ }
     }
 
+    // ── Multi-site detection: skip single-recipe replay for chained requests ──
+    // If the prompt references multiple sites (e.g., "search Amazon then email"),
+    // the chain system should handle it, not a single recipe replay.
+    const isMultiSitePrompt = (() => {
+      const lower = (userPrompt || '').toLowerCase();
+      const SITE_KEYWORDS = ['amazon', 'ebay', 'walmart', 'etsy', 'gmail', 'outlook', 'yahoo',
+        'linkedin', 'twitter', 'reddit', 'facebook', 'instagram', 'youtube', 'google',
+        'slack', 'discord', 'zillow', 'airbnb', 'indeed'];
+      let siteCount = 0;
+      const found = new Set();
+      for (const kw of SITE_KEYWORDS) {
+        if (new RegExp(`\\b${kw}\\b`, 'i').test(lower) && !found.has(kw)) {
+          found.add(kw);
+          siteCount++;
+        }
+      }
+      if (siteCount >= 2) return true;
+      // Chain verbs: "search X and/then email Y"
+      if (/\b(search|find|look)\b.*\b(and|then)\b.*\b(email|send|post|share|message|forward)\b/i.test(lower)) return true;
+      if (/\b(email|send|post|share)\b.*\b(and|then)\b.*\b(search|find|buy|order)\b/i.test(lower)) return true;
+      if (/\b(buy|order|purchase)\b.*\b(and|then)\b.*\b(email|send|share)\b/i.test(lower)) return true;
+      // From non-mail domain + email intent
+      const siteDomain = url ? new URL(url).hostname.toLowerCase() : '';
+      const isOnMailSite = /mail\.google|gmail|outlook|yahoo/i.test(siteDomain);
+      if (!isOnMailSite && /\b(email|compose|write|send|reply|forward|message)\b/i.test(lower)) return true;
+      return false;
+    })();
+
     // ── LEARNING MODE: Auto-replay matching recipe (zero-token, silent) ──
     // If a learned recipe exists for this site + task, replay it automatically
     // without asking the user. If replay fails, silently fall through to AI.
-    if (!skipRecipeCheck) try {
+    // SKIP for multi-site prompts — let the chain system handle those.
+    if (!skipRecipeCheck && !isMultiSitePrompt) try {
       const siteDomain = url ? new URL(url).hostname : '';
       if (siteDomain && userPrompt) {
         const recipeRes = await fetch(
@@ -5608,21 +5809,73 @@ async function handleMessage(request, sender) {
           const matchScore = recipeMatch.score || 0;
           console.log(`[BG] Recipe auto-match: "${recipe.workflowName}" (score=${matchScore}, confidence=${recipe.confidence})`);
 
-          // Determine if recipe has unfilled variables that we can't resolve from the prompt
+          // Try to auto-fill recipe variables from the user's prompt
           const variables = Array.isArray(recipe.variables) ? recipe.variables : [];
-          const hasUnfilledVars = variables.length > 0;
+          const filledVars = {};
+          if (variables.length > 0) {
+            // Extract values from the user prompt to fill recipe variables
+            const promptLower = userPrompt.toLowerCase();
 
-          // If recipe requires user-provided variables, we can't auto-replay silently.
-          // Fall through to AI which can handle the full request intelligently.
-          if (!hasUnfilledVars) {
+            // Extract email addresses
+            const emailMatch = userPrompt.match(/[^\s@]+@[^\s@]+\.[^\s@]+/);
+
+            // Extract quoted strings (explicit values)
+            const quotedMatches = userPrompt.match(/"([^"]+)"|'([^']+)'/g);
+            const quotedValues = quotedMatches ? quotedMatches.map(q => q.replace(/['"]/g, '')) : [];
+
+            // Extract search query: strip site names, action verbs, and connectors
+            const searchQuery = userPrompt
+              .replace(/\b(search|find|look\s*for|browse|shop|buy|purchase|order|email|compose|write|send|reply|message|forward|then|and|on|in|at|the|a|an|for|to|from|my|me|please|can|you|i|want|need)\b/gi, ' ')
+              .replace(/\b(amazon|ebay|walmart|etsy|gmail|outlook|yahoo|linkedin|twitter|reddit|facebook|instagram|youtube|google|slack|discord|zillow|airbnb|indeed)\b/gi, ' ')
+              .replace(/[^\s@]+@[^\s@]+\.[^\s@]+/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+
+            for (const v of variables) {
+              const nameLower = (v.name || '').toLowerCase();
+              const descLower = (v.description || '').toLowerCase();
+
+              if (/email|recipient|to_address/.test(nameLower) || /email|recipient/.test(descLower)) {
+                if (emailMatch) filledVars[v.name] = emailMatch[0];
+              } else if (/search|query|keyword|product|item/.test(nameLower) || /search|query|what.*find/.test(descLower)) {
+                if (quotedValues.length > 0) {
+                  filledVars[v.name] = quotedValues[0];
+                } else if (searchQuery) {
+                  filledVars[v.name] = searchQuery;
+                }
+              } else if (/subject/.test(nameLower)) {
+                if (quotedValues.length > 1) filledVars[v.name] = quotedValues[1];
+                else if (searchQuery) filledVars[v.name] = searchQuery;
+              } else if (/url|link/.test(nameLower)) {
+                const urlMatch = userPrompt.match(/https?:\/\/[^\s]+/);
+                if (urlMatch) filledVars[v.name] = urlMatch[0];
+              } else {
+                // Generic fallback: use quoted value or search query
+                if (quotedValues.length > 0) filledVars[v.name] = quotedValues.shift();
+                else if (searchQuery) filledVars[v.name] = searchQuery;
+              }
+            }
+
+            const unfilledCount = variables.filter(v => !filledVars[v.name]).length;
+            if (unfilledCount > 0) {
+              console.log(`[BG] Recipe has ${unfilledCount}/${variables.length} unfilled variable(s) after extraction, skipping auto-replay — AI will handle`);
+            } else {
+              console.log(`[BG] Auto-filled ${Object.keys(filledVars).length} variable(s) from prompt:`, Object.keys(filledVars));
+            }
+          }
+
+          // Replay if no variables or all variables were filled from the prompt
+          const unfilledVarCount = variables.filter(v => !filledVars[v.name]).length;
+          if (unfilledVarCount === 0) {
             // Auto-replay: dispatch internally to the replay handler
             try {
               const replayResult = await handleMessage({
                 type: 'learning_replay_recipe',
                 data: {
                   recipe,
-                  variables: {},
+                  variables: filledVars,
                   taskContext: userPrompt,
+                  originalPrompt: userPrompt,
                 },
               }, {} /* no sender — internal call */);
 
@@ -5640,7 +5893,7 @@ async function handleMessage(request, sender) {
                   success: true,
                   data: {
                     action_type: 'RECIPE_REPLAY_COMPLETE',
-                    headline: `Done! Used community workflow "${recipe.autoDescription || recipe.workflowName}"`,
+                    headline: `Done! Used workflow "${recipe.autoDescription || recipe.workflowName}"`,
                     primary_content: `Completed ${replayResult.completedSteps}/${replayResult.totalSteps} steps in ${((replayResult.durationMs || 0) / 1000).toFixed(1)}s — 0 credits used.`,
                     recipe_used: { id: recipe.id, name: recipe.autoDescription || recipe.workflowName, confidence: recipe.confidence },
                     consent_level: 'none',
@@ -5663,8 +5916,6 @@ async function handleMessage(request, sender) {
             } catch (replayErr) {
               console.warn('[BG] Recipe auto-replay threw, falling through to AI:', replayErr.message);
             }
-          } else {
-            console.log(`[BG] Recipe has ${variables.length} variable(s), skipping auto-replay — AI will handle`);
           }
         }
       }
@@ -5710,19 +5961,149 @@ async function handleMessage(request, sender) {
 
           let stepResult;
 
+          // ── Navigate to the target domain if not already there ──
+          // Chain sub-tasks often span different sites (Amazon → Gmail).
+          // Before executing each sub-task, ensure the active tab is on the right domain.
+          if (subTask.domain && subTask.order > 1) {
+            try {
+              const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+              const currentHost = currentTab?.url ? new URL(currentTab.url).hostname.toLowerCase() : '';
+              const targetDomain = subTask.domain.toLowerCase();
+
+              // Check if we need to navigate (different domain family)
+              const currentFamily = currentHost.split('.').slice(-2, -1)[0] || currentHost;
+              const targetFamily = targetDomain.split('.').slice(-2, -1)[0] || targetDomain;
+              const needsNavigation = currentFamily !== targetFamily &&
+                !currentHost.includes(targetDomain) && !targetDomain.includes(currentHost);
+
+              if (needsNavigation && currentTab) {
+                console.log(`[BG] Chain: navigating from "${currentHost}" to "${targetDomain}" for sub-task ${subTask.order}`);
+
+                // Try to find an existing tab on the target domain first
+                const allTabs = await chrome.tabs.query({ currentWindow: true });
+                const existingTab = allTabs.find(t => {
+                  try {
+                    const host = new URL(t.url).hostname.toLowerCase();
+                    return host.includes(targetDomain) || targetDomain.includes(host.split('.').slice(-2, -1)[0]);
+                  } catch { return false; }
+                });
+
+                // Rich web apps (Gmail, Outlook) need more settle time for JS frameworks to initialize
+                const isRichApp = /mail\.google|gmail|outlook|facebook|linkedin|slack/i.test(targetDomain);
+                const settleTimeMs = isRichApp ? 3000 : 1500;
+
+                if (existingTab) {
+                  // Switch to existing tab
+                  await chrome.tabs.update(existingTab.id, { active: true });
+                  await new Promise(r => setTimeout(r, settleTimeMs)); // Let tab re-activate and re-render
+                  console.log(`[BG] Chain: switched to existing tab on ${targetDomain} (settled ${settleTimeMs}ms)`);
+                } else {
+                  // Navigate the current tab to the target domain
+                  const targetUrl = targetDomain.includes('mail.google') ? 'https://mail.google.com' :
+                                    targetDomain.includes('outlook') ? 'https://outlook.live.com' :
+                                    `https://${targetDomain}`;
+                  await chrome.tabs.update(currentTab.id, { url: targetUrl });
+                  // Wait for page to load
+                  await new Promise((resolve) => {
+                    const onLoad = (tabId, changeInfo) => {
+                      if (tabId === currentTab.id && changeInfo.status === 'complete') {
+                        chrome.tabs.onUpdated.removeListener(onLoad);
+                        resolve();
+                      }
+                    };
+                    chrome.tabs.onUpdated.addListener(onLoad);
+                    setTimeout(() => { chrome.tabs.onUpdated.removeListener(onLoad); resolve(); }, 15000);
+                  });
+                  await new Promise(r => setTimeout(r, settleTimeMs)); // Extra settle time for JS apps
+                  console.log(`[BG] Chain: navigated to ${targetUrl} (settled ${settleTimeMs}ms)`);
+                }
+              }
+            } catch (navErr) {
+              console.warn(`[BG] Chain: domain navigation failed for sub-task ${subTask.order}:`, navErr.message);
+              // Continue anyway — the sub-task execution will handle being on the wrong page
+            }
+          }
+
           if (subTask.executionMethod === 'recipe_replay' && subTask.recipe) {
             // RECIPE REPLAY — free, deterministic
+            // Map resolved inputs to recipe variable names (decomposer uses names like
+            // 'search_query' but recipe variables may have different names set by user)
+            const recipeVars = Array.isArray(subTask.recipe.variables) ? subTask.recipe.variables : [];
+            const mappedVars = { ...resolvedInputs };
+            if (recipeVars.length > 0 && Object.keys(resolvedInputs).length > 0) {
+              for (const rv of recipeVars) {
+                if (mappedVars[rv.name]) continue; // already matched by name
+                const rvNameLower = (rv.name || '').toLowerCase();
+                const rvDescLower = (rv.description || '').toLowerCase();
+                // Try to map by semantic type
+                for (const [inputName, inputValue] of Object.entries(resolvedInputs)) {
+                  if (mappedVars[rv.name]) break;
+                  const inLower = inputName.toLowerCase();
+                  if (/search|query|keyword|product/.test(inLower) && /search|query|keyword|product|item/.test(rvNameLower + ' ' + rvDescLower)) {
+                    mappedVars[rv.name] = inputValue;
+                  } else if (/email|recipient/.test(inLower) && /email|recipient|to/.test(rvNameLower + ' ' + rvDescLower)) {
+                    mappedVars[rv.name] = inputValue;
+                  } else if (/subject/.test(inLower) && /subject/.test(rvNameLower + ' ' + rvDescLower)) {
+                    mappedVars[rv.name] = inputValue;
+                  } else if (/body|content|message/.test(inLower) && /body|content|message|text/.test(rvNameLower + ' ' + rvDescLower)) {
+                    mappedVars[rv.name] = inputValue;
+                  }
+                }
+              }
+            }
             try {
+              // Build rich task context: sub-task intent + data from previous steps
+              // This ensures the LLM knows what was found in step 1 when generating email in step 2
+              let richTaskContext = subTask.intent;
+              if (Object.keys(outputStore).length > 0) {
+                const prevStepSummaries = Object.entries(outputStore)
+                  .map(([stepOrder, data]) => {
+                    const parts = [`Step ${stepOrder}: ${data.page_title || 'completed'}`];
+                    if (data.page_url) parts.push(`URL: ${data.page_url}`);
+                    if (data.page_content) parts.push(`Content:\n${data.page_content.slice(0, 2000)}`);
+                    return parts.join('\n');
+                  })
+                  .join('\n\n');
+                richTaskContext = `${subTask.intent}\n\nData from previous steps:\n${prevStepSummaries}`;
+              }
+
               stepResult = await handleMessage({
                 type: 'learning_replay_recipe',
                 data: {
                   recipe: subTask.recipe,
-                  variables: resolvedInputs,
-                  taskContext: subTask.intent,
+                  variables: mappedVars,
+                  taskContext: richTaskContext,
+                  originalPrompt: userPrompt, // Original user prompt for search query extraction (not enriched context)
                 },
               }, {});
 
               if (stepResult?.success && !stepResult?.partial) {
+                // Check if replay stopped at a consequential action (Send, Buy, Delete)
+                if (stepResult.skippedConsequential) {
+                  console.log(`[BG] Chain sub-task ${subTask.order} stopped at consequential action: "${stepResult.consequentialStep}"`);
+                  // Record as success with awaiting flag — chain continues to next sub-task
+                  chainResults.push({
+                    order: subTask.order,
+                    intent: subTask.intent,
+                    domain: subTask.domain,
+                    method: subTask.executionMethod,
+                    recipeName: subTask.recipe?.autoDescription || subTask.recipe?.workflowName || null,
+                    success: true,
+                    awaitingUserAction: true,
+                    consequentialStep: stepResult.consequentialStep,
+                    duration: stepResult?.durationMs || 0,
+                    error: null,
+                  });
+                  // Capture page outputs for downstream steps before continuing
+                  try {
+                    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                    outputStore[subTask.order] = {
+                      page_url: activeTab?.url || '',
+                      page_title: activeTab?.title || '',
+                    };
+                  } catch { outputStore[subTask.order] = {}; }
+                  continue; // Move to next sub-task — user will click the button manually
+                }
                 // Record success
                 try {
                   await fetch(`${API_BASE}/api/recipes/${subTask.recipe.id}/validate`, {
@@ -5739,20 +6120,96 @@ async function handleMessage(request, sender) {
               stepResult = { success: false, error: replayErr.message };
             }
           } else {
-            // AI REASONING — expensive but necessary (no recipe available)
-            // For now, mark as needing AI; the full chain returns partial so the
-            // AI call below handles the remaining request.
-            stepResult = { success: false, error: 'No recipe available — needs AI reasoning' };
+            // AI REASONING — no recipe available, use the full AI agent for this sub-task
+            console.log(`[BG] Chain sub-task ${subTask.order} ("${subTask.intent}") has no recipe — falling through to AI`);
+            // Build a focused prompt for just this sub-task, incorporating resolved inputs + previous step data
+            const inputContext = Object.entries(resolvedInputs)
+              .map(([k, v]) => `${k}: ${v}`)
+              .join(', ');
+            // Include previous step outputs so AI knows what was found (e.g., product details for email)
+            const prevStepData = Object.entries(outputStore)
+              .map(([stepOrder, data]) => {
+                const parts = [`Step ${stepOrder}: ${data.page_title || 'completed'}`];
+                if (data.page_url) parts.push(`URL: ${data.page_url}`);
+                if (data.page_content) parts.push(data.page_content.slice(0, 1500));
+                return parts.join(' | ');
+              })
+              .join('\n');
+            const contextParts = [subTask.intent];
+            if (inputContext) contextParts.push(`Inputs: ${inputContext}`);
+            if (prevStepData) contextParts.push(`Data from previous steps:\n${prevStepData}`);
+            const focusedPrompt = contextParts.join('. ');
+
+            try {
+              // Get current tab context for the AI
+              const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+              const currentUrl = currentTab?.url || `https://${subTask.domain}`;
+
+              // Scrape page context for AI
+              let aiPageContext = { url: currentUrl, siteHint: null };
+              try {
+                const [scraped] = await chrome.scripting.executeScript({
+                  target: { tabId: currentTab.id },
+                  func: () => ({
+                    title: document.title,
+                    text: document.body?.innerText?.slice(0, 3000) || '',
+                  }),
+                });
+                if (scraped?.result) {
+                  aiPageContext.title = scraped.result.title;
+                  aiPageContext.visibleText = scraped.result.text;
+                }
+              } catch { /* page may block injection */ }
+
+              const aiRes = await fetch(`${API_BASE}/api/agent/process`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                body: JSON.stringify({
+                  userPrompt: focusedPrompt,
+                  pageContext: aiPageContext,
+                  userMemory: userMemory || null,
+                  conversationHistory: [],
+                }),
+              });
+              if (aiRes.ok) {
+                const aiData = await aiRes.json();
+                // Mark success so chain can capture outputs and continue
+                stepResult = { success: true, aiAction: aiData, durationMs: 0 };
+              } else {
+                stepResult = { success: false, error: 'AI reasoning failed for chain sub-task' };
+              }
+            } catch (aiErr) {
+              stepResult = { success: false, error: `AI fallback error: ${aiErr.message}` };
+            }
           }
 
-          // Capture page outputs after this sub-task (URL + title from active tab)
+          // Capture page outputs after this sub-task (URL + title + visible content from active tab)
+          // The visible content is critical for cross-step context (e.g., search results → email body)
           if (stepResult?.success) {
             try {
               const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-              outputStore[subTask.order] = {
+              const capturedOutput = {
                 page_url: activeTab?.url || '',
                 page_title: activeTab?.title || '',
               };
+
+              // Capture visible page content for downstream steps (e.g., product details for email)
+              try {
+                const [scraped] = await chrome.scripting.executeScript({
+                  target: { tabId: activeTab.id },
+                  func: () => {
+                    // Extract meaningful content: product info, search results, article text
+                    const body = document.body?.innerText || '';
+                    // Trim to 3000 chars to keep context manageable
+                    return body.slice(0, 3000);
+                  },
+                });
+                if (scraped?.result) {
+                  capturedOutput.page_content = scraped.result;
+                }
+              } catch { /* page may block injection — continue without content */ }
+
+              outputStore[subTask.order] = capturedOutput;
             } catch {
               outputStore[subTask.order] = {};
             }
@@ -5780,14 +6237,21 @@ async function handleMessage(request, sender) {
         if (chainSuccess) {
           const totalDuration = chainResults.reduce((sum, r) => sum + (r.duration || 0), 0);
           const recipesUsed = chainResults.filter(r => r.method === 'recipe_replay' && r.success).length;
+          const awaitingActions = chainResults.filter(r => r.awaitingUserAction);
+          const headline = awaitingActions.length > 0
+            ? `Chain complete! ${chainResults.length} tasks done — ${awaitingActions.length} awaiting your click`
+            : `Chain complete! ${chainResults.length} tasks done`;
           return {
             success: true,
             data: {
               action_type: 'RECIPE_REPLAY_COMPLETE',
-              headline: `Chain complete! ${chainResults.length} tasks done`,
-              primary_content: chainResults.map(r =>
-                `${r.order}. ${r.intent} (${r.domain}) — ${r.success ? 'Done' : 'Failed'}${r.recipeName ? ' via "' + r.recipeName + '"' : ''}`
-              ).join('\n'),
+              headline,
+              primary_content: chainResults.map(r => {
+                const status = r.awaitingUserAction
+                  ? `Awaiting your click on "${r.consequentialStep}"`
+                  : r.success ? 'Done' : 'Failed';
+                return `${r.order}. ${r.intent} (${r.domain}) — ${status}${r.recipeName ? ' via "' + r.recipeName + '"' : ''}`;
+              }).join('\n'),
               chain_results: chainResults,
               consent_level: 'none',
             },
@@ -6461,22 +6925,29 @@ async function handleMessage(request, sender) {
 
   if (request.type === 'learning_session_start') {
     // Initialize a new recording session (called from sidepanel)
+    // Recording can start on ANY page, including chrome://newtab and empty tabs.
+    // When tabUrl is empty, startUrl/startDomain stay empty until the user navigates
+    // to a real website — the webNavigation listener captures that as step 1.
     const { workflowName, tabId, tabUrl } = request.data;
+    let startDomain = '';
+    try {
+      if (tabUrl) startDomain = new URL(tabUrl).hostname.replace(/^www\./, '').toLowerCase();
+    } catch { /* empty or invalid URL — that's fine */ }
     const session = {
       active: true,
       workflowName,
       steps: [],
       stepCounter: 0,
       startUrl: tabUrl || '',
-      startDomain: tabUrl ? new URL(tabUrl).hostname.replace(/^www\./, '').toLowerCase() : '',
+      startDomain,
+      startedFromEmpty: !tabUrl, // Flag: recording started on non-injectable page
       activeTabId: tabId,
       tabDomains: {},
       startedAt: Date.now(),
     };
     learningPendingSwitch = null;
-    if (tabUrl) {
-      const domain = new URL(tabUrl).hostname.replace(/^www\./, '').toLowerCase();
-      session.tabDomains[tabId] = domain;
+    if (tabUrl && startDomain) {
+      session.tabDomains[tabId] = startDomain;
     }
     await chrome.storage.session.set({ learningSession: session });
     console.log('[Learning] Session started:', workflowName, 'on tab', tabId);
@@ -6494,9 +6965,25 @@ async function handleMessage(request, sender) {
 
     const recordingNavListener = async (details) => {
       if (details.frameId !== 0) return; // ignore iframes
+      // Skip chrome:// and extension:// URLs — can't inject content scripts there
+      if (details.url.startsWith('chrome://') || details.url.startsWith('chrome-extension://')) return;
+
       const { learningSession: ls } = await chrome.storage.session.get('learningSession');
       if (!ls?.active) return;
       if (ls.activeTabId !== details.tabId) return; // wrong tab
+
+      // If recording started from an empty/chrome tab, this is the first real navigation.
+      // Set the session's startUrl and startDomain now.
+      if (ls.startedFromEmpty && !ls.startDomain) {
+        try {
+          const domain = new URL(details.url).hostname.replace(/^www\./, '').toLowerCase();
+          ls.startUrl = details.url;
+          ls.startDomain = domain;
+          ls.tabDomains[details.tabId] = domain;
+          ls.startedFromEmpty = false; // Only set once
+          console.log('[Learning] First navigation from empty tab — setting startUrl:', details.url);
+        } catch { /* invalid URL — skip */ }
+      }
 
       // Deduplicate: skip if last step is a navigate to the same URL within 2s
       const lastStep = ls.steps[ls.steps.length - 1];
@@ -6516,8 +7003,9 @@ async function handleMessage(request, sender) {
           type: 'navigate',
           url: details.url,
           waitFor: 'load',
-          description: `Navigate to ${new URL(details.url).pathname}`,
+          description: `Navigate to ${new URL(details.url).hostname}`,
           autoDetected: true,
+          isStartingNavigation: ls.steps.length === 0, // True if this is the very first step
         },
         url: details.url,
         timestamp: Date.now(),
@@ -6569,7 +7057,7 @@ async function handleMessage(request, sender) {
           type: 'navigate',
           url: details.url,
           waitFor: 'load',
-          description: `Navigate to ${new URL(details.url).pathname}`,
+          description: `Navigate to ${new URL(details.url).hostname}`,
           autoDetected: true,
         },
         url: details.url,
@@ -6827,12 +7315,24 @@ async function handleMessage(request, sender) {
 
   // ── LEARNING MODE: Replay a recipe on active tab ──
   if (request.type === 'learning_replay_recipe') {
-    const { recipe, variables, taskContext } = request.data;
+    const { recipe, variables, taskContext, originalPrompt } = request.data;
     const runtimeRecipe = upgradeRecipeForReplay(recipe);
+
+    // Use originalPrompt (the user's raw input) for search query extraction.
+    // taskContext may contain enriched data from previous chain steps — don't use it for search.
+    const promptForSearch = originalPrompt || taskContext || '';
+    const searchQueryFromPrompt = promptForSearch
+      .replace(/\b(search|find|look\s*for|browse|shop|buy|purchase|order|get|show|display|email|compose|write|send|reply|message|forward|then|and|on|in|at|the|a|an|for|to|from|my|me|please|can|you|i|want|need|under|over|below|above|less\s*than|more\s*than|cheaper\s*than|about|tell|compile)\b/gi, ' ')
+      .replace(/\b(amazon|ebay|walmart|etsy|gmail|outlook|yahoo|linkedin|twitter|reddit|facebook|instagram|youtube|google|slack|discord|zillow|airbnb|indeed|circlenomy)\b/gi, ' ')
+      .replace(/[^\s@]+@[^\s@]+\.[^\s@]+/g, ' ') // Remove emails
+      .replace(/\s+/g, ' ')
+      .trim();
+
     const runtimeVariables = {
       ...(variables || {}),
       __task_context: taskContext || runtimeRecipe?.workflowName || '',
       __workflow_name: runtimeRecipe?.workflowName || '',
+      __search_query: searchQueryFromPrompt || variables?.__search_query || '',
     };
     const hasSwitchTab = runtimeRecipe.steps.some(s => s.action.type === 'switch_tab');
 
@@ -6868,7 +7368,7 @@ async function handleMessage(request, sender) {
         let remainingRecipe = { ...runtimeRecipe, steps: [...runtimeRecipe.steps] };
         const totalSteps = runtimeRecipe.steps.length;
         const replayStartTime = Date.now();
-        const MAX_CONTINUATIONS = 5;
+        const MAX_CONTINUATIONS = 3;
 
         // Navigation detection via webNavigation (catches click-triggered page loads)
         let replayNavDetected = false;
@@ -6985,6 +7485,35 @@ async function handleMessage(request, sender) {
                 cleanupReplay();
                 return { success: false, error: 'Tab closed during navigation.', completedSteps: completedSoFar, totalSteps };
               }
+
+              // Safety: check if we navigated to an auth/login page — stop immediately
+              try {
+                const [authCheck] = await chrome.scripting.executeScript({
+                  target: { tabId: tab.id },
+                  func: () => {
+                    const url = window.location.href.toLowerCase();
+                    const AUTH_PATTERNS = [
+                      /\/signin\b/, /\/sign-in\b/, /\/login\b/, /\/log-in\b/,
+                      /\/register\b/, /\/signup\b/, /\/sign-up\b/, /\/createaccount\b/,
+                      /\/ap\/signin/, /\/ap\/register/,
+                      /\/auth\//, /\/oauth\//, /\/sso\//,
+                    ];
+                    return AUTH_PATTERNS.some(p => p.test(url));
+                  },
+                });
+                if (authCheck?.result) {
+                  console.warn('[Learning] Replay navigated to auth/login page — stopping to prevent unintended actions.');
+                  cleanupReplay();
+                  return {
+                    success: false,
+                    error: 'Recipe navigated to a login/authentication page. Replay stopped for safety.',
+                    completedSteps: completedSoFar,
+                    totalSteps,
+                    results: allResults,
+                    durationMs: Date.now() - replayStartTime,
+                  };
+                }
+              } catch { /* page may be restricted — continue cautiously */ }
 
               // Build remaining steps and continue
               const remaining = runtimeRecipe.steps.slice(completedSoFar);
@@ -7383,9 +7912,16 @@ async function handleMessage(request, sender) {
         if (/"title"\s*:|"description"\s*:|"dueDate"\s*:|"priority"\s*:/i.test(trimmed)) return true;
         if (/^action_type\s*:|^headline\s*:/i.test(trimmed)) return true;
 
+        // Use taskContext for relevance check, but only extract keywords from the FIRST LINE
+        // (the sub-task intent), not from enriched previous-step data which may contain
+        // irrelevant content from prior pages
         if (taskContext) {
-          const taskWords = taskContext.toLowerCase().match(/[a-z]{4,}/g) || [];
-          const distinctiveWords = [...new Set(taskWords)].filter(w => !['that', 'with', 'then', 'check', 'write', 'email', 'launching'].includes(w)).slice(0, 4);
+          // Take only the first line (sub-task intent) to avoid false positives from enriched context
+          const intentLine = taskContext.split('\n')[0] || taskContext;
+          const taskWords = intentLine.toLowerCase().match(/[a-z]{4,}/g) || [];
+          const stopWords = ['that', 'with', 'then', 'check', 'write', 'email', 'launching', 'search',
+            'find', 'about', 'compile', 'tell', 'from', 'into', 'steps', 'data', 'previous', 'content'];
+          const distinctiveWords = [...new Set(taskWords)].filter(w => !stopWords.includes(w)).slice(0, 4);
           if (distinctiveWords.length > 0) {
             const lower = trimmed.toLowerCase();
             const hitCount = distinctiveWords.filter(w => lower.includes(w)).length;
@@ -7447,6 +7983,17 @@ async function handleMessage(request, sender) {
       });
     } catch {}
     return { success: true };
+  }
+
+  // ── LEARNING MODE: Forward consequential action consent to side panel / floating panel ──
+  if (request.type === 'replay_consent_required') {
+    try {
+      chrome.runtime.sendMessage({
+        type: 'replay_consent_notify',
+        data: request.data,
+      }).catch(() => {});
+    } catch {}
+    return { received: true };
   }
 
   return { success: false, error: `Unknown message type: ${request.type}` };

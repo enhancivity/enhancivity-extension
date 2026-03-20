@@ -1,0 +1,14 @@
+{
+  "action_type": "NAVIGATE",
+  "headline": "Opening that page for you",
+  "rationale": "You want to go to a specific page. Navigating now.",
+  "primary_content": "Navigating to the requested page.",
+  "consent_level": "auto",
+  "dom_actions": [
+    {
+      "action": "navigate",
+      "value": "http://localhost:3099/harness/form-page.html",
+      "description": "Navigate to the test form page"
+    }
+  ]
+}
