@@ -1611,7 +1611,7 @@ function renderComparison(container, data) {
 
 // ── Defensive Pipeline: typed errors + timeout ───────────────
 
-const PIPELINE_TIMEOUT_MS = 90000; // 90 seconds
+const PIPELINE_TIMEOUT_MS = 300000; // 5 minutes — chains span multiple sites and need time
 
 function sendToBackground(type, data, timeoutMs = PIPELINE_TIMEOUT_MS) {
   return new Promise((resolve) => {
@@ -1652,6 +1652,14 @@ function sendToBackground(type, data, timeoutMs = PIPELINE_TIMEOUT_MS) {
     }
   });
 }
+
+// ── Chain progress listener ──────────────────────────────────
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === 'chain_progress') {
+    const { step, total, description } = message.data || {};
+    setStage(`Chain ${step}/${total}: ${description}`);
+  }
+});
 
 function showView(id) {
   document.querySelectorAll('.view').forEach(v => v.classList.add('hidden'));

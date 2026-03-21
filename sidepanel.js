@@ -9,7 +9,7 @@
 
 // ── Constants ────────────────────────────────────────────────
 
-const PIPELINE_TIMEOUT_MS = 90000;
+const PIPELINE_TIMEOUT_MS = 300000; // 5 minutes — chains span multiple sites and need time
 
 const PLACEHOLDERS = {
   gmail:   'Analyze this email...',
@@ -2818,6 +2818,15 @@ function setupLearningMode() {
       const bar = $('#learning-replay-progress-bar');
       if (label) label.textContent = `Step ${stepNumber}/${totalSteps}: ${description || ''}`;
       if (bar) bar.style.width = `${Math.round((stepNumber / totalSteps) * 100)}%`;
+    }
+
+    // Chain progress: show status updates during multi-site execution
+    if (msg.type === 'chain_progress') {
+      const { step, total, description } = msg.data || {};
+      const label = $('#learning-replay-step-label');
+      const bar = $('#learning-replay-progress-bar');
+      if (label) label.textContent = `Chain ${step}/${total}: ${description}`;
+      if (bar) bar.style.width = `${Math.round((step / total) * 100)}%`;
     }
 
     // ONE-INCH RULE: Notify user when replay pauses at a consequential action

@@ -418,47 +418,19 @@
   }
 
   // ── Dangerous button detection ──────────────────────────────
-  // Two tiers:
-  //   EXACT  — button text must be EXACTLY this (e.g., "post", "send", "submit")
-  //            This prevents blocking "Create Post", "Post Launch", etc.
-  //   PHRASE — button text must CONTAIN this phrase (multi-word = specific enough)
-  const DANGEROUS_EXACT = new Set([
-    'send', 'submit', 'post', 'publish', 'pay', 'delete', 'remove',
-  ]);
-  const DANGEROUS_PHRASE = [
-    'purchase', 'buy now', 'place order', 'confirm order',
-    'complete purchase', 'checkout', 'place your order',
-  ];
-
-  // AI chatbot sites where clicking Send/Submit is expected and non-consequential.
-  // The One-Inch Rule does NOT apply here — typing a question into a chatbot is not
-  // a consequential third-party action (no money, no irreversible data change).
-  const CHATBOT_ALLOWLIST = [
-    'chatgpt.com', 'chat.openai.com', 'claude.ai', 'gemini.google.com',
-  ];
-
-  function isOnChatbotSite() {
-    try {
-      const hostname = window.location.hostname;
-      return CHATBOT_ALLOWLIST.some(domain => hostname === domain || hostname.endsWith('.' + domain));
-    } catch { return false; }
-  }
+  // Uses the shared consequential_actions.js system (injected via manifest.json).
+  // 5-Layer architecture: Always-Block → Always-Safe → Structural Finality → LLM → Recording
+  // See docs/CONSEQUENTIAL_ACTION_SYSTEM.md for full documentation.
+  const _ca = globalThis.__enhancivityConsequentialActions || {};
 
   function isDangerousClick(el) {
-    const text = (el.innerText || el.value || el.textContent || '').toLowerCase().trim();
-    // On chatbot sites, "send" and "submit" are safe — they just send a chat message
-    if (isOnChatbotSite()) {
-      // Still block actual dangerous actions even on chatbot sites (pay, delete, purchase)
-      const CHATBOT_STILL_DANGEROUS = new Set(['pay', 'delete', 'remove']);
-      if (CHATBOT_STILL_DANGEROUS.has(text)) return true;
-      if (DANGEROUS_PHRASE.some(d => text.includes(d))) return true;
-      return false;
+    if (!_ca.assessAction) {
+      // Fallback: shared module not loaded — use minimal hardcoded check
+      const text = (el.innerText || el.value || el.textContent || '').toLowerCase().trim();
+      return /\b(send|submit|post|publish|pay|delete|remove|buy now|place order|checkout|purchase)\b/i.test(text);
     }
-    // Exact match — the ENTIRE button text must be one of these single words
-    if (DANGEROUS_EXACT.has(text)) return true;
-    // Phrase match — button text contains a multi-word dangerous phrase
-    if (DANGEROUS_PHRASE.some(d => text.includes(d))) return true;
-    return false;
+    const result = _ca.assessAction(el);
+    return result.isDangerous;
   }
 
   // ── Helper: Find element by semantic ID ─────────────────────

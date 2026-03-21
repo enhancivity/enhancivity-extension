@@ -31,7 +31,7 @@
 
   // ── Constants ────────────────────────────────────────────────
 
-  const PIPELINE_TIMEOUT_MS = 90000;
+  const PIPELINE_TIMEOUT_MS = 300000; // 5 minutes — chains span multiple sites and need time
 
   const PLACEHOLDERS = {
     gmail:   'Analyze this email...',
@@ -2973,6 +2973,23 @@
 
       sendResponse({ ok: true });
       return true;
+    }
+
+    // ── Chain progress: show status updates during multi-site execution ──
+    if (message.type === 'chain_progress') {
+      const { step, total, description, nextStep } = message.data || {};
+      const resultArea = panel?.querySelector('.enh-results');
+      if (resultArea) {
+        // Remove previous chain progress notice (keep only latest)
+        resultArea.querySelectorAll('.enh-chain-progress').forEach(el => el.remove());
+        const notice = document.createElement('div');
+        notice.className = 'enh-result-card enh-chain-progress';
+        notice.style.cssText = 'border-left: 3px solid #6366f1; padding: 8px 12px; margin: 6px 0; font-size: 13px; color: #a5b4fc;';
+        notice.innerHTML = `<strong>Chain ${step}/${total}</strong> — ${description}${nextStep ? `<br><span style="color:#818cf8;font-size:11px;">Up next: ${nextStep}</span>` : ''}`;
+        resultArea.appendChild(notice);
+        notice.scrollIntoView({ behavior: 'smooth' });
+      }
+      return;
     }
 
     // ── ONE-INCH RULE: Notify user when replay pauses at a consequential action ──

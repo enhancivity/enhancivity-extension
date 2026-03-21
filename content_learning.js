@@ -438,6 +438,13 @@
       timestamp: now,
     };
 
+    // Classify whether this click is consequential (Send, Buy, Delete, etc.)
+    // Stored in the recipe step so replay knows without runtime analysis.
+    const _ca = globalThis.__enhancivityConsequentialActions;
+    if (_ca?.classifyRecordedClick) {
+      step.action._consequentialClassification = _ca.classifyRecordedClick(el, localStepCount, -1);
+    }
+
     reportStep(step);
     localStepCount++;
     // A click breaks the typing debounce chain
