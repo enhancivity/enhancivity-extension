@@ -10,7 +10,7 @@
 // ============================================================
 
 // Toggle for deployment: 'https://service.enhancivity.com' for production, 'http://localhost:3001' for local dev
-const API_BASE = 'https://service.enhancivity.com';
+const API_BASE = 'http://localhost:3001';
 const MEMORY_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // Allow content scripts to access chrome.storage.session (required for conversation persistence + exploration recovery)
@@ -876,6 +876,11 @@ async function ensureReplayScriptReady(tabId, { forceReinject = false, waitMs = 
       }).catch(() => {});
     }
 
+    // Inject shared consequential actions module first (dependency)
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['consequential_actions.js'],
+    }).catch(() => {}); // Non-fatal — content_replay.js has inline fallback
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ['content_replay.js'],
@@ -1164,6 +1169,10 @@ async function waitForPing(tabId, maxWaitMs = 3000, intervalMs = 100) {
 // into the same tab concurrently. Second caller awaits the first's result.
 const _pendingInjections = new Map(); // tabId → Promise<boolean>
 
+// Scripts that depend on the shared consequential_actions.js module.
+// When injecting these, we inject the dependency first.
+const _CONSEQUENTIAL_DEPENDENTS = new Set(['content_explore.js', 'content_replay.js', 'content_learning.js']);
+
 async function injectAndConfirm(tabId, scriptFile = 'content_explore.js') {
   const existing = _pendingInjections.get(tabId);
   if (existing) {
@@ -1173,6 +1182,13 @@ async function injectAndConfirm(tabId, scriptFile = 'content_explore.js') {
 
   const injectionPromise = (async () => {
     try {
+      // Inject shared consequential actions module first if this script depends on it
+      if (_CONSEQUENTIAL_DEPENDENTS.has(scriptFile)) {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          files: ['consequential_actions.js'],
+        }).catch(() => {}); // Non-fatal — content scripts have inline fallbacks
+      }
       await chrome.scripting.executeScript({
         target: { tabId },
         files: [scriptFile],
@@ -4533,13 +4549,44 @@ function looksEmailLike(text) {
 }
 
 /**
+ * Detect email recipient fields (To, Cc, Bcc) that should become auto-variables.
+ * These get their value from the chain's resolvedInputs at replay time.
+ * The recorded email address is kept as originalFixedValue fallback for standalone replay.
+ */
+function shouldAutoEmailVariable(step) {
+  const action = step?.action || {};
+  if (action.type !== 'type' || (action.inputType !== 'fixed' && action.inputType !== undefined)) return false;
+
+  const value = normalizeRecipeText(action.fixedValue);
+  if (!value || !looksEmailLike(value)) return false;
+
+  const hint = normalizeRecipeText([
+    action.description,
+    action.semanticContext?.label,
+    action.semanticContext?.ariaLabel,
+    action.semanticContext?.placeholder,
+    action.semanticContext?.context,
+    action.semanticContext?.role,
+    action.semanticContext?.tag,
+    action.semanticContext?.type,
+    action.semanticContext?.name,
+    action.semanticContext?.id,
+  ].filter(Boolean).join(' ')).toLowerCase();
+
+  // Match email recipient fields: To, Cc, Bcc, recipient, addressee
+  return /(to\b|cc\b|bcc\b|recipient|email.*address|compose.*to|mail.*to|addressee)/i.test(hint) ||
+    action.semanticContext?.role === 'combobox' ||
+    action.semanticContext?.type === 'email';
+}
+
+/**
  * Detect search/query input fields that should become auto-variables.
  * These get their value from the user's NEW prompt at replay time — no AI call needed.
  * Fast path: variable extraction from prompt, zero latency.
  */
 function shouldAutoVariable(step) {
   const action = step?.action || {};
-  if (action.type !== 'type' || action.inputType !== 'fixed') return false;
+  if (action.type !== 'type' || (action.inputType !== 'fixed' && action.inputType !== undefined)) return false;
 
   const value = normalizeRecipeText(action.fixedValue);
   if (!value || looksEmailLike(value)) return false;
@@ -4582,7 +4629,7 @@ function shouldAutoVariable(step) {
 
 function shouldAutoLlmFill(step) {
   const action = step?.action || {};
-  if (action.type !== 'type' || action.inputType !== 'fixed') return false;
+  if (action.type !== 'type' || (action.inputType !== 'fixed' && action.inputType !== undefined)) return false;
 
   const value = normalizeRecipeText(action.fixedValue);
   if (!value || looksEmailLike(value)) return false;
@@ -4603,11 +4650,14 @@ function shouldAutoLlmFill(step) {
 
   const longText = value.length >= 24 || /\s/.test(value);
   const generativeField = /(message body|body|reply|comment|description|details|summary|post|caption|prompt|content|notes?|headline|subject|title|chat|email)/i.test(hint);
+  const isContentEditable = /contenteditable/i.test(JSON.stringify(action.semanticContext || {}));
   const textSurface = ['textarea'].includes(action.semanticContext?.tag) ||
     action.semanticContext?.role === 'textbox' ||
-    /contenteditable/i.test(JSON.stringify(action.semanticContext || {}));
+    isContentEditable;
 
-  return generativeField || (textSurface && longText);
+  // ContentEditable fields (Gmail compose, rich text editors) are almost always generative —
+  // upgrade them regardless of recorded text length (user may have typed short test text)
+  return generativeField || (textSurface && longText) || isContentEditable;
 }
 
 function buildLlmPromptForStep(step) {
@@ -4640,12 +4690,22 @@ function upgradeRecipeStepForReplay(step, stepNumber) {
     stepNumber: stepNumber || step.stepNumber,
   };
 
-  if (upgraded.action?.type === 'type' && upgraded.action?.inputType === 'fixed') {
+  if (upgraded.action?.type === 'type' && (upgraded.action?.inputType === 'fixed' || upgraded.action?.inputType === undefined)) {
     const normalizedValue = normalizeRecipeText(upgraded.action.fixedValue);
     if (!normalizedValue) return null;
     upgraded.action.fixedValue = normalizedValue;
 
-    if (shouldAutoVariable(upgraded)) {
+    if (shouldAutoEmailVariable(upgraded)) {
+      // Email recipient fields (To, Cc, Bcc): upgrade to variable for chain injection
+      // Value comes from chain's resolvedInputs; original email kept as standalone fallback
+      upgraded.action = {
+        ...upgraded.action,
+        inputType: 'variable',
+        variableName: '__recipient_email',
+        originalFixedValue: normalizedValue,
+      };
+      delete upgraded.action.fixedValue;
+    } else if (shouldAutoVariable(upgraded)) {
       // Search/query fields: upgrade to variable type for fast prompt extraction
       // No AI call needed — value comes directly from user's new prompt
       upgraded.action = {
@@ -5771,7 +5831,8 @@ async function handleMessage(request, sender) {
       const lower = (userPrompt || '').toLowerCase();
       const SITE_KEYWORDS = ['amazon', 'ebay', 'walmart', 'etsy', 'gmail', 'outlook', 'yahoo',
         'linkedin', 'twitter', 'reddit', 'facebook', 'instagram', 'youtube', 'google',
-        'slack', 'discord', 'zillow', 'airbnb', 'indeed'];
+        'slack', 'discord', 'zillow', 'airbnb', 'indeed',
+        'chatgpt', 'gemini', 'claude', 'notion', 'trello', 'github', 'stackoverflow', 'figma'];
       let siteCount = 0;
       const found = new Set();
       for (const kw of SITE_KEYWORDS) {
@@ -5789,6 +5850,21 @@ async function handleMessage(request, sender) {
       const siteDomain = url ? new URL(url).hostname.toLowerCase() : '';
       const isOnMailSite = /mail\.google|gmail|outlook|yahoo/i.test(siteDomain);
       if (!isOnMailSite && /\b(email|compose|write|send|reply|forward|message)\b/i.test(lower)) return true;
+
+      // ── Fallback: detect multi-task language for sites NOT in the dictionary ──
+      // If the user uses sequential/parallel language, let the AI decomposer (Tier 3) decide.
+      // Sequential: "then", "after that", "followed by", "once done", "afterwards"
+      const hasSequentialLanguage = /\bthen\b|\bafter that\b|\band then\b|\bfollowed by\b|\bonce (done|finished)\b|\bwhen (done|finished)\b|\bafterwards?\b/i.test(lower);
+      // Parallel: "ask X and Y and Z", "both", "all three/four/five", "each one/site/platform"
+      const hasParallelLanguage = /\b(ask|check|query|search|open)\b.+\band\b.+\band\b/i.test(lower) ||
+        /\bboth\b/i.test(lower) ||
+        /\ball\s+(three|four|five|six)\b/i.test(lower) ||
+        /\beach\s+(one|site|platform|app)\b/i.test(lower);
+      // Require at least one action verb alongside sequential/parallel language
+      // to avoid false positives on normal sentences containing "then"
+      const hasMultipleActionVerbs = (lower.match(/\b(search|find|send|email|compose|post|buy|open|check|ask|go|navigate|create|fill|submit|upload|write|order|browse|visit)\b/gi) || []).length >= 2;
+      if ((hasSequentialLanguage || hasParallelLanguage) && hasMultipleActionVerbs) return true;
+
       return false;
     })();
 
@@ -5941,8 +6017,28 @@ async function handleMessage(request, sender) {
         const chainResults = [];
         const outputStore = {};
         let chainSuccess = true;
+        const totalSubTasks = chainPlan.subTasks.length;
+
+        // Broadcast chain progress to all UI surfaces (panel, sidepanel, popup)
+        function broadcastChainProgress(step, total, description, nextStep) {
+          const payload = { type: 'chain_progress', data: { step, total, description, nextStep } };
+          // Reach popup + sidepanel
+          try { chrome.runtime.sendMessage(payload).catch(() => {}); } catch {}
+          // Reach content scripts (panel)
+          chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+            if (tab?.id) try { chrome.tabs.sendMessage(tab.id, payload).catch(() => {}); } catch {}
+          }).catch(() => {});
+        }
 
         for (const subTask of chainPlan.subTasks) {
+          // Notify UI about current sub-task
+          const nextSubTask = chainPlan.subTasks.find(st => st.order === subTask.order + 1);
+          broadcastChainProgress(
+            subTask.order, totalSubTasks,
+            `Working on: ${subTask.intent}`,
+            nextSubTask ? nextSubTask.intent : 'Finishing up...'
+          );
+
           // Resolve pending inputs (previous_step references + AI-generated content)
           let resolvedInputs = { ...subTask.resolvedInputs };
           if (subTask.pendingInputs && subTask.pendingInputs.length > 0 && Object.keys(outputStore).length > 0) {
@@ -5966,7 +6062,7 @@ async function handleMessage(request, sender) {
           // Before executing each sub-task, ensure the active tab is on the right domain.
           if (subTask.domain && subTask.order > 1) {
             try {
-              const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+              let [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
               const currentHost = currentTab?.url ? new URL(currentTab.url).hostname.toLowerCase() : '';
               const targetDomain = subTask.domain.toLowerCase();
 
@@ -5998,15 +6094,15 @@ async function handleMessage(request, sender) {
                   await new Promise(r => setTimeout(r, settleTimeMs)); // Let tab re-activate and re-render
                   console.log(`[BG] Chain: switched to existing tab on ${targetDomain} (settled ${settleTimeMs}ms)`);
                 } else {
-                  // Navigate the current tab to the target domain
+                  // Open a NEW tab for the target domain — never overwrite the user's current tab
                   const targetUrl = targetDomain.includes('mail.google') ? 'https://mail.google.com' :
                                     targetDomain.includes('outlook') ? 'https://outlook.live.com' :
                                     `https://${targetDomain}`;
-                  await chrome.tabs.update(currentTab.id, { url: targetUrl });
+                  const newTab = await chrome.tabs.create({ url: targetUrl, active: true });
                   // Wait for page to load
                   await new Promise((resolve) => {
                     const onLoad = (tabId, changeInfo) => {
-                      if (tabId === currentTab.id && changeInfo.status === 'complete') {
+                      if (tabId === newTab.id && changeInfo.status === 'complete') {
                         chrome.tabs.onUpdated.removeListener(onLoad);
                         resolve();
                       }
@@ -6015,7 +6111,9 @@ async function handleMessage(request, sender) {
                     setTimeout(() => { chrome.tabs.onUpdated.removeListener(onLoad); resolve(); }, 15000);
                   });
                   await new Promise(r => setTimeout(r, settleTimeMs)); // Extra settle time for JS apps
-                  console.log(`[BG] Chain: navigated to ${targetUrl} (settled ${settleTimeMs}ms)`);
+                  // Update currentTab reference so subsequent chain steps target the new tab
+                  currentTab = newTab;
+                  console.log(`[BG] Chain: opened new tab for ${targetUrl} (tab ${newTab.id}, settled ${settleTimeMs}ms)`);
                 }
               }
             } catch (navErr) {
@@ -6051,10 +6149,47 @@ async function handleMessage(request, sender) {
                 }
               }
             }
+            // Inject __recipient_email from resolvedInputs or user prompt
+            // Chain decomposer may use keys like 'recipient', 'email', 'to', 'recipient_email'
+            if (!mappedVars.__recipient_email) {
+              for (const [key, val] of Object.entries(resolvedInputs)) {
+                if (/^(recipient|email|to|recipient_email|send_to)$/i.test(key) && typeof val === 'string' && val.includes('@')) {
+                  mappedVars.__recipient_email = val;
+                  break;
+                }
+              }
+            }
+            // Fallback: extract email from the user's original prompt
+            if (!mappedVars.__recipient_email) {
+              const emailMatch = userPrompt.match(/[^\s@]+@[^\s@]+\.[^\s@]+/);
+              if (emailMatch) mappedVars.__recipient_email = emailMatch[0];
+            }
+
             try {
-              // Build rich task context: sub-task intent + data from previous steps
-              // This ensures the LLM knows what was found in step 1 when generating email in step 2
-              let richTaskContext = subTask.intent;
+              // Build rich task context: user's original prompt + sub-task intent + previous steps + AI-generated content
+              // The original prompt is CRITICAL — it contains the user's specific content instructions
+              // (e.g., "tell them I will deploy the code asap") that llm_fill needs to follow.
+              const contextParts = [];
+
+              // 1. User's original prompt — highest priority for content generation
+              contextParts.push(`User's request: ${userPrompt}`);
+
+              // 2. Sub-task intent — what this specific step should accomplish
+              contextParts.push(`Current task: ${subTask.intent}`);
+
+              // 3. AI-generated content from chain resolver — if the backend already generated
+              //    body/subject text via ai_generate, include it so llm_fill can use or refine it
+              const aiGeneratedFields = [];
+              for (const [key, val] of Object.entries(resolvedInputs)) {
+                if (typeof val === 'string' && val.length > 10 && /body|content|message|subject/i.test(key)) {
+                  aiGeneratedFields.push(`Pre-generated ${key}: ${val}`);
+                }
+              }
+              if (aiGeneratedFields.length > 0) {
+                contextParts.push(`AI-generated content (use as primary reference):\n${aiGeneratedFields.join('\n')}`);
+              }
+
+              // 4. Data from previous steps (URLs, page content, etc.)
               if (Object.keys(outputStore).length > 0) {
                 const prevStepSummaries = Object.entries(outputStore)
                   .map(([stepOrder, data]) => {
@@ -6064,8 +6199,10 @@ async function handleMessage(request, sender) {
                     return parts.join('\n');
                   })
                   .join('\n\n');
-                richTaskContext = `${subTask.intent}\n\nData from previous steps:\n${prevStepSummaries}`;
+                contextParts.push(`Data from previous steps:\n${prevStepSummaries}`);
               }
+
+              const richTaskContext = contextParts.join('\n\n');
 
               stepResult = await handleMessage({
                 type: 'learning_replay_recipe',
@@ -6225,6 +6362,15 @@ async function handleMessage(request, sender) {
             duration: stepResult?.durationMs || 0,
             error: stepResult?.error || null,
           });
+
+          // Notify UI that this sub-task completed
+          broadcastChainProgress(
+            subTask.order, totalSubTasks,
+            stepResult?.success
+              ? `Done: ${subTask.intent}`
+              : `Failed: ${subTask.intent}`,
+            nextSubTask ? `Next: ${nextSubTask.intent}` : 'Finishing up...'
+          );
 
           // If a critical sub-task failed, stop the chain
           if (!stepResult?.success) {
@@ -7321,6 +7467,11 @@ async function handleMessage(request, sender) {
     // Use originalPrompt (the user's raw input) for search query extraction.
     // taskContext may contain enriched data from previous chain steps — don't use it for search.
     const promptForSearch = originalPrompt || taskContext || '';
+
+    // Extract email addresses from the prompt before stripping them for search query
+    const emailsInPrompt = promptForSearch.match(/[^\s@]+@[^\s@]+\.[^\s@]+/g) || [];
+    const recipientEmail = emailsInPrompt[0] || variables?.__recipient_email || '';
+
     const searchQueryFromPrompt = promptForSearch
       .replace(/\b(search|find|look\s*for|browse|shop|buy|purchase|order|get|show|display|email|compose|write|send|reply|message|forward|then|and|on|in|at|the|a|an|for|to|from|my|me|please|can|you|i|want|need|under|over|below|above|less\s*than|more\s*than|cheaper\s*than|about|tell|compile)\b/gi, ' ')
       .replace(/\b(amazon|ebay|walmart|etsy|gmail|outlook|yahoo|linkedin|twitter|reddit|facebook|instagram|youtube|google|slack|discord|zillow|airbnb|indeed|circlenomy)\b/gi, ' ')
@@ -7333,6 +7484,7 @@ async function handleMessage(request, sender) {
       __task_context: taskContext || runtimeRecipe?.workflowName || '',
       __workflow_name: runtimeRecipe?.workflowName || '',
       __search_query: searchQueryFromPrompt || variables?.__search_query || '',
+      __recipient_email: recipientEmail,
     };
     const hasSwitchTab = runtimeRecipe.steps.some(s => s.action.type === 'switch_tab');
 
@@ -7882,23 +8034,38 @@ async function handleMessage(request, sender) {
       const workflowName = extraContext?.workflowName || '';
 
       const buildRecipeFillRequest = (strict = false) => {
+        // Extract the user's original request from task context (first line after "User's request:")
+        const userRequestMatch = taskContext.match(/User's request:\s*(.+?)(?:\n|$)/i);
+        const userOriginalRequest = userRequestMatch ? userRequestMatch[1].trim() : '';
+
+        // Extract any pre-generated content from task context
+        const preGenMatch = taskContext.match(/Pre-generated (?:body|content|message):\s*(.+?)(?:\n\n|$)/is);
+        const preGeneratedContent = preGenMatch ? preGenMatch[1].trim() : '';
+
         const systemPrompt = [
           'You are a text generation assistant embedded in a browser automation workflow.',
           'The user is replaying a recipe and needs you to generate text to fill into a form field.',
-          'Your highest priority is the current task context, not stale page text from previous screens.',
+          'PRIORITY ORDER for content generation:',
+          '1. If pre-generated content is provided below, use it as-is or refine it slightly.',
+          '2. If the user\'s original request specifies what to write, follow that instruction exactly.',
+          '3. Use task context and page context only as supporting reference.',
+          'NEVER use example text from recipe recordings. NEVER use placeholder or test content.',
           'Generate ONLY the text content for the target field.',
-          'Do not return JSON, markdown, labels, commentary, or explanation unless the user explicitly asked for that exact format.',
-          'If page context conflicts with task context, follow the task context.',
+          'Do not return JSON, markdown, labels, commentary, or explanation.',
           strict ? 'This is a retry because the previous output was invalid. Return plain natural language text only.' : '',
           fieldDescription ? `Field: ${fieldDescription}` : '',
           workflowName ? `Workflow: ${workflowName}` : '',
-          taskContext ? `Current task context:\n${taskContext}` : '',
+          userOriginalRequest ? `User's original request: "${userOriginalRequest}"` : '',
+          preGeneratedContent ? `Pre-generated content (use this as primary source):\n${preGeneratedContent}` : '',
+          taskContext ? `Full task context:\n${taskContext}` : '',
           pageContext ? `Visible page context (secondary reference only):\n${pageContext.slice(0, 1200)}` : '',
         ].filter(Boolean).join('\n');
 
         const userPrompt = [
           prompt,
-          taskContext ? `Current task: ${taskContext}` : '',
+          userOriginalRequest ? `The user said: "${userOriginalRequest}" — follow this instruction for content.` : '',
+          preGeneratedContent ? `Use this pre-generated content: "${preGeneratedContent}"` : '',
+          taskContext && !userOriginalRequest ? `Current task: ${taskContext}` : '',
           strict ? 'Return only the final text that should be typed into the field.' : '',
         ].filter(Boolean).join('\n\n');
 
