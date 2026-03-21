@@ -526,23 +526,20 @@
     }
   }
 
-  // Consequential action patterns — clicking these requires user consent (ONE-INCH RULE).
-  // The replay pauses BEFORE clicking these, highlights the button, and waits for user action.
-  const CONSEQUENTIAL_CLICK_PATTERNS = /\b(send|submit|purchase|buy\s*now|place\s*order|confirm\s*order|pay\s*now|checkout|delete|remove|unsubscribe|cancel\s*subscription|sign\s*out|log\s*out)\b/i;
-  const CONSEQUENTIAL_ARIA_PATTERNS = /\b(send|submit|purchase|buy|place.order|pay|delete|remove)\b/i;
+  // ── Consequential Action Detection ──────────────────────────
+  // Uses the shared consequential_actions.js system (injected via manifest.json).
+  // 5-Layer architecture: Always-Block → Always-Safe → Structural Finality → LLM → Recording
+  // See docs/CONSEQUENTIAL_ACTION_SYSTEM.md for full documentation.
+  //
+  // Core Principle: Block ONLY when data irreversibly leaves the user's local
+  // environment to a third-party system. Intermediate "Submit" buttons in
+  // multi-step wizards (e.g., Facebook Ads demographics) are SAFE to click.
+  const _ca = globalThis.__enhancivityConsequentialActions || {};
 
-  // Category-specific keywords for timeout assignment
-  const PURCHASE_KEYWORDS = /\b(buy|purchase|place\s*order|confirm\s*order|checkout)\b/i;
-  const PAYMENT_KEYWORDS = /\b(pay|confirm\s*payment|authorize|transfer|wire)\b/i;
-  const SEND_KEYWORDS = /\b(send|reply|forward|post|publish|tweet|share)\b/i;
-  const DELETE_KEYWORDS = /\b(delete|remove|unsubscribe|cancel\s*subscription|close\s*account|deactivate)\b/i;
-
-  function classifyConsequentialCategory(hints) {
-    if (PURCHASE_KEYWORDS.test(hints)) return 'purchase';
-    if (PAYMENT_KEYWORDS.test(hints)) return 'payment';
-    if (DELETE_KEYWORDS.test(hints)) return 'delete';
-    if (SEND_KEYWORDS.test(hints)) return 'send';
-    return 'confirm';
+  // Map shared category names to legacy names used by waitForHumanDecision
+  function _mapCategory(sharedCategory) {
+    const MAP = { purchasing: 'purchase', approval: 'payment', sending: 'send', destructive: 'delete', publishing: 'send' };
+    return MAP[sharedCategory] || 'confirm';
   }
 
   function getTimeoutForCategory(category) {
@@ -556,6 +553,13 @@
   }
 
   function getCriticalMessage(category, actionName) {
+    if (_ca.PAUSE_BEHAVIOR) {
+      // Use the shared system's message generator
+      const sharedCat = { purchase: 'purchasing', payment: 'approval', send: 'sending', delete: 'destructive' }[category] || 'unknown';
+      const behavior = _ca.PAUSE_BEHAVIOR[sharedCat] || _ca.PAUSE_BEHAVIOR.unknown;
+      if (behavior?.message) return behavior.message(actionName);
+    }
+    // Fallback
     switch (category) {
       case 'purchase': return `Ready to purchase — click "${actionName}" when you want to buy`;
       case 'payment':  return `Payment ready — click "${actionName}" to confirm`;
@@ -566,33 +570,40 @@
   }
 
   function isConsequentialClick(action, element) {
-    // Check action description and semantic context
+    // ── Priority 1: Recipe step has pre-classified consequential status (from recording) ──
+    if (action._consequentialClassification) {
+      return action._consequentialClassification.requiresHumanConfirmation === true;
+    }
+
+    // ── Priority 2: Use shared layered detection system ──
+    if (_ca.assessAction) {
+      const result = _ca.assessAction(element, action);
+      return result.isDangerous;
+    }
+
+    // ── Fallback: minimal hardcoded check (shared module not loaded) ──
     const hints = [
       action.description,
       action.semanticContext?.label,
       action.semanticContext?.ariaLabel,
       action.semanticContext?.text,
-      action.semanticContext?.placeholder,
+      (element?.textContent || '').trim().slice(0, 50),
+      element?.getAttribute('aria-label') || '',
     ].filter(Boolean).join(' ');
 
-    if (CONSEQUENTIAL_CLICK_PATTERNS.test(hints)) return true;
+    return /\b(send|purchase|buy\s*now|place\s*order|pay\s*now|checkout|delete\s*permanently|publish|go\s*live)\b/i.test(hints);
+  }
 
-    // Check the actual element's visible text and ARIA attributes
-    if (element) {
-      const elText = (element.textContent || '').trim().slice(0, 50);
-      const elAriaLabel = element.getAttribute('aria-label') || '';
-      const elType = (element.getAttribute('type') || '').toLowerCase();
-
-      if (CONSEQUENTIAL_CLICK_PATTERNS.test(elText)) return true;
-      if (CONSEQUENTIAL_ARIA_PATTERNS.test(elAriaLabel)) return true;
-      if (elType === 'submit' && CONSEQUENTIAL_CLICK_PATTERNS.test(elText + ' ' + elAriaLabel)) return true;
-
-      // Gmail-specific: Send button detection
-      if (element.closest('[role="button"]')?.getAttribute('aria-label')?.toLowerCase().includes('send')) return true;
-      if (element.closest('[data-tooltip]')?.getAttribute('data-tooltip')?.toLowerCase().includes('send')) return true;
+  function classifyConsequentialCategory(hints) {
+    if (_ca.classifyCategory) {
+      return _mapCategory(_ca.classifyCategory(hints));
     }
-
-    return false;
+    // Fallback
+    if (/\b(buy|purchase|place\s*order|checkout)\b/i.test(hints)) return 'purchase';
+    if (/\b(pay|authorize|transfer)\b/i.test(hints)) return 'payment';
+    if (/\b(delete|remove|unsubscribe|cancel\s*subscription)\b/i.test(hints)) return 'delete';
+    if (/\b(send|reply|forward|post|publish|tweet|share)\b/i.test(hints)) return 'send';
+    return 'confirm';
   }
 
   // Wait for user to click the consequential element, skip, or timeout
@@ -748,6 +759,20 @@
     const prevOutline = el.style.outline;
     el.style.outline = '2px solid #6366f1';
     setTimeout(() => { el.style.outline = prevOutline; }, 800);
+
+    // Wait for disabled buttons to become enabled (e.g., ChatGPT send button
+    // enables after text appears in the input with a brief delay)
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') {
+      const maxWait = 2000;
+      const pollInterval = 200;
+      const startTime = Date.now();
+      while ((el.disabled || el.getAttribute('aria-disabled') === 'true') && Date.now() - startTime < maxWait) {
+        await delay(pollInterval);
+      }
+      if (el.disabled || el.getAttribute('aria-disabled') === 'true') {
+        console.warn(`[Enhancivity Replay] Button still disabled after ${maxWait}ms, attempting click anyway: "${action.description || 'unknown'}"`);
+      }
+    }
 
     // Snapshot pre-click state for navigation detection
     const preClickUrl = window.location.href;
