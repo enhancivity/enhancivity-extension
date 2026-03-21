@@ -6272,10 +6272,11 @@ async function handleMessage(request, sender) {
                 return parts.join(' | ');
               })
               .join('\n');
-            const contextParts = [subTask.intent];
+            const contextParts = [`Current task: ${subTask.intent}`];
+            contextParts.push(`Original request: ${userPrompt}`);
             if (inputContext) contextParts.push(`Inputs: ${inputContext}`);
             if (prevStepData) contextParts.push(`Data from previous steps:\n${prevStepData}`);
-            const focusedPrompt = contextParts.join('. ');
+            const focusedPrompt = contextParts.join('\n');
 
             try {
               // Get current tab context for the AI
