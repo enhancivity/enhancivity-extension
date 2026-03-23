@@ -29,6 +29,15 @@ function fixture(name) {
 // ── Explore step counter (per-session) ───────────────────────
 let exploreStepCounter = 0;
 
+// ── Data-transfer scenario support ───────────────────────────
+let activeScenario = 'default';
+let dataTransferStep = 0;
+
+const SUBSCRIPTION_TSV = 'Service\tPlan\tAmount\tNext Billing\nSpotify\tPremium\t$9.99\tApr 15\nNetflix\tStandard\t$15.49\tApr 20\nGitHub\tPro\t$4.00\tApr 1\nClaude\tMax\t$100.00\tApr 10';
+const SUBSCRIPTION_TSV_BATCH2 = 'AWS\tBusiness\t$29.99\tApr 5';
+const SPREADSHEET_URL = 'http://localhost:3099/harness/spreadsheet.html';
+const EMAIL_URL = 'http://localhost:3099/harness/email-detail.html';
+
 // ── ERROR MODE (for testing error scenarios) ─────────────────
 // Tests toggle this by POSTing to /test/set-error-mode
 let errorMode = null;
@@ -38,9 +47,17 @@ app.post('/test/set-error-mode', (req, res) => {
   res.json({ success: true, mode: errorMode });
 });
 
+app.post('/test/set-scenario', (req, res) => {
+  activeScenario = req.body.scenario || 'default';
+  dataTransferStep = 0;
+  res.json({ success: true, scenario: activeScenario });
+});
+
 app.post('/test/reset', (req, res) => {
   errorMode = null;
   exploreStepCounter = 0;
+  activeScenario = 'default';
+  dataTransferStep = 0;
   res.json({ success: true });
 });
 
@@ -149,6 +166,76 @@ app.post('/api/agent/explore-plan', (req, res) => {
 });
 
 app.post('/api/agent/explore-step', (req, res) => {
+  // ── Data-transfer scenario: email → spreadsheet (6 steps) ──
+  if (activeScenario === 'data-transfer') {
+    dataTransferStep++;
+    const steps = [
+      // Step 1: Scrape email page, extract subscription data
+      { nextAction: { type: 'scrape_page', description: 'Read subscription table from email' }, extractedData: SUBSCRIPTION_TSV, reasoning: 'Extracting subscription data from email.' },
+      // Step 2: Navigate to spreadsheet
+      { nextAction: { type: 'navigate', target: SPREADSHEET_URL, description: 'Navigate to spreadsheet' }, reasoning: 'Moving to target spreadsheet.' },
+      // Step 3: Click cell A1
+      { nextAction: { type: 'click_element', target: 'cell-a1', description: 'Click cell A1 to start pasting' }, reasoning: 'Selecting starting cell.' },
+      // Step 4: Paste scratchpad data
+      { nextAction: { type: 'paste_tsv', value: '__USE_SCRATCHPAD__', description: 'Paste subscription data into spreadsheet' }, reasoning: 'Bulk-pasting extracted data.' },
+      // Step 5: Verify paste
+      { nextAction: { type: 'scrape_page', description: 'Verify data landed in spreadsheet' }, reasoning: 'Checking paste result.' },
+      // Step 6: Goal complete
+      { isGoalComplete: true, goalResult: 'Successfully transferred subscription data (4 rows × 4 columns) from email to spreadsheet.', nextAction: null },
+    ];
+    const step = steps[Math.min(dataTransferStep - 1, steps.length - 1)];
+    return res.json({
+      nextAction: step.nextAction || null,
+      reasoning: step.reasoning || 'Completing task.',
+      revisedStrategy: null,
+      isGoalComplete: step.isGoalComplete || false,
+      goalResult: step.goalResult || null,
+      extractedData: step.extractedData || null,
+      needsConsent: false,
+      consentReason: null,
+    });
+  }
+
+  // ── Data-transfer-roundtrip scenario: email → sheet → email → sheet (10 steps) ──
+  // Tests that navigate to the same URL twice does NOT trigger cycle detection
+  if (activeScenario === 'data-transfer-roundtrip') {
+    dataTransferStep++;
+    const steps = [
+      // Step 1: Scrape email — batch 1
+      { nextAction: { type: 'scrape_page', description: 'Read subscription table from email' }, extractedData: SUBSCRIPTION_TSV, reasoning: 'Extracting first batch of data.' },
+      // Step 2: Navigate to spreadsheet
+      { nextAction: { type: 'navigate', target: SPREADSHEET_URL, description: 'Navigate to spreadsheet' }, reasoning: 'Moving to spreadsheet.' },
+      // Step 3: Click cell A1
+      { nextAction: { type: 'click_element', target: 'cell-a1', description: 'Click cell A1' }, reasoning: 'Selecting starting cell.' },
+      // Step 4: Paste batch 1
+      { nextAction: { type: 'paste_tsv', value: '__USE_SCRATCHPAD__', description: 'Paste first batch' }, reasoning: 'Pasting first batch.' },
+      // Step 5: Navigate BACK to email for more data
+      { nextAction: { type: 'navigate', target: EMAIL_URL, description: 'Navigate back to email for more data' }, reasoning: 'Returning to source for second batch.' },
+      // Step 6: Scrape email — batch 2
+      { nextAction: { type: 'scrape_page', description: 'Read additional data from email' }, extractedData: SUBSCRIPTION_TSV_BATCH2, reasoning: 'Extracting second batch.' },
+      // Step 7: Navigate to spreadsheet AGAIN (same URL as step 2 — would trigger old cycle bug)
+      { nextAction: { type: 'navigate', target: SPREADSHEET_URL, description: 'Navigate back to spreadsheet' }, reasoning: 'Returning to spreadsheet with second batch.' },
+      // Step 8: Click cell A5
+      { nextAction: { type: 'click_element', target: 'cell-a5', description: 'Click cell A5' }, reasoning: 'Selecting next empty cell.' },
+      // Step 9: Paste batch 2
+      { nextAction: { type: 'paste_tsv', value: '__USE_SCRATCHPAD__', description: 'Paste second batch' }, reasoning: 'Pasting second batch.' },
+      // Step 10: Goal complete
+      { isGoalComplete: true, goalResult: 'Successfully transferred all subscription data (5 rows) from email to spreadsheet in 2 batches.', nextAction: null },
+    ];
+    const step = steps[Math.min(dataTransferStep - 1, steps.length - 1)];
+    return res.json({
+      nextAction: step.nextAction || null,
+      reasoning: step.reasoning || 'Completing task.',
+      revisedStrategy: null,
+      isGoalComplete: step.isGoalComplete || false,
+      goalResult: step.goalResult || null,
+      extractedData: step.extractedData || null,
+      needsConsent: false,
+      consentReason: null,
+    });
+  }
+
+  // ── Default explore-step behavior ──
   exploreStepCounter++;
 
   if (exploreStepCounter >= 5) {
@@ -367,6 +454,61 @@ app.get('/api/recipes/match', (req, res) => {
   if (task.includes('fill') && task.includes('form')) {
     return res.json(fixture('recipe-match-fingerprint.json'));
   }
+  // Low-score own recipe — always matched regardless of score
+  if (task.includes('low-score-own')) {
+    return res.json({
+      success: true,
+      found: true,
+      recipe: {
+        id: 'own-low-score-001',
+        workflowName: 'My form recipe (low score)',
+        siteDomain: 'localhost',
+        stepCount: 2,
+        confidence: 0.3,
+        validationCount: 1,
+        status: 'CANDIDATE',
+        trainedBy: 'test-user-001',
+        startUrl: 'http://localhost:3099/harness/form-page.html',
+        steps: [
+          { stepNumber: 1, action: { type: 'click', selectors: [{ strategy: 'css-id', value: '#first-name', priority: 1 }], description: 'Click name field' } },
+          { stepNumber: 2, action: { type: 'type', selectors: [{ strategy: 'css-id', value: '#first-name', priority: 1 }], inputType: 'variable', variableName: 'userName', description: 'Type name' } },
+        ],
+        variables: [{ name: 'userName', description: 'Name' }],
+        variables: [],
+        fingerprint: { domains: ['localhost'], category: 'other', actionSignature: [], requiresInputs: [], producesOutputs: ['page-url'] },
+        autoDescription: 'Low score own recipe',
+      },
+      matchType: 'structural',
+      score: 5,
+    });
+  }
+  // Community recipe recommendation
+  if (task.includes('community-recipe')) {
+    return res.json({
+      success: true,
+      found: true,
+      recipe: {
+        id: 'community-rec-001',
+        workflowName: 'Community form fill',
+        siteDomain: 'localhost',
+        stepCount: 2,
+        confidence: 0.9,
+        validationCount: 10,
+        status: 'PROMOTED',
+        trainedBy: 'other-user-999',
+        startUrl: 'http://localhost:3099/harness/form-page.html',
+        steps: [
+          { type: 'click', selectors: [{ strategy: 'css-id', value: '#first-name' }], description: 'Click name field' },
+          { type: 'type', selectors: [{ strategy: 'css-id', value: '#first-name' }], value: 'CommunityUser', description: 'Type name' },
+        ],
+        variables: [],
+        fingerprint: { domains: ['localhost'], category: 'fill-form', actionSignature: [], requiresInputs: [], producesOutputs: ['page-url'] },
+        autoDescription: 'Community recommended recipe',
+      },
+      matchType: 'structural',
+      score: 85,
+    });
+  }
   res.json({ success: true, found: false });
 });
 
@@ -511,7 +653,15 @@ app.post('/api/sitemap/capture', (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/api/sitemap/capture-action', (req, res) => {
+  res.json({ success: true });
+});
+
 app.get('/api/sitemap/lookup', (req, res) => {
+  res.json({ success: true, found: false });
+});
+
+app.post('/api/sitemap/lookup-action', (req, res) => {
   res.json({ success: true, found: false });
 });
 

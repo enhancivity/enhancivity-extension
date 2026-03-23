@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Mock Spreadsheet — Enhancivity Harness</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 700px; margin: 40px auto; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #6366f1; font-size: 20px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+    th { padding: 6px 10px; background: #12121a; color: #a5b4fc; font-size: 12px; border: 1px solid #333; text-align: center; width: 25%; }
+    th:first-child { width: 30px; }
+    td { padding: 6px 10px; border: 1px solid #333; font-size: 14px; min-height: 24px; }
+    td:first-child { background: #12121a; color: #a5b4fc; font-size: 12px; text-align: center; width: 30px; }
+    td[contenteditable] { cursor: text; background: #0d0d15; }
+    td[contenteditable]:focus { outline: 2px solid #6366f1; background: #1a1a2e; }
+    #paste-result { margin-top: 16px; padding: 12px; background: #12121a; border: 1px solid #333; border-radius: 6px; font-size: 12px; color: #4ade80; white-space: pre-wrap; display: none; }
+  </style>
+</head>
+<body>
+  <h1 data-enh-sid="sheet-title">Spreadsheet</h1>
+
+  <table id="spreadsheet-grid" data-enh-sid="sheet-grid">
+    <thead>
+      <tr><th></th><th>A</th><th>B</th><th>C</th><th>D</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td contenteditable="true" data-enh-sid="cell-a1" id="cell-a1" role="textbox" aria-label="Cell A1"></td>
+        <td contenteditable="true" data-enh-sid="cell-b1" id="cell-b1" role="textbox" aria-label="Cell B1"></td>
+        <td contenteditable="true" data-enh-sid="cell-c1" id="cell-c1" role="textbox" aria-label="Cell C1"></td>
+        <td contenteditable="true" data-enh-sid="cell-d1" id="cell-d1" role="textbox" aria-label="Cell D1"></td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td contenteditable="true" data-enh-sid="cell-a2" id="cell-a2" role="textbox" aria-label="Cell A2"></td>
+        <td contenteditable="true" data-enh-sid="cell-b2" id="cell-b2" role="textbox" aria-label="Cell B2"></td>
+        <td contenteditable="true" data-enh-sid="cell-c2" id="cell-c2" role="textbox" aria-label="Cell C2"></td>
+        <td contenteditable="true" data-enh-sid="cell-d2" id="cell-d2" role="textbox" aria-label="Cell D2"></td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td contenteditable="true" data-enh-sid="cell-a3" id="cell-a3" role="textbox" aria-label="Cell A3"></td>
+        <td contenteditable="true" data-enh-sid="cell-b3" id="cell-b3" role="textbox" aria-label="Cell B3"></td>
+        <td contenteditable="true" data-enh-sid="cell-c3" id="cell-c3" role="textbox" aria-label="Cell C3"></td>
+        <td contenteditable="true" data-enh-sid="cell-d3" id="cell-d3" role="textbox" aria-label="Cell D3"></td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td contenteditable="true" data-enh-sid="cell-a4" id="cell-a4" role="textbox" aria-label="Cell A4"></td>
+        <td contenteditable="true" data-enh-sid="cell-b4" id="cell-b4" role="textbox" aria-label="Cell B4"></td>
+        <td contenteditable="true" data-enh-sid="cell-c4" id="cell-c4" role="textbox" aria-label="Cell C4"></td>
+        <td contenteditable="true" data-enh-sid="cell-d4" id="cell-d4" role="textbox" aria-label="Cell D4"></td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td contenteditable="true" data-enh-sid="cell-a5" id="cell-a5" role="textbox" aria-label="Cell A5"></td>
+        <td contenteditable="true" data-enh-sid="cell-b5" id="cell-b5" role="textbox" aria-label="Cell B5"></td>
+        <td contenteditable="true" data-enh-sid="cell-c5" id="cell-c5" role="textbox" aria-label="Cell C5"></td>
+        <td contenteditable="true" data-enh-sid="cell-d5" id="cell-d5" role="textbox" aria-label="Cell D5"></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div id="paste-result"></div>
+
+  <script>
+    // Track paste events for test verification
+    document.querySelectorAll('[contenteditable]').forEach(cell => {
+      cell.addEventListener('paste', (e) => {
+        const text = e.clipboardData?.getData('text/plain') || '';
+        const resultEl = document.getElementById('paste-result');
+        resultEl.textContent = text;
+        resultEl.style.display = 'block';
+        resultEl.setAttribute('data-paste-length', text.length);
+      });
+    });
+  </script>
+</body>
+</html>

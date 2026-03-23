@@ -21,12 +21,17 @@
     "https://enhancivity.com/*",
     "http://localhost:3000/*",
     "http://localhost:3001/*",
-    "http://localhost:3002/*"
+    "http://localhost:3002/*",
+    "http://localhost:3099/*"
   ],
   "content_scripts": [
     {
-      "matches": ["https://mail.google.com/*"],
-      "js": ["content_gmail.js"],
+      "matches": [
+        "https://mail.google.com/*"
+      ],
+      "js": [
+        "content_gmail.js"
+      ],
       "run_at": "document_idle"
     },
     {
@@ -38,7 +43,9 @@
         "https://www.amazon.ca/*",
         "https://www.amazon.com.au/*"
       ],
-      "js": ["content_amazon.js"],
+      "js": [
+        "content_amazon.js"
+      ],
       "run_at": "document_idle"
     },
     {
@@ -48,7 +55,9 @@
         "http://localhost:3001/*",
         "http://localhost:3002/*"
       ],
-      "js": ["dashboard_bridge.js"],
+      "js": [
+        "dashboard_bridge.js"
+      ],
       "run_at": "document_idle"
     }
   ],
@@ -72,12 +81,19 @@
   },
   "oauth2": {
     "client_id": "409104365095-beonfvn8d6cdtnmgcjqk42bav4uk5amc.apps.googleusercontent.com",
-    "scopes": ["email", "profile"]
+    "scopes": [
+      "email",
+      "profile"
+    ]
   },
   "web_accessible_resources": [
     {
-      "resources": ["images/*.png"],
-      "matches": ["<all_urls>"]
+      "resources": [
+        "images/*.png"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ]
 }

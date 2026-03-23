@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Search Results — Stubborn Modal</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 20px; }
+    .overlay {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.7); z-index: 999;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .overlay.hidden { display: none; }
+    .modal-box {
+      background: white; border-radius: 8px; padding: 24px; width: 420px;
+      position: relative; color: #333;
+    }
+    .modal-box h2 { margin-top: 0; }
+    /* X button — visually inside modal but NOT a child of [role=dialog] container.
+       Amazon does this: the close X is a sibling of the modal box, positioned over it. */
+    .close-x-external {
+      position: absolute; top: -10px; right: -10px; z-index: 1001;
+      background: #fff; border: 1px solid #ccc; border-radius: 50%;
+      width: 28px; height: 28px; font-size: 16px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      color: #666; line-height: 1;
+    }
+    .btn { padding: 8px 16px; cursor: pointer; border-radius: 4px; font-size: 14px; margin-top: 8px; display: block; width: 100%; }
+    .btn-yellow { background: #f0c14b; border: 1px solid #a88734; }
+    .btn-grey { background: #eee; border: 1px solid #ccc; }
+    .product { padding: 8px 0; border-bottom: 1px solid #eee; }
+    .product a { color: #0066c0; text-decoration: none; }
+    .product .price { color: #b12704; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Search Results</h1>
+  <p>Showing results for <b>laptop under 500 euro</b></p>
+
+  <div class="product"><a href="/product/1">Lenovo IdeaPad Slim 3</a><div class="price">€194.98</div></div>
+  <div class="product"><a href="/product/2">HP EliteBook 840 G6</a><div class="price">€249.00</div></div>
+  <div class="product"><a href="/product/3">Jumper Laptop 17.6"</a><div class="price">€299.00</div></div>
+
+  <!-- Amazon-style modal: the dialog role is on the inner box ONLY.
+       The overlay is a generic div (no role). The close X is on the overlay,
+       NOT inside [role=dialog]. This means inModal=false on the X button. -->
+  <div class="overlay" id="stubborn-modal">
+    <!-- Close X is on the overlay — NOT inside [role=dialog] -->
+    <button class="close-x-external" id="close-x" aria-label="Close">&#215;</button>
+    <div class="modal-box" role="dialog" aria-modal="true" aria-label="Choose your location">
+      <h2>Choose your location</h2>
+      <p>Delivery options vary for different locations.</p>
+      <button class="btn btn-yellow" id="sign-in-btn">Sign in to see your addresses</button>
+      <p style="font-size:13px; margin:8px 0;">or enter a postal code</p>
+      <input type="text" id="postal-code" placeholder="Postal code" style="padding:6px; width:140px;">
+      <button class="btn btn-yellow" id="apply-btn">Apply</button>
+      <button class="btn btn-grey" id="done-btn">Done</button>
+    </div>
+  </div>
+
+  <script>
+    const modal = document.getElementById('stubborn-modal');
+
+    // STUBBORN: Escape does NOT close this modal (Amazon-like behavior)
+    // Only the X button or clicking the overlay background closes it.
+    // "Done" only works with a postal code. "Apply" validates (no-op without code).
+
+    document.getElementById('close-x').addEventListener('click', (e) => {
+      e.stopPropagation();
+      modal.classList.add('hidden');
+      window.__dismissMethod = 'close-x';
+    });
+
+    // Clicking directly on overlay background (not modal-box or X) dismisses
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) {
+        modal.classList.add('hidden');
+        window.__dismissMethod = 'overlay-click';
+      }
+    });
+
+    // Done only with postal code
+    document.getElementById('done-btn').addEventListener('click', () => {
+      if (document.getElementById('postal-code').value.trim()) {
+        modal.classList.add('hidden');
+        window.__dismissMethod = 'done-btn';
+      }
+    });
+
+    // Track attempts for test verification
+    window.__dismissAttempts = [];
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') window.__dismissAttempts.push('escape');
+    });
+  </script>
+</body>
+</html>

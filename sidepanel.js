@@ -3480,6 +3480,9 @@ newChatBtn?.addEventListener('click', async () => {
   mainError.textContent = '';
   loadingBar.classList.add('hidden');
   try { await chrome.storage.session.remove(convKey()); } catch {}
+  // Clean up exploration state so it doesn't re-trigger
+  try { await chrome.storage.session.remove(['explorationActive', 'explorationResult', 'explorationProgress']); } catch {}
+  try { chrome.runtime.sendMessage({ type: 'explore_cancel' }).catch(() => {}); } catch {}
   promptInput.focus();
 });
 

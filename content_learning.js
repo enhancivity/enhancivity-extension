@@ -262,6 +262,9 @@
     const aria = el.getAttribute('aria-label') || '';
     const title = el.getAttribute('title') || '';
     const placeholder = el.getAttribute('placeholder') || el.getAttribute('aria-placeholder') || '';
+    const name = el.getAttribute('name') || '';
+    const id = el.getAttribute('id') || '';
+    const contentEditable = el.getAttribute('contenteditable') === 'true' || el.isContentEditable || false;
     const contextBits = [];
 
     if (parent) {
@@ -294,6 +297,9 @@
       ariaLabel: aria || undefined,
       title: title || undefined,
       placeholder: placeholder || undefined,
+      name: name || undefined,
+      id: id || undefined,
+      contentEditable: contentEditable || undefined,
       context: contextBits.join(' | ').slice(0, 240) || undefined,
       position,
       viewport: {

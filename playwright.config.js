@@ -19,6 +19,7 @@ module.exports = defineConfig({
         '--disable-popup-blocking',
         '--disable-component-extensions-with-background-pages',
       ],
+      ignoreDefaultArgs: ['--disable-extensions'],
     },
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',

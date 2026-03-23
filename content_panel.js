@@ -472,8 +472,17 @@
     Promise.all([
       saveConversation(),  // writes empty array to enhConversation_<tabId>
       chrome.storage.session.remove(convKey()).catch(() => {}), // clean up the key entirely
+      // Clean up exploration state so it doesn't re-trigger on panel re-injection
+      chrome.storage.session.remove(['explorationActive', 'explorationResult', 'explorationProgress']).catch(() => {}),
       saveState(),
     ]).catch(() => {});
+    // Tell background to cancel any running exploration
+    try { chrome.runtime.sendMessage({ type: 'explore_cancel' }).catch(() => {}); } catch {}
+    // Remove exploration storage listener if active
+    if (typeof explorationListener !== 'undefined' && explorationListener) {
+      chrome.storage.onChanged.removeListener(explorationListener);
+      explorationListener = null;
+    }
   }
 
   // Expose toggle for re-injection calls

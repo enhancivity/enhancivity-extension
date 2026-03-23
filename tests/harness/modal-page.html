@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Search Results — Modal Test</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 20px; }
+    .overlay {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.5); z-index: 999;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .overlay.hidden { display: none; }
+    .modal-box {
+      background: white; border-radius: 8px; padding: 24px; width: 400px;
+      position: relative;
+    }
+    .modal-box h2 { margin-top: 0; }
+    /* The X button — small, top-right, easy to miss */
+    .close-x {
+      position: absolute; top: 8px; right: 12px;
+      background: none; border: none; font-size: 20px; cursor: pointer;
+      color: #666; padding: 4px 8px; line-height: 1;
+    }
+    .close-x:hover { color: #000; }
+    /* Primary action buttons that look clickable but DON'T close the modal */
+    .btn-primary {
+      background: #f0c14b; border: 1px solid #a88734; border-radius: 4px;
+      padding: 8px 16px; cursor: pointer; font-size: 14px; margin-top: 12px;
+    }
+    .btn-done {
+      background: #eee; border: 1px solid #ccc; border-radius: 4px;
+      padding: 8px 16px; cursor: pointer; font-size: 14px; margin-top: 8px;
+    }
+    .product { padding: 8px 0; border-bottom: 1px solid #eee; }
+    .product a { color: #0066c0; text-decoration: none; }
+    .product .price { color: #b12704; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Search Results</h1>
+  <p>Showing results for <b>laptop under 500 euro</b></p>
+
+  <div class="product">
+    <a href="/product/1">Lenovo IdeaPad Slim 3 — 14" Full HD</a>
+    <div class="price">€194.98</div>
+  </div>
+  <div class="product">
+    <a href="/product/2">HP EliteBook 840 G6 — 14" 1080p</a>
+    <div class="price">€249.00</div>
+  </div>
+  <div class="product">
+    <a href="/product/3">Jumper Laptop 17.6" — N95 CPU</a>
+    <div class="price">€299.00</div>
+  </div>
+
+  <!-- Amazon-style location modal — blocks interaction until dismissed -->
+  <div class="overlay" id="location-modal" role="dialog" aria-modal="true" aria-label="Choose your location">
+    <div class="modal-box">
+      <!-- The X close button — the CORRECT way to dismiss -->
+      <button class="close-x" aria-label="Close" id="modal-close-x">&times;</button>
+
+      <h2>Choose your location</h2>
+      <p>Delivery options and delivery speeds may vary for different locations.</p>
+
+      <!-- These buttons look actionable but DON'T dismiss the modal -->
+      <button class="btn-primary" id="sign-in-btn">Sign in to see your addresses</button>
+      <br>
+      <p style="margin:8px 0; font-size: 13px;">or enter a postal code</p>
+      <input type="text" id="postal-code" placeholder="Enter postal code" style="padding: 6px; width: 140px;">
+      <button class="btn-primary" id="apply-btn">Apply</button>
+      <br>
+      <button class="btn-done" id="done-btn">Done</button>
+    </div>
+  </div>
+
+  <script>
+    // Only the X button and Escape key close the modal.
+    // "Done" requires a postal code. "Sign in" navigates away.
+    // "Apply" validates the postal code (but nothing entered = no-op).
+    // This mimics Amazon's actual modal behavior.
+
+    const modal = document.getElementById('location-modal');
+
+    document.getElementById('modal-close-x').addEventListener('click', () => {
+      modal.classList.add('hidden');
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !modal.classList.contains('hidden')) {
+        modal.classList.add('hidden');
+      }
+    });
+
+    // "Done" only works if postal code is filled
+    document.getElementById('done-btn').addEventListener('click', () => {
+      if (document.getElementById('postal-code').value.trim()) {
+        modal.classList.add('hidden');
+      }
+    });
+
+    // Track dismiss method for test verification
+    window.__modalDismissMethod = null;
+    const origHide = () => { modal.classList.add('hidden'); };
+    document.getElementById('modal-close-x').addEventListener('click', () => {
+      window.__modalDismissMethod = 'close-x';
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') window.__modalDismissMethod = 'escape';
+    });
+
+    // Click outside modal dismisses it (overlay click)
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) {
+        modal.classList.add('hidden');
+        window.__modalDismissMethod = 'overlay-click';
+      }
+    });
+  </script>
+</body>
+</html>

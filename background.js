@@ -1,5 +1,7 @@
 // ============================================================
-// Enhancivity Background Service Worker — Grand Extension v4.0
+// Enhancivity Background Service Worker — Grand Extension v4.2 (variable-by-default)
+// VERSION MARKER: If you see this in service worker console, the latest code is loaded.
+console.log('[BG] ===== BACKGROUND v4.2 (variable-by-default) LOADED =====');
 // Responsibilities:
 //   1. Auth (email/password + Google OAuth)
 //   2. 3-Tier Memory caching (30-min TTL)
@@ -2560,8 +2562,15 @@ async function executeExploreAction(tabId, action, token, _retryCount = 0) {
   }
 }
 
+// Global abort flag — set by explore_cancel handler, checked by the step loop
+let explorationAborted = false;
+
 // Helper: mark exploration as finished and store result for panel recovery
 async function finishExploration(result) {
+  // Only reset abort flag if the user did NOT cancel. If they cancelled,
+  // the chain loop needs to read the flag and break before starting the next sub-task.
+  // The flag gets reset at the START of the next explore_start instead (line ~6905).
+  if (!explorationAborted) explorationAborted = false;
   // Set result first, THEN remove active flag — so listener sees result when it checks
   try {
     await chrome.storage.session.set({ explorationResult: { ...result, finishedAt: Date.now() } });
@@ -2735,6 +2744,112 @@ function phaseContainsCompletionEvidence(stepLog, goal) {
 // ── Auto-Continuation Constants ──
 const MAX_PHASES = 3;         // Max 3 phases × 30 steps = 90 steps total
 const PHASE_TIMEOUT_MS = 480000; // 8 minutes per phase (accounts for slow connections + observe→plan call)
+
+/**
+ * Modal dismissal subroutine — tries Escape → close button → overlay click.
+ * Extracted so it can be called from both the 2x and 3x repeat handlers.
+ * Returns { dismissed: boolean, method: string|null }
+ */
+async function tryDismissModal(snapshot, tabId, token) {
+  let dismissed = false;
+  let method = null;
+
+  // Strategy 1: Press Escape
+  try {
+    await executeExploreAction(tabId, {
+      type: 'press_key', value: 'Escape',
+      description: 'Pressing Escape to dismiss modal',
+    }, token);
+    await new Promise(r => setTimeout(r, 600));
+    const postEsc = await takePageSnapshot(tabId);
+    if (!postEsc.hasOpenModal) {
+      dismissed = true;
+      method = 'escape';
+      console.log('[Explore] Modal dismissed via Escape key');
+      return { dismissed, method };
+    }
+  } catch (e) {
+    console.warn('[Explore] Modal dismiss: Escape failed:', e.message);
+  }
+
+  // Strategy 2: Find close/dismiss button — search inModal elements first, then ALL elements
+  const elements = snapshot.semanticElements || [];
+  const isCloseButton = (el) => {
+    const text = (el.text || '').toLowerCase();
+    const ariaLabel = (el.attrs?.ariaLabel || '').toLowerCase();
+    const iconMeaning = (el.attrs?.iconMeaning || '').toLowerCase();
+    return (
+      text === 'close' || text === 'cancel' || text === 'dismiss' || text === '×' || text === 'x' ||
+      ariaLabel.includes('close') || ariaLabel.includes('dismiss') || ariaLabel.includes('cancel') ||
+      iconMeaning.includes('close') || iconMeaning.includes('dismiss')
+    );
+  };
+
+  // Prefer inModal buttons, but fall back to ANY close button on the page
+  const closeBtn = elements.find(el => el.inModal && isCloseButton(el))
+    || elements.find(el => isCloseButton(el));
+
+  if (closeBtn) {
+    try {
+      console.log(`[Explore] Modal dismiss: clicking close button ${closeBtn.sid} ("${closeBtn.text}")`);
+      await executeExploreAction(tabId, {
+        type: 'click_element', target: closeBtn.sid,
+        description: `Clicking modal close button: "${closeBtn.text}"`,
+      }, token);
+      await new Promise(r => setTimeout(r, 600));
+      const postClick = await takePageSnapshot(tabId);
+      if (!postClick.hasOpenModal) {
+        dismissed = true;
+        method = 'close_button';
+        console.log(`[Explore] Modal dismissed via click on ${closeBtn.sid}`);
+        return { dismissed, method };
+      }
+    } catch (e) {
+      console.warn('[Explore] Modal dismiss: click-close failed:', e.message);
+    }
+  } else {
+    console.warn('[Explore] Modal dismiss: no close/cancel button found');
+  }
+
+  // Strategy 3: Click outside the modal (overlay click)
+  // Find the dialog/modal element itself and try to click its parent overlay
+  try {
+    const dialogEl = elements.find(el => {
+      const role = (el.attrs?.role || '').toLowerCase();
+      return role === 'dialog' || role === 'alertdialog';
+    });
+    if (dialogEl) {
+      // Use executeScript to click at position (0,0) of the viewport overlay area
+      // which is outside the modal box but inside the overlay
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          // Find the overlay/backdrop behind the dialog
+          const dialogs = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
+          for (const d of dialogs) {
+            const parent = d.parentElement;
+            if (parent && parent !== document.body) {
+              // Click the parent overlay at its top-left corner (outside the modal box)
+              parent.click();
+            }
+          }
+        },
+      });
+      await new Promise(r => setTimeout(r, 600));
+      const postOverlay = await takePageSnapshot(tabId);
+      if (!postOverlay.hasOpenModal) {
+        dismissed = true;
+        method = 'overlay_click';
+        console.log('[Explore] Modal dismissed via overlay click');
+        return { dismissed, method };
+      }
+    }
+  } catch (e) {
+    console.warn('[Explore] Modal dismiss: overlay click failed:', e.message);
+  }
+
+  return { dismissed, method };
+}
 
 async function runExplorationLoop(explorePlan, tabId, token, resumeState = null, continuationContext = null) {
   const { goal, strategy, maxSteps, creditBudget, startAction } = explorePlan;
@@ -2981,6 +3096,13 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
 
     // Main exploration loop
     for (let step = startStep; step <= maxSteps; step++) {
+      // User cancelled exploration
+      if (explorationAborted) {
+        console.log('[Explore] Aborted by user at step', step);
+        cleanupLoop();
+        return finishExploration({ success: false, error: 'Exploration cancelled by user.', stepsUsed: step - 1, creditsUsed, stepLog });
+      }
+
       // Frustration failsafe: 5 consecutive failures → stop (increased from 3 to handle transient rate limits)
       if (consecutiveFailures >= 5) {
         await hudUpdate(currentTabId, `explore-${step}`, 'error', 'Too many failures — stopping');
@@ -3447,98 +3569,31 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
               });
             }
 
-            // BRANCH 2: Modal is blocking — try Escape → click close → navigate fallback
+            // BRANCH 2: Modal is blocking — try Escape → click close → overlay click
             if (snapshot.hasOpenModal) {
               console.warn(`[Explore] Step ${step}: MODAL STUCK — attempting modal dismissal subroutine`);
+              const { dismissed: modalDismissed, method: dismissMethod } = await tryDismissModal(snapshot, currentTabId, token);
 
-              // Step 2a: Press Escape
-              let modalDismissed = false;
-              try {
-                const escResult = await executeExploreAction(currentTabId, {
-                  type: 'press_key', value: 'Escape',
-                  description: 'Pressing Escape to dismiss modal',
-                }, token);
-                console.log(`[Explore] Modal dismiss: Escape result:`, escResult?.success);
-                await new Promise(r => setTimeout(r, 600));
-
-                // Check if modal is gone via fresh snapshot
-                const postEscSnapshot = await takePageSnapshot(currentTabId);
-                if (!postEscSnapshot.hasOpenModal) {
-                  modalDismissed = true;
-                  console.log('[Explore] Modal dismissed via Escape key');
-                }
-              } catch (escErr) {
-                console.warn('[Explore] Modal dismiss: Escape failed:', escErr.message);
-              }
-
-              // Step 2b: If Escape didn't work, find and click a close button inside the modal
-              if (!modalDismissed) {
-                try {
-                  // Find a close/dismiss/cancel button inside the modal from the snapshot
-                  const modalCloseElement = (snapshot.semanticElements || []).find(el => {
-                    if (!el.inModal) return false;
-                    const text = (el.text || '').toLowerCase();
-                    const ariaLabel = (el.attrs?.ariaLabel || '').toLowerCase();
-                    const iconMeaning = (el.attrs?.iconMeaning || '').toLowerCase();
-                    return (
-                      text === 'close' || text === 'cancel' || text === 'dismiss' || text === '×' || text === 'x' ||
-                      ariaLabel.includes('close') || ariaLabel.includes('dismiss') || ariaLabel.includes('cancel') ||
-                      iconMeaning.includes('close') || iconMeaning.includes('dismiss')
-                    );
-                  });
-
-                  if (modalCloseElement) {
-                    console.log(`[Explore] Modal dismiss: clicking close button ${modalCloseElement.sid} ("${modalCloseElement.text}")`);
-                    const clickResult = await executeExploreAction(currentTabId, {
-                      type: 'click_element', target: modalCloseElement.sid,
-                      description: `Clicking modal close button: "${modalCloseElement.text}"`,
-                    }, token);
-                    await new Promise(r => setTimeout(r, 600));
-
-                    const postClickSnapshot = await takePageSnapshot(currentTabId);
-                    if (!postClickSnapshot.hasOpenModal) {
-                      modalDismissed = true;
-                      console.log(`[Explore] Modal dismissed via click on ${modalCloseElement.sid}`);
-                    }
-                  } else {
-                    console.warn('[Explore] Modal dismiss: no close/cancel button found in modal elements');
-                  }
-                } catch (clickErr) {
-                  console.warn('[Explore] Modal dismiss: click-close failed:', clickErr.message);
-                }
-              }
-
-              // Log the modal break result
               stepLog.push({
                 step,
-                action: { type: 'modal_break', description: `Modal stuck: ${currType}(${currTarget}) x${repeatCount}, dismissed=${modalDismissed}` },
+                action: { type: 'modal_break', description: `Modal stuck: ${currType}(${currTarget}) x${repeatCount}, dismissed=${modalDismissed} via ${dismissMethod}` },
                 result: { success: modalDismissed, failureReason: modalDismissed ? null : 'MODAL_STUCK' },
                 observation: modalDismissed
-                  ? 'Modal dismissed successfully. Re-scanning page.'
-                  : 'Modal could not be dismissed via Escape or close button. Try navigating to a different URL.',
+                  ? `Modal dismissed via ${dismissMethod}. Re-scanning page.`
+                  : 'Modal could not be dismissed via Escape, close button, or overlay click.',
               });
 
-              // ── SITEACTION: Capture successful modal dismissal as learned behavior ──
-              // So future visits to this site know "when a modal appears, press Escape" or
-              // "click the close button" without the agent having to rediscover it.
               if (modalDismissed && snapshot?.url) {
-                try {
-                  fetch(`${API_BASE}/api/sitemap/capture-action`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                    body: JSON.stringify({
-                      url: snapshot.url,
-                      goal: 'dismiss_modal',
-                      actionType: 'press_key',
-                      targetText: 'Escape',
-                      targetRole: 'modal-dismiss',
-                      targetSection: null,
-                      targetXPct: null,
-                      targetYPct: null,
-                      actionValue: 'Escape',
-                    }),
-                  }).catch(() => {});
-                } catch {}
+                fetch(`${API_BASE}/api/sitemap/capture-action`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                  body: JSON.stringify({
+                    url: snapshot.url, goal: 'dismiss_modal',
+                    actionType: dismissMethod === 'escape' ? 'press_key' : 'click_element',
+                    targetText: dismissMethod === 'escape' ? 'Escape' : 'Close',
+                    targetRole: 'modal-dismiss',
+                  }),
+                }).catch(() => {});
               }
 
               decision.nextAction = {
@@ -3578,9 +3633,27 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           }
 
           if (repeatCount >= 2 && currType !== 'type_text') {
-            // Force a scrape_page on second repeat instead of letting it continue
             // EXCEPTION: type_text is allowed to retry — the AI may click first then re-type
             console.warn(`[Explore] Step ${step}: Blocked repeated ${currType}(${currTarget}), forcing scrape_page`);
+
+            // If a modal is open, try to dismiss it NOW instead of just rescanning.
+            // This saves 4+ steps compared to waiting for the 3x handler.
+            if (snapshot.hasOpenModal) {
+              console.log(`[Explore] Step ${step}: 2x repeat + modal detected — attempting early modal dismissal`);
+              const { dismissed, method } = await tryDismissModal(snapshot, currentTabId, token);
+              stepLog.push({
+                step,
+                action: { type: 'modal_break', description: `Early modal dismiss (2x repeat): ${dismissed ? method : 'failed'}` },
+                result: { success: dismissed, failureReason: dismissed ? null : 'MODAL_STUCK' },
+                observation: dismissed
+                  ? `Modal dismissed via ${method} (caught at 2x repeat). Re-scanning.`
+                  : 'Modal could not be dismissed. Re-scanning page.',
+              });
+              if (dismissed) {
+                decision.revisedStrategy = `Modal has been closed. Continue with the original goal. Do NOT re-open the same modal.`;
+              }
+            }
+
             decision.nextAction = {
               type: 'scrape_page',
               description: `Re-reading page (blocked repeated ${currType} on ${currTarget})`,
@@ -3651,7 +3724,10 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
       // Detect cross-target cycles: A→B→C→A patterns (not just A→A repeats).
       // Also detect no-progress states where interactive actions don't change the page.
       if (decision.nextAction && stepLog.length >= 4) {
-        const interactiveTypes = new Set(['click_element', 'type_text', 'navigate', 'select_option', 'fill_field', 'press_key']);
+        // NOTE: 'navigate' intentionally excluded — multi-site workflows (e.g., Gmail→Excel→Gmail→Excel)
+        // legitimately revisit the same URLs. Navigate is still protected by Layer 2 (3+ consecutive
+        // repeats at line ~3529) and the frustration failsafe.
+        const interactiveTypes = new Set(['click_element', 'type_text', 'select_option', 'fill_field', 'press_key']);
         const recentInteractive = stepLog
           .filter(s => interactiveTypes.has(s.action?.type))
           .slice(-6);
@@ -3683,7 +3759,8 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
                 .join(' | ');
 
               decision.isGoalComplete = true;
-              decision.goalResult = `I was unable to fully complete this task due to a navigation cycle on this page. Here is what I found so far: ${partialResults || 'No data collected yet. The page may require manual interaction.'}`;
+              const scratchpadSummary = dataBuffer ? `\n\nCollected data:\n${dataBuffer.slice(0, 2000)}` : '';
+              decision.goalResult = `I was unable to fully complete this task due to a navigation cycle on this page. Here is what I found so far: ${partialResults || 'No data collected yet. The page may require manual interaction.'}${scratchpadSummary}`;
               decision.nextAction = null;
             } else {
               // Soft break: inject cycle-break step, force navigate or scrape
@@ -4544,120 +4621,39 @@ function normalizeRecipeText(text) {
   return String(text || '').replace(/\s+/g, ' ').trim();
 }
 
-function looksEmailLike(text) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(text || '').trim());
-}
-
 /**
- * Detect email recipient fields (To, Cc, Bcc) that should become auto-variables.
- * These get their value from the chain's resolvedInputs at replay time.
- * The recorded email address is kept as originalFixedValue fallback for standalone replay.
+ * Variable-by-Default classification for recipe type steps.
+ * ALL short typed values are dynamic variables by default.
+ * Only narrow exclusions: password/hidden fields stay fixed.
+ *
+ * Returns: 'email_variable' | 'search_variable' | 'llm_fill' | 'fixed' | 'skip'
  */
-function shouldAutoEmailVariable(step) {
+function classifyTypeStep(step) {
   const action = step?.action || {};
-  if (action.type !== 'type' || (action.inputType !== 'fixed' && action.inputType !== undefined)) return false;
+  if (action.type !== 'type') return 'skip';
+  if (action.inputType !== 'fixed' && action.inputType !== undefined) return 'skip';
 
   const value = normalizeRecipeText(action.fixedValue);
-  if (!value || !looksEmailLike(value)) return false;
+  if (!value) return 'skip';
 
-  const hint = normalizeRecipeText([
-    action.description,
-    action.semanticContext?.label,
-    action.semanticContext?.ariaLabel,
-    action.semanticContext?.placeholder,
-    action.semanticContext?.context,
-    action.semanticContext?.role,
-    action.semanticContext?.tag,
-    action.semanticContext?.type,
-    action.semanticContext?.name,
-    action.semanticContext?.id,
-  ].filter(Boolean).join(' ')).toLowerCase();
+  // 1. Password or hidden fields: NEVER substitute
+  const fieldType = (action.semanticContext?.type || '').toLowerCase();
+  if (fieldType === 'password' || fieldType === 'hidden') return 'fixed';
 
-  // Match email recipient fields: To, Cc, Bcc, recipient, addressee
-  return /(to\b|cc\b|bcc\b|recipient|email.*address|compose.*to|mail.*to|addressee)/i.test(hint) ||
-    action.semanticContext?.role === 'combobox' ||
-    action.semanticContext?.type === 'email';
-}
+  // 2. Value contains @: email recipient variable
+  if (value.includes('@')) return 'email_variable';
 
-/**
- * Detect search/query input fields that should become auto-variables.
- * These get their value from the user's NEW prompt at replay time — no AI call needed.
- * Fast path: variable extraction from prompt, zero latency.
- */
-function shouldAutoVariable(step) {
-  const action = step?.action || {};
-  if (action.type !== 'type' || (action.inputType !== 'fixed' && action.inputType !== undefined)) return false;
+  // 3. ContentEditable fields: always LLM fill (rich text editors like Gmail compose)
+  const isContentEditable = action.semanticContext?.contentEditable === true ||
+    /contenteditable/i.test(JSON.stringify(action.semanticContext || {}));
+  if (isContentEditable) return 'llm_fill';
 
-  const value = normalizeRecipeText(action.fixedValue);
-  if (!value || looksEmailLike(value)) return false;
+  // 4. Short plain text (<=6 words): search query variable — UNCONDITIONALLY
+  const wordCount = value.split(/\s+/).length;
+  if (wordCount <= 6) return 'search_variable';
 
-  const hint = normalizeRecipeText([
-    action.description,
-    action.semanticContext?.label,
-    action.semanticContext?.ariaLabel,
-    action.semanticContext?.placeholder,
-    action.semanticContext?.context,
-    action.semanticContext?.role,
-    action.semanticContext?.tag,
-    action.semanticContext?.type,
-    action.semanticContext?.name,
-    action.semanticContext?.id,
-  ].filter(Boolean).join(' ')).toLowerCase();
-
-  // EXCLUSION: Email-related fields (To, Cc, Bcc, recipient) are NOT search fields
-  // Gmail's To field is a combobox but for email addresses, not product search
-  const isEmailField = /(to\b|cc\b|bcc\b|recipient|email.*address|compose.*to|mail.*to|addressee)/i.test(hint);
-  if (isEmailField) return false;
-
-  // EXCLUSION: Subject/title fields are for LLM generation, not variable extraction
-  const isSubjectField = /(subject|title|headline)/i.test(hint);
-  if (isSubjectField) return false;
-
-  // Search box heuristics: field name/placeholder/label contains search-related keywords
-  const searchField = /(search|query|keyword|find|lookup|filter|q\b|search.?box|search.?bar|search.?input|search.?field|search.?term)/i.test(hint);
-
-  // Also detect by input type="search" or common search element patterns
-  // Note: combobox alone is too broad (Gmail To field is combobox) — require "search" hint too
-  const isSearchInput = action.semanticContext?.type === 'search' ||
-    action.semanticContext?.role === 'searchbox' ||
-    (action.semanticContext?.role === 'combobox' && /search/i.test(hint)) ||
-    /search/i.test(action.semanticContext?.name || '') ||
-    /search/i.test(action.semanticContext?.id || '');
-
-  return searchField || isSearchInput;
-}
-
-function shouldAutoLlmFill(step) {
-  const action = step?.action || {};
-  if (action.type !== 'type' || (action.inputType !== 'fixed' && action.inputType !== undefined)) return false;
-
-  const value = normalizeRecipeText(action.fixedValue);
-  if (!value || looksEmailLike(value)) return false;
-
-  // Search fields are handled by shouldAutoVariable — skip them here
-  if (shouldAutoVariable(step)) return false;
-
-  const hint = normalizeRecipeText([
-    action.description,
-    action.semanticContext?.label,
-    action.semanticContext?.ariaLabel,
-    action.semanticContext?.placeholder,
-    action.semanticContext?.context,
-    action.semanticContext?.role,
-    action.semanticContext?.tag,
-    action.semanticContext?.type,
-  ].filter(Boolean).join(' ')).toLowerCase();
-
-  const longText = value.length >= 24 || /\s/.test(value);
-  const generativeField = /(message body|body|reply|comment|description|details|summary|post|caption|prompt|content|notes?|headline|subject|title|chat|email)/i.test(hint);
-  const isContentEditable = /contenteditable/i.test(JSON.stringify(action.semanticContext || {}));
-  const textSurface = ['textarea'].includes(action.semanticContext?.tag) ||
-    action.semanticContext?.role === 'textbox' ||
-    isContentEditable;
-
-  // ContentEditable fields (Gmail compose, rich text editors) are almost always generative —
-  // upgrade them regardless of recorded text length (user may have typed short test text)
-  return generativeField || (textSurface && longText) || isContentEditable;
+  // 5. Long text (>6 words): LLM fill
+  return 'llm_fill';
 }
 
 function buildLlmPromptForStep(step) {
@@ -4690,43 +4686,48 @@ function upgradeRecipeStepForReplay(step, stepNumber) {
     stepNumber: stepNumber || step.stepNumber,
   };
 
-  if (upgraded.action?.type === 'type' && (upgraded.action?.inputType === 'fixed' || upgraded.action?.inputType === undefined)) {
+  const classification = classifyTypeStep(upgraded);
+
+  if (classification !== 'skip' && classification !== 'fixed') {
     const normalizedValue = normalizeRecipeText(upgraded.action.fixedValue);
     if (!normalizedValue) return null;
     upgraded.action.fixedValue = normalizedValue;
 
-    if (shouldAutoEmailVariable(upgraded)) {
-      // Email recipient fields (To, Cc, Bcc): upgrade to variable for chain injection
-      // Value comes from chain's resolvedInputs; original email kept as standalone fallback
-      upgraded.action = {
-        ...upgraded.action,
-        inputType: 'variable',
-        variableName: '__recipient_email',
-        originalFixedValue: normalizedValue,
-      };
-      delete upgraded.action.fixedValue;
-    } else if (shouldAutoVariable(upgraded)) {
-      // Search/query fields: upgrade to variable type for fast prompt extraction
-      // No AI call needed — value comes directly from user's new prompt
-      upgraded.action = {
-        ...upgraded.action,
-        inputType: 'variable',
-        variableName: '__search_query',
-        originalFixedValue: normalizedValue, // Keep original as fallback
-      };
-      delete upgraded.action.fixedValue;
-    } else if (shouldAutoLlmFill(upgraded)) {
-      const llmPrompt = buildLlmPromptForStep(upgraded);
-      upgraded.action = {
-        ...upgraded.action,
-        type: 'llm_fill',
-        llmPrompt,
-        variableDescription: llmPrompt,
-        contextVariables: ['__task_context', '__workflow_name'],
-      };
-      delete upgraded.action.fixedValue;
-      delete upgraded.action.inputType;
-      delete upgraded.action.variableName;
+    switch (classification) {
+      case 'email_variable':
+        upgraded.action = {
+          ...upgraded.action,
+          inputType: 'variable',
+          variableName: '__recipient_email',
+          originalFixedValue: normalizedValue,
+        };
+        delete upgraded.action.fixedValue;
+        break;
+
+      case 'search_variable':
+        upgraded.action = {
+          ...upgraded.action,
+          inputType: 'variable',
+          variableName: '__search_query',
+          originalFixedValue: normalizedValue,
+        };
+        delete upgraded.action.fixedValue;
+        break;
+
+      case 'llm_fill': {
+        const llmPrompt = buildLlmPromptForStep(upgraded);
+        upgraded.action = {
+          ...upgraded.action,
+          type: 'llm_fill',
+          llmPrompt,
+          variableDescription: llmPrompt,
+          contextVariables: ['__task_context', '__workflow_name'],
+        };
+        delete upgraded.action.fixedValue;
+        delete upgraded.action.inputType;
+        delete upgraded.action.variableName;
+        break;
+      }
     }
   }
 
@@ -4862,12 +4863,8 @@ function buildRecipeFromSession(session) {
       }
       cleanStep.action.fixedValue = normalizedValue;
 
-      if (shouldAutoVariable(cleanStep)) {
-        // Search/query fields: save as variable at recording time
-        const upgradedStep = upgradeRecipeStepForReplay(cleanStep, cleanedSteps.length + 1);
-        if (!upgradedStep) continue;
-        cleanStep.action = upgradedStep.action;
-      } else if (shouldAutoLlmFill(cleanStep)) {
+      const classification = classifyTypeStep(cleanStep);
+      if (classification !== 'fixed' && classification !== 'skip') {
         const upgradedStep = upgradeRecipeStepForReplay(cleanStep, cleanedSteps.length + 1);
         if (!upgradedStep) continue;
         cleanStep.action = upgradedStep.action;
@@ -5868,11 +5865,17 @@ async function handleMessage(request, sender) {
       return false;
     })();
 
+    // Tracks partial recipe completion for chain handoff.
+    // If a recipe partially replays (e.g., search done but content script died),
+    // the chain system uses this to skip the already-completed sub-task.
+    let recipePartialContext = null;
+
     // ── LEARNING MODE: Auto-replay matching recipe (zero-token, silent) ──
     // If a learned recipe exists for this site + task, replay it automatically
     // without asking the user. If replay fails, silently fall through to AI.
-    // SKIP for multi-site prompts — let the chain system handle those.
-    if (!skipRecipeCheck && !isMultiSitePrompt) try {
+    // ALWAYS try recipe matching first — even for multi-site prompts.
+    // If a recipe matches the current domain, replay it. The chain system handles the rest.
+    if (!skipRecipeCheck) try {
       const siteDomain = url ? new URL(url).hostname : '';
       if (siteDomain && userPrompt) {
         const recipeRes = await fetch(
@@ -5899,11 +5902,17 @@ async function handleMessage(request, sender) {
             const quotedMatches = userPrompt.match(/"([^"]+)"|'([^']+)'/g);
             const quotedValues = quotedMatches ? quotedMatches.map(q => q.replace(/['"]/g, '')) : [];
 
-            // Extract search query: strip site names, action verbs, and connectors
-            const searchQuery = userPrompt
-              .replace(/\b(search|find|look\s*for|browse|shop|buy|purchase|order|email|compose|write|send|reply|message|forward|then|and|on|in|at|the|a|an|for|to|from|my|me|please|can|you|i|want|need)\b/gi, ' ')
+            // Extract search query: for compound prompts like "find X then email Y about Z",
+            // capture only the first clause so the entire second clause is dropped.
+            const compoundSplitAuto = userPrompt.match(
+              /^([\s\S]+?)\b(?:and\s+then|then|after\s+that)\s+(?:write|send|email|compose|reply|message|forward|call|book|order|buy|purchase|post|tweet|slack|notify|tell)\b/i
+            );
+            const promptForSearch = compoundSplitAuto ? compoundSplitAuto[1].trim() : userPrompt.trim();
+            const searchQuery = promptForSearch
+              .replace(/\b(search|find|look\s*for|browse|shop|buy|purchase|order|email|compose|write|send|reply|message|forward|then|and|on|in|at|the|a|an|for|to|from|my|me|please|can|you|i|want|need|what|which|who|when|where|how|got|bought|found|used)\b/gi, ' ')
               .replace(/\b(amazon|ebay|walmart|etsy|gmail|outlook|yahoo|linkedin|twitter|reddit|facebook|instagram|youtube|google|slack|discord|zillow|airbnb|indeed)\b/gi, ' ')
               .replace(/[^\s@]+@[^\s@]+\.[^\s@]+/g, ' ')
+              .replace(/[^\w\s\-]/g, ' ')
               .replace(/\s+/g, ' ')
               .trim();
 
@@ -5956,7 +5965,7 @@ async function handleMessage(request, sender) {
               }, {} /* no sender — internal call */);
 
               if (replayResult?.success && !replayResult?.partial) {
-                // Replay succeeded — record outcome and return success
+                // Replay succeeded — record outcome
                 try {
                   await fetch(`${API_BASE}/api/recipes/${recipe.id}/validate`, {
                     method: 'PUT',
@@ -5965,30 +5974,95 @@ async function handleMessage(request, sender) {
                   });
                 } catch { /* non-critical */ }
 
-                return {
-                  success: true,
-                  data: {
-                    action_type: 'RECIPE_REPLAY_COMPLETE',
-                    headline: `Done! Used workflow "${recipe.autoDescription || recipe.workflowName}"`,
-                    primary_content: `Completed ${replayResult.completedSteps}/${replayResult.totalSteps} steps in ${((replayResult.durationMs || 0) / 1000).toFixed(1)}s — 0 credits used.`,
-                    recipe_used: { id: recipe.id, name: recipe.autoDescription || recipe.workflowName, confidence: recipe.confidence },
-                    consent_level: 'none',
-                  },
-                };
+                // If this is a multi-site prompt, the recipe only handled the FIRST part.
+                // Don't return yet — fall through to the chain system to handle remaining sub-tasks (e.g., email).
+                if (isMultiSitePrompt) {
+                  console.log('[BG] Recipe succeeded for first site — continuing to chain system for remaining sub-tasks');
+                  // Skip the chain's first sub-task (already done via recipe) by marking it
+                  // The chain system will see this and handle remaining sub-tasks
+                } else {
+                  return {
+                    success: true,
+                    data: {
+                      action_type: 'RECIPE_REPLAY_COMPLETE',
+                      headline: `Done! Used workflow "${recipe.autoDescription || recipe.workflowName}"`,
+                      primary_content: `Completed ${replayResult.completedSteps}/${replayResult.totalSteps} steps in ${((replayResult.durationMs || 0) / 1000).toFixed(1)}s — 0 credits used.`,
+                      recipe_used: { id: recipe.id, name: recipe.autoDescription || recipe.workflowName, confidence: recipe.confidence },
+                      consent_level: 'none',
+                    },
+                  };
+                }
               }
 
-              // Replay failed or partial — record failure and fall through to AI
-              console.warn('[BG] Recipe auto-replay failed, falling through to AI:', replayResult?.error || replayResult?.failReason || 'unknown');
-              try {
-                // Don't penalize confidence for step-1 page mismatch failures
-                const isPageMismatch = replayResult?.failedAtStep === 1 && (replayResult?.failReason || '').includes('Element not found');
-                if (!isPageMismatch) {
-                  await fetch(`${API_BASE}/api/recipes/${recipe.id}/fail`, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                  });
-                }
-              } catch { /* non-critical */ }
+              // Replay failed or partial — check if the search goal was already achieved.
+              // When the recipe types a search query + hits Enter, the page navigates to
+              // results. The content script dies during navigation, so the replay reports
+              // "partial failure" — but the SEARCH IS DONE. The URL proves it.
+              const partialSteps = replayResult?.completedSteps || 0;
+              if (partialSteps >= 2) {
+                try {
+                  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                  const tabUrl = activeTab?.url || '';
+                  // Detect search results pages: URL contains query params like ?k=, ?q=, ?query=, /s?, /search?
+                  const looksLikeSearchResults = /[?&](k|q|query|search|keyword|search_query|field-keywords)=/i.test(tabUrl) ||
+                    /\/(s|search|results)\?/i.test(tabUrl);
+
+                  if (looksLikeSearchResults) {
+                    console.log(`[BG] Recipe partial success: search completed (${partialSteps} steps). URL confirms results: ${tabUrl.slice(0, 120)}`);
+
+                    // Capture context for the chain system (multi-site prompts)
+                    recipePartialContext = {
+                      completedSteps: partialSteps,
+                      totalSteps: replayResult?.totalSteps || 0,
+                      domain: new URL(tabUrl).hostname.toLowerCase(),
+                      pageUrl: tabUrl,
+                      pageTitle: activeTab.title || '',
+                    };
+
+                    // Validate recipe (it DID work — the search completed)
+                    try {
+                      await fetch(`${API_BASE}/api/recipes/${recipe.id}/validate`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                        body: JSON.stringify({ durationMs: replayResult?.durationMs || 0 }),
+                      });
+                    } catch { /* non-critical */ }
+
+                    // Route through the SUCCESS path:
+                    // - Single-task: returns RECIPE_REPLAY_COMPLETE (done, no further action)
+                    // - Multi-task: falls through to chain system for remaining sub-tasks
+                    if (isMultiSitePrompt) {
+                      console.log('[BG] Recipe search done — continuing to chain system for remaining sub-tasks');
+                    } else {
+                      return {
+                        success: true,
+                        data: {
+                          action_type: 'RECIPE_REPLAY_COMPLETE',
+                          headline: `Done! Searched "${recipe.autoDescription || recipe.workflowName}"`,
+                          primary_content: `Search completed (${partialSteps} steps) — results are showing. 0 credits used.`,
+                          recipe_used: { id: recipe.id, name: recipe.autoDescription || recipe.workflowName, confidence: recipe.confidence },
+                          consent_level: 'none',
+                        },
+                      };
+                    }
+                  }
+                } catch { /* non-critical — fall through to normal failure path */ }
+              }
+
+              // Genuine failure — search didn't complete or page isn't showing results.
+              // Don't penalize recipes that partially succeeded (search results visible).
+              if (!recipePartialContext) {
+                console.warn('[BG] Recipe auto-replay failed, falling through:', replayResult?.error || replayResult?.failReason || 'unknown');
+                try {
+                  const isPageMismatch = replayResult?.failedAtStep === 1 && (replayResult?.failReason || '').includes('Element not found');
+                  if (!isPageMismatch) {
+                    await fetch(`${API_BASE}/api/recipes/${recipe.id}/fail`, {
+                      method: 'PUT',
+                      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                    });
+                  }
+                } catch { /* non-critical */ }
+              }
             } catch (replayErr) {
               console.warn('[BG] Recipe auto-replay threw, falling through to AI:', replayErr.message);
             }
@@ -6012,11 +6086,15 @@ async function handleMessage(request, sender) {
       const chainPlan = await chainPlanRes.json();
 
       if (chainPlan?.success && chainPlan?.isChain && chainPlan.subTasks?.length > 1) {
+        // Sort sub-tasks by order to guarantee correct execution sequence
+        // (backend may return them out of order in edge cases)
+        chainPlan.subTasks.sort((a, b) => a.order - b.order);
         console.log(`[BG] Chain detected: ${chainPlan.totalSteps} sub-tasks (${chainPlan.recipeCount} recipes, ${chainPlan.aiCount} AI)`);
 
         const chainResults = [];
         const outputStore = {};
         let chainSuccess = true;
+        let composeOpened = false; // Guard: track if email compose was already opened
         const totalSubTasks = chainPlan.subTasks.length;
 
         // Broadcast chain progress to all UI surfaces (panel, sidepanel, popup)
@@ -6031,6 +6109,113 @@ async function handleMessage(request, sender) {
         }
 
         for (const subTask of chainPlan.subTasks) {
+          // ── CANCELLATION CHECK: user clicked X/Cancel during a previous sub-task ──
+          if (explorationAborted) {
+            console.log(`[BG] Chain: aborting at sub-task ${subTask.order} — user cancelled`);
+            chainSuccess = false;
+            break;
+          }
+
+          // ── Skip sub-task 1 if the search is already done ──
+          // Detect TWO scenarios:
+          // A) Recipe partially replayed the search (recipePartialContext set)
+          // B) User is ALREADY on the search results page for sub-task 1's domain
+          //    (e.g., they searched before sending the compound prompt, or the recipe
+          //    is deprecated but a previous attempt already loaded results)
+          if (subTask.order === 1 && subTask.category === 'search') {
+            let shouldSkip = false;
+            let skipReason = '';
+
+            // Scenario A: recipe partial context
+            if (recipePartialContext) {
+              const partialDomain = recipePartialContext.domain || '';
+              const subTaskDomain = (subTask.domain || '').toLowerCase();
+              const domainMatch = partialDomain.includes(subTaskDomain) ||
+                subTaskDomain.includes(partialDomain.split('.').slice(-2, -1)[0] || '');
+              if (domainMatch) {
+                shouldSkip = true;
+                skipReason = `recipe already completed ${recipePartialContext.completedSteps} steps`;
+              }
+            }
+
+            // Scenario B: current page is already showing search results on the target domain
+            if (!shouldSkip) {
+              try {
+                const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                const tabUrl = activeTab?.url || '';
+                const tabHost = tabUrl ? new URL(tabUrl).hostname.toLowerCase() : '';
+                const subTaskDomain = (subTask.domain || '').toLowerCase();
+                const subTaskFamily = subTaskDomain.split('.').slice(-2, -1)[0] || '';
+                const tabFamily = tabHost.split('.').slice(-2, -1)[0] || '';
+                // Both families must be non-empty and ≥3 chars to avoid false positives
+                const onTargetDomain = subTaskFamily.length >= 3 && tabFamily.length >= 3 &&
+                  (tabHost.includes(subTaskFamily) || subTaskDomain.includes(tabFamily));
+                const hasSearchResults = /[?&](k|q|query|search|keyword|search_query|field-keywords)=/i.test(tabUrl) ||
+                  /\/(s|search|results)\?/i.test(tabUrl);
+
+                // Query relevance: verify the URL's search query matches what the sub-task needs.
+                // Without this, a stale Amazon tab with "t-shirt" results would skip a "laptop" search.
+                let queryRelevant = true; // default true if we can't extract either query
+                if (hasSearchResults) {
+                  try {
+                    const urlParams = new URL(tabUrl).searchParams;
+                    const currentQuery = (urlParams.get('k') || urlParams.get('q') || urlParams.get('query') ||
+                      urlParams.get('search') || urlParams.get('keyword') || '').toLowerCase();
+                    const expectedQuery = (subTask.resolvedInputs?.search_query ||
+                      (subTask.inputs || []).find(i => i.name === 'search_query')?.value || '').toLowerCase();
+
+                    if (currentQuery && expectedQuery) {
+                      const expectedWords = expectedQuery.split(/\s+/).filter(w => w.length >= 3);
+                      queryRelevant = expectedWords.length === 0 ||
+                        expectedWords.some(w => currentQuery.includes(w));
+                      if (!queryRelevant) {
+                        console.log(`[BG] Chain: skip blocked — URL query "${currentQuery}" does not match expected "${expectedQuery}"`);
+                      }
+                    }
+                  } catch { /* URL parsing failed — keep queryRelevant=true */ }
+                }
+
+                if (onTargetDomain && hasSearchResults && queryRelevant) {
+                  shouldSkip = true;
+                  skipReason = `already on search results page (${tabHost})`;
+                }
+              } catch { /* non-critical */ }
+            }
+
+            if (shouldSkip) {
+              console.log(`[BG] Chain: skipping sub-task 1 — ${skipReason}`);
+              try {
+                const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                outputStore[subTask.order] = {
+                  page_url: activeTab?.url || recipePartialContext?.pageUrl || '',
+                  page_title: activeTab?.title || recipePartialContext?.pageTitle || '',
+                };
+                if (activeTab?.id) {
+                  const [scraped] = await chrome.scripting.executeScript({
+                    target: { tabId: activeTab.id },
+                    func: () => (document.body?.innerText || '').slice(0, 3000),
+                  });
+                  if (scraped?.result) outputStore[subTask.order].page_content = scraped.result;
+                }
+              } catch { /* page may block injection */ }
+              chainResults.push({
+                order: subTask.order,
+                intent: subTask.intent,
+                domain: subTask.domain,
+                method: recipePartialContext ? 'recipe_partial' : 'page_detected',
+                success: true,
+                duration: 0,
+                error: null,
+              });
+              broadcastChainProgress(
+                subTask.order, totalSubTasks,
+                `Done: ${subTask.intent}`,
+                chainPlan.subTasks[1]?.intent || 'Finishing up...'
+              );
+              continue; // Skip to sub-task 2
+            }
+          }
+
           // Notify UI about current sub-task
           const nextSubTask = chainPlan.subTasks.find(st => st.order === subTask.order + 1);
           broadcastChainProgress(
@@ -6053,14 +6238,24 @@ async function handleMessage(request, sender) {
                 resolvedInputs = { ...resolvedInputs, ...resolved.resolvedInputs };
               }
             } catch { /* use what we have */ }
+
+            // Validate subject was resolved — fallback if missing/sentinel/empty
+            if (subTask.pendingInputs?.some(i => i.name === 'subject')) {
+              const subj = resolvedInputs.subject;
+              if (!subj || /^__UNRESOLVED__/.test(subj) || subj.length < 3) {
+                const fallbackTitle = outputStore[1]?.page_title || subTask.intent || 'Your request';
+                resolvedInputs.subject = `Re: ${fallbackTitle}`.slice(0, 80);
+                console.log(`[BG] Chain subject fallback applied: "${resolvedInputs.subject}"`);
+              }
+            }
           }
 
           let stepResult;
 
           // ── Navigate to the target domain if not already there ──
-          // Chain sub-tasks often span different sites (Amazon → Gmail).
-          // Before executing each sub-task, ensure the active tab is on the right domain.
-          if (subTask.domain && subTask.order > 1) {
+          // Chain sub-tasks span different sites (Amazon → Gmail).
+          // Before executing EACH sub-task (including #1), ensure we're on the right domain.
+          if (subTask.domain) {
             try {
               let [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
               const currentHost = currentTab?.url ? new URL(currentTab.url).hostname.toLowerCase() : '';
@@ -6075,12 +6270,33 @@ async function handleMessage(request, sender) {
               if (needsNavigation && currentTab) {
                 console.log(`[BG] Chain: navigating from "${currentHost}" to "${targetDomain}" for sub-task ${subTask.order}`);
 
-                // Try to find an existing tab on the target domain first
+                // Try to find an existing tab on the target domain.
+                // For search sub-tasks, also verify the tab has relevant content
+                // (prevents reusing a stale Amazon tab with "t-shirt" results for a "laptop" search).
+                const expectedQuery = (subTask.resolvedInputs?.search_query ||
+                  (subTask.inputs || []).find(i => i.name === 'search_query')?.value || '').toLowerCase();
                 const allTabs = await chrome.tabs.query({ currentWindow: true });
                 const existingTab = allTabs.find(t => {
                   try {
-                    const host = new URL(t.url).hostname.toLowerCase();
-                    return host.includes(targetDomain) || targetDomain.includes(host.split('.').slice(-2, -1)[0]);
+                    const tUrl = new URL(t.url);
+                    const host = tUrl.hostname.toLowerCase();
+                    const domainMatch = host.includes(targetDomain) || targetDomain.includes(host.split('.').slice(-2, -1)[0]);
+                    if (!domainMatch) return false;
+
+                    // For search sub-tasks: verify the tab's search query matches
+                    if (subTask.category === 'search' && expectedQuery) {
+                      const tabQuery = (tUrl.searchParams.get('k') || tUrl.searchParams.get('q') ||
+                        tUrl.searchParams.get('query') || tUrl.searchParams.get('search') || '').toLowerCase();
+                      if (tabQuery) {
+                        const queryWords = expectedQuery.split(/\s+/).filter(w => w.length >= 3);
+                        const relevant = queryWords.length === 0 || queryWords.some(w => tabQuery.includes(w));
+                        if (!relevant) {
+                          console.log(`[BG] Chain: skipping stale tab (query "${tabQuery}" doesn't match "${expectedQuery}")`);
+                          return false;
+                        }
+                      }
+                    }
+                    return true;
                   } catch { return false; }
                 });
 
@@ -6137,32 +6353,41 @@ async function handleMessage(request, sender) {
                 for (const [inputName, inputValue] of Object.entries(resolvedInputs)) {
                   if (mappedVars[rv.name]) break;
                   const inLower = inputName.toLowerCase();
-                  if (/search|query|keyword|product/.test(inLower) && /search|query|keyword|product|item/.test(rvNameLower + ' ' + rvDescLower)) {
+                  // Mutually exclusive mapping — search_query must NOT leak into subject/body vars
+                  if (/search|query|keyword|product/.test(inLower) && /search|query|keyword|product|item/.test(rvNameLower + ' ' + rvDescLower) && !/subject|body|content|message/.test(rvNameLower)) {
                     mappedVars[rv.name] = inputValue;
                   } else if (/email|recipient/.test(inLower) && /email|recipient|to/.test(rvNameLower + ' ' + rvDescLower)) {
                     mappedVars[rv.name] = inputValue;
-                  } else if (/subject/.test(inLower) && /subject/.test(rvNameLower + ' ' + rvDescLower)) {
+                  } else if (/subject/.test(inLower) && /subject/.test(rvNameLower + ' ' + rvDescLower) && !/search|query/.test(inLower)) {
                     mappedVars[rv.name] = inputValue;
-                  } else if (/body|content|message/.test(inLower) && /body|content|message|text/.test(rvNameLower + ' ' + rvDescLower)) {
+                  } else if (/body|content|message/.test(inLower) && /body|content|message|text/.test(rvNameLower + ' ' + rvDescLower) && !/search|query/.test(inLower)) {
                     mappedVars[rv.name] = inputValue;
                   }
                 }
               }
             }
-            // Inject __recipient_email from resolvedInputs or user prompt
-            // Chain decomposer may use keys like 'recipient', 'email', 'to', 'recipient_email'
+            // Inject __recipient_email from resolvedInputs or user prompt.
+            // Accept email addresses AND contact names — email clients autocomplete names.
             if (!mappedVars.__recipient_email) {
               for (const [key, val] of Object.entries(resolvedInputs)) {
-                if (/^(recipient|email|to|recipient_email|send_to)$/i.test(key) && typeof val === 'string' && val.includes('@')) {
-                  mappedVars.__recipient_email = val;
+                if (/^(recipient|email|to|recipient_email|send_to|recipient_name|contact)$/i.test(key) && typeof val === 'string' && val.trim()) {
+                  mappedVars.__recipient_email = val.trim();
                   break;
                 }
               }
             }
-            // Fallback: extract email from the user's original prompt
+            // Fallback: extract email address or contact name from the user's original prompt
             if (!mappedVars.__recipient_email) {
               const emailMatch = userPrompt.match(/[^\s@]+@[^\s@]+\.[^\s@]+/);
-              if (emailMatch) mappedVars.__recipient_email = emailMatch[0];
+              if (emailMatch) {
+                mappedVars.__recipient_email = emailMatch[0];
+              } else {
+                // Extract contact name: "email to kibromamaniel" → "kibromamaniel"
+                const nameMatch = userPrompt.match(
+                  /\b(?:write|send|email|message|compose)(?:\s+(?:an?\s+)?(?:email|message))?\s+to\s+([\w][\w.\-]*)/i
+                );
+                if (nameMatch?.[1]) mappedVars.__recipient_email = nameMatch[1];
+              }
             }
 
             try {
@@ -6252,12 +6477,82 @@ async function handleMessage(request, sender) {
               } else {
                 // Recipe failed — mark for AI fallback reporting
                 stepResult = { success: false, error: stepResult?.error || 'Recipe replay failed' };
+                // Report failure to backend so confidence updates (mirrors auto-replay at line ~6055)
+                try {
+                  await fetch(`${API_BASE}/api/recipes/${subTask.recipe.id}/fail`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                  });
+                } catch { /* non-critical */ }
               }
             } catch (replayErr) {
               stepResult = { success: false, error: replayErr.message };
+              // Report failure for exception path too
+              try {
+                await fetch(`${API_BASE}/api/recipes/${subTask.recipe.id}/fail`, {
+                  method: 'PUT',
+                  headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                });
+              } catch { /* non-critical */ }
             }
           } else {
+            // LAST-CHANCE RECIPE CHECK: The chain planner may have mislabeled the category.
+            // Try a domain-only recipe lookup before falling to expensive AI reasoning.
+            if (subTask.domain) {
+              try {
+                const lastChanceRes = await fetch(
+                  `${API_BASE}/api/recipes/match?siteDomain=${encodeURIComponent(subTask.domain)}&task=${encodeURIComponent(subTask.intent || userPrompt)}`,
+                  { headers: { Authorization: `Bearer ${token}` } }
+                );
+                const lastChance = await lastChanceRes.json();
+                if (lastChance?.success && lastChance?.found && lastChance?.recipe) {
+                  console.log(`[BG] Chain sub-task ${subTask.order}: last-chance recipe found! "${lastChance.recipe.autoDescription || lastChance.recipe.workflowName}" (score=${lastChance.score})`);
+                  // Replay this recipe instead of falling through to AI
+                  const lcRecipe = lastChance.recipe;
+                  const lcVars = { ...resolvedInputs };
+                  // Map variables like the normal chain replay path
+                  const lcRecipeVars = Array.isArray(lcRecipe.variables) ? lcRecipe.variables : [];
+                  for (const rv of lcRecipeVars) {
+                    if (lcVars[rv.name]) continue;
+                    const rvLower = ((rv.name || '') + ' ' + (rv.description || '')).toLowerCase();
+                    for (const [inName, inVal] of Object.entries(resolvedInputs)) {
+                      if (lcVars[rv.name]) break;
+                      const inLower = inName.toLowerCase();
+                      if (/search|query/.test(inLower) && /search|query/.test(rvLower)) lcVars[rv.name] = inVal;
+                      else if (/email|recipient/.test(inLower) && /email|recipient|to/.test(rvLower)) lcVars[rv.name] = inVal;
+                    }
+                  }
+                  try {
+                    stepResult = await handleMessage({
+                      type: 'learning_replay_recipe',
+                      data: { recipe: lcRecipe, variables: lcVars, taskContext: userPrompt, originalPrompt: userPrompt },
+                    }, {});
+                    if (stepResult?.success && !stepResult?.partial) {
+                      // Record validation
+                      try {
+                        await fetch(`${API_BASE}/api/recipes/${lcRecipe.id}/validate`, {
+                          method: 'PUT',
+                          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                          body: JSON.stringify({ durationMs: stepResult.durationMs }),
+                        });
+                      } catch { /* non-critical */ }
+                    }
+                  } catch (lcErr) {
+                    console.warn(`[BG] Chain sub-task ${subTask.order}: last-chance recipe replay failed:`, lcErr.message);
+                    stepResult = null; // Fall through to AI below
+                  }
+                }
+              } catch { /* last-chance lookup failed — continue to AI */ }
+            }
+
             // AI REASONING — no recipe available, use the full AI agent for this sub-task
+            if (!stepResult || !stepResult.success) {
+            // Compose guard: if email compose was already opened by a prior sub-task or recipe,
+            // skip this sub-task to avoid duplicate compose windows
+            if (composeOpened && /compose|email|send|write/i.test(subTask.category || subTask.intent || '')) {
+              console.log(`[BG] Chain sub-task ${subTask.order}: skipping — compose already opened`);
+              stepResult = { success: true, durationMs: 0, skippedDuplicate: true };
+            } else {
             console.log(`[BG] Chain sub-task ${subTask.order} ("${subTask.intent}") has no recipe — falling through to AI`);
             // Build a focused prompt for just this sub-task, incorporating resolved inputs + previous step data
             const inputContext = Object.entries(resolvedInputs)
@@ -6311,14 +6606,54 @@ async function handleMessage(request, sender) {
               });
               if (aiRes.ok) {
                 const aiData = await aiRes.json();
-                // Mark success so chain can capture outputs and continue
-                stepResult = { success: true, aiAction: aiData, durationMs: 0 };
+
+                // If AI returned EXPLORE, run a mini exploration for this chain sub-task
+                if (aiData.action_type === 'EXPLORE' && aiData.explore_plan) {
+                  console.log(`[BG] Chain sub-task ${subTask.order}: AI returned EXPLORE — running mini exploration`);
+                  try {
+                    const exploreResult = await runExplorationLoop(
+                      aiData.explore_plan,
+                      currentTab.id,
+                      token,
+                      null, // no resume state
+                      { originalPrompt: userPrompt, phase: 1, previousPhases: [], totalSteps: 0, dataBuffer: '' }
+                    );
+                    stepResult = {
+                      success: exploreResult.success,
+                      durationMs: 0,
+                      error: exploreResult.error || null,
+                      exploreGoalResult: exploreResult.goalResult || null,
+                    };
+                  } catch (exploreErr) {
+                    console.warn(`[BG] Chain sub-task ${subTask.order}: mini-exploration failed:`, exploreErr.message);
+                    stepResult = { success: false, error: `Exploration failed: ${exploreErr.message}` };
+                  }
+                } else if (aiData.action_type === 'NAVIGATE' && aiData.navigate_url) {
+                  // Simple navigation — execute it
+                  try {
+                    await chrome.tabs.update(currentTab.id, { url: aiData.navigate_url });
+                    await new Promise(r => setTimeout(r, 3000)); // Wait for page load
+                    stepResult = { success: true, aiAction: aiData, durationMs: 0 };
+                  } catch (navErr) {
+                    stepResult = { success: false, error: `Navigation failed: ${navErr.message}` };
+                  }
+                } else {
+                  // Other action types (RECOMMENDATION, etc.) — mark as success, capture outputs
+                  stepResult = { success: true, aiAction: aiData, durationMs: 0 };
+                }
               } else {
                 stepResult = { success: false, error: 'AI reasoning failed for chain sub-task' };
               }
             } catch (aiErr) {
               stepResult = { success: false, error: `AI fallback error: ${aiErr.message}` };
             }
+            } // end else (compose guard)
+            } // end if (!stepResult || !stepResult.success) — last-chance recipe may have succeeded
+          }
+
+          // Track compose opens to prevent duplicate compose windows
+          if (stepResult?.success && /compose|email|send|write/i.test(subTask.category || subTask.intent || '')) {
+            composeOpened = true;
           }
 
           // Capture page outputs after this sub-task (URL + title + visible content from active tab)
@@ -6632,7 +6967,18 @@ async function handleMessage(request, sender) {
 
   // ── EXPLORE: Multi-step agentic exploration loop ────────────
   // Fire-and-forget: return immediately, results come via updateExplorationProgress
+  if (request.type === 'explore_cancel') {
+    console.log('[BG] Exploration cancel requested by user');
+    explorationAborted = true;
+    // Clean up storage immediately so panel recovery doesn't re-trigger
+    try {
+      await chrome.storage.session.remove(['explorationActive', 'explorationResult', 'explorationProgress']);
+    } catch {}
+    return { success: true, cancelled: true };
+  }
+
   if (request.type === 'explore_start') {
+    explorationAborted = false; // Reset abort flag for new exploration
     const { explorePlan, userPrompt } = request.data;
     if (!explorePlan || !explorePlan.goal) {
       return { success: false, error: 'Invalid explore plan: no goal specified.' };
@@ -7469,14 +7815,27 @@ async function handleMessage(request, sender) {
     // taskContext may contain enriched data from previous chain steps — don't use it for search.
     const promptForSearch = originalPrompt || taskContext || '';
 
-    // Extract email addresses from the prompt before stripping them for search query
+    // Extract recipient: prefer explicit email address; fall back to contact name.
+    // Email clients (Gmail, Outlook, etc.) resolve contact names to email via autocomplete.
     const emailsInPrompt = promptForSearch.match(/[^\s@]+@[^\s@]+\.[^\s@]+/g) || [];
-    const recipientEmail = emailsInPrompt[0] || variables?.__recipient_email || '';
+    const recipientNameMatch = promptForSearch.match(
+      /\b(?:write|send|email|message|compose)(?:\s+(?:an?\s+)?(?:email|message))?\s+to\s+([\w][\w.\-]*)/i
+    );
+    const recipientEmail = emailsInPrompt[0] || variables?.__recipient_email || recipientNameMatch?.[1] || '';
 
-    const searchQueryFromPrompt = promptForSearch
-      .replace(/\b(search|find|look\s*for|browse|shop|buy|purchase|order|get|show|display|email|compose|write|send|reply|message|forward|then|and|on|in|at|the|a|an|for|to|from|my|me|please|can|you|i|want|need|under|over|below|above|less\s*than|more\s*than|cheaper\s*than|about|tell|compile)\b/gi, ' ')
+    // For compound prompts like "find X then write email to Y about Z", extract only the
+    // first clause (the search term). Match everything BEFORE "then/and then + action-verb"
+    // so the entire second clause — including "email to kibromamaniel..." — is dropped.
+    const compoundSplit = promptForSearch.match(
+      /^([\s\S]+?)\b(?:and\s+then|then|after\s+that)\s+(?:write|send|email|compose|reply|message|forward|call|book|order|buy|purchase|post|tweet|slack|notify|tell)\b/i
+    );
+    const promptForSearchTrimmed = compoundSplit ? compoundSplit[1].trim() : promptForSearch.trim();
+
+    const searchQueryFromPrompt = promptForSearchTrimmed
+      .replace(/\b(search|find|look\s*for|browse|shop|buy|purchase|order|get|show|display|email|compose|write|send|reply|message|forward|then|and|on|in|at|the|a|an|for|to|from|my|me|please|can|you|i|want|need|under|over|below|above|less\s*than|more\s*than|cheaper\s*than|about|tell|compile|what|which|who|when|where|how|got|bought|found|used)\b/gi, ' ')
       .replace(/\b(amazon|ebay|walmart|etsy|gmail|outlook|yahoo|linkedin|twitter|reddit|facebook|instagram|youtube|google|slack|discord|zillow|airbnb|indeed|circlenomy)\b/gi, ' ')
       .replace(/[^\s@]+@[^\s@]+\.[^\s@]+/g, ' ') // Remove emails
+      .replace(/[^\w\s\-]/g, ' ')                 // Remove special chars (URLs, punctuation)
       .replace(/\s+/g, ' ')
       .trim();
 

@@ -13,6 +13,10 @@
   if (window.__enhReplayInjected) return;
   window.__enhReplayInjected = true;
 
+  // Adaptive polling: tracks how long waitForElement took per step.
+  // Shared across replayRecipe + waitForElement. Reset on each new replay.
+  let elementFindTimings = [];
+
   // ── Element Finding (Multi-Strategy Selector Resolution) ─────
 
   function getAllReachableDocuments() {
@@ -472,21 +476,38 @@
 
   // ── Wait-and-Find: retry finding element with generous timeout ──
   // Default 30s — pages can take 10-20s to load after SPA transitions.
-  // Polls every 500ms (first 5s) then every 800ms (remaining time) to avoid CPU thrash.
+  // Polls with adaptive timing: starts fast, slows down if element isn't found quickly.
+  // Uses elementFindTimings (tracked per-replay in replayRecipe) to calibrate:
+  //   - If recent steps found elements in <500ms → poll at 200ms, timeout at 5s
+  //   - Otherwise → default 400ms poll, 12s timeout
+  // After a navigation step, timings reset (new page = fresh loading).
 
   async function waitForElement(selectors, timeoutMs = 12000, description, semanticContext) {
+    // Adaptive calibration from recent replay history
+    let effectiveTimeout = timeoutMs;
+    let basePollMs = 400;
+    if (elementFindTimings.length >= 3) {
+      const avg = elementFindTimings.slice(-5).reduce((a, b) => a + b, 0) / Math.min(elementFindTimings.length, 5);
+      if (avg < 500) {
+        basePollMs = 200;
+        effectiveTimeout = Math.min(timeoutMs, 5000);
+      }
+    }
+
     const startTime = Date.now();
     let attempts = 0;
-    while (Date.now() - startTime < timeoutMs) {
+    while (Date.now() - startTime < effectiveTimeout) {
       const found = findElement(selectors, description, semanticContext);
       if (found) {
-        console.log(`[Enhancivity Replay] Found element after ${attempts} attempts (${Date.now() - startTime}ms) using "${found.usedStrategy}"`);
+        const elapsed = Date.now() - startTime;
+        console.log(`[Enhancivity Replay] Found element after ${attempts} attempts (${elapsed}ms) using "${found.usedStrategy}"`);
+        elementFindTimings.push(elapsed);
         return found;
       }
       attempts++;
-      // Poll faster in the first 5 seconds, slower after (element likely waiting for page load)
+      // Poll faster initially, slower after 5s (element likely waiting for page load)
       const elapsed = Date.now() - startTime;
-      await delay(elapsed < 5000 ? 400 : 800);
+      await delay(elapsed < 5000 ? basePollMs : Math.max(basePollMs, 800));
     }
     // Log what we tried for debugging
     console.warn(`[Enhancivity Replay] Element NOT found after ${attempts} attempts (${timeoutMs}ms timeout). Selectors tried:`,
@@ -795,7 +816,7 @@
 
     // Post-click: detect if click caused page transition (SPA navigation or major DOM change)
     // and wait for the page to stabilize before the next step
-    await delay(300);
+    await delay(100);
     const postClickUrl = window.location.href;
     const postClickBodyLen = document.body?.innerHTML?.length || 0;
     const urlChanged = postClickUrl !== preClickUrl;
@@ -825,7 +846,7 @@
 
   // Wait for the page DOM to stop changing (signals that SPA navigation or
   // dynamic content loading has finished). Max wait: 15 seconds.
-  async function waitForPageStable(maxWaitMs = 15000, settleMs = 800) {
+  async function waitForPageStable(maxWaitMs = 15000, settleMs = 500) {
     const startTime = Date.now();
     let lastBodyLen = document.body?.innerHTML?.length || 0;
     let stableSince = Date.now();
@@ -855,10 +876,10 @@
       ? (variables[action.variableName] || '')
       : (action.fixedValue || '');
 
-    // Fallback: if variable is empty but we have the original recorded value, use it
-    if (!value && action.originalFixedValue) {
-      console.log(`[Enhancivity Replay] Variable "${action.variableName}" empty, falling back to original: "${action.originalFixedValue}"`);
-      value = action.originalFixedValue;
+    // If a required variable has no value, fail the recipe so the AI takes over.
+    // Never fall back to the recorded example — it was just a demonstration, not the actual value.
+    if (!value && action.inputType === 'variable') {
+      return { success: false, error: `Variable "${action.variableName}" has no value — recipe cannot execute` };
     }
 
     if (!value) return { success: true, usedStrategy: found.usedStrategy, note: 'Empty value — skipped' };
@@ -1230,6 +1251,8 @@
   async function replayRecipe(recipe, variables) {
     const results = [];
     const startTime = Date.now();
+    // Reset adaptive polling timings for this replay session
+    elementFindTimings = [];
 
     console.log('[Enhancivity Replay] Starting recipe:', recipe.workflowName, '— steps:', recipe.steps.length);
 
@@ -1332,6 +1355,14 @@
             durationMs: Date.now() - startTime,
           };
         }
+
+        // Reset adaptive timings after navigation — new page may load slowly
+        if (action.type === 'navigate' || action.type === 'click') {
+          const postUrl = window.location.href;
+          if (i > 0 && postUrl !== (recipe.steps[i - 1]?.url || '')) {
+            elementFindTimings.length = 0; // Clear history — fresh page
+          }
+        }
       } catch (err) {
         result = { success: false, error: err.message };
       }
@@ -1374,9 +1405,9 @@
         };
       }
 
-      // Human-like delay between steps (200-600ms)
+      // Brief delay between steps (50-150ms) — enough to avoid synchronous event conflicts
       if (i < recipe.steps.length - 1) {
-        await delay(200 + Math.random() * 400);
+        await delay(50 + Math.random() * 100);
       }
     }
 
