@@ -11,20 +11,28 @@ const MANIFEST_BACKUP_PATH = path.resolve(__dirname, '..', '.manifest-backup.jso
 module.exports = async function globalSetup() {
   // ── Patch background.js: API_BASE → localhost:3099 ──
   const original = fs.readFileSync(BG_PATH, 'utf8');
-  fs.writeFileSync(BACKUP_PATH, original, 'utf8');
 
-  const patched = original.replace(
-    /const API_BASE = ['"]http:\/\/localhost:3001['"]/,
-    "const API_BASE = 'http://localhost:3099'"
-  );
-
-  if (patched === original) {
-    console.warn('[GlobalSetup] WARNING: API_BASE patch did not match — background.js may already be patched or format changed.');
+  // Guard: if already patched (file stuck from a previous run where teardown didn't execute),
+  // skip both the backup write and the patch. Writing a backup of localhost:3099 would cause
+  // teardown to "restore" to localhost:3099, permanently breaking the file.
+  if (original.includes("const API_BASE = 'http://localhost:3099'")) {
+    console.warn('[GlobalSetup] WARNING: background.js already at localhost:3099 — skipping patch. Restore to localhost:3001 before running tests.');
   } else {
-    console.log('[GlobalSetup] Patched API_BASE → localhost:3099');
-  }
+    fs.writeFileSync(BACKUP_PATH, original, 'utf8');
 
-  fs.writeFileSync(BG_PATH, patched, 'utf8');
+    const patched = original.replace(
+      /const API_BASE = ['"]http:\/\/localhost:3001['"]/,
+      "const API_BASE = 'http://localhost:3099'"
+    );
+
+    if (patched === original) {
+      console.warn('[GlobalSetup] WARNING: API_BASE patch did not match — background.js may already be patched or format changed.');
+    } else {
+      console.log('[GlobalSetup] Patched API_BASE → localhost:3099');
+    }
+
+    fs.writeFileSync(BG_PATH, patched, 'utf8');
+  }
 
   // ── Patch manifest.json: add localhost:3099 to host_permissions ──
   const manifestOriginal = fs.readFileSync(MANIFEST_PATH, 'utf8');
