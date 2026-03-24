@@ -1,5 +1,4 @@
 const { defineConfig } = require('@playwright/test');
-const path = require('path');
 
 module.exports = defineConfig({
   testDir: './tests/suites',
@@ -9,18 +8,6 @@ module.exports = defineConfig({
   reporter: [['html', { open: 'never' }], ['list']],
 
   use: {
-    headless: false,
-    channel: 'chromium',
-    launchOptions: {
-      args: [
-        `--disable-extensions-except=${path.resolve(__dirname)}`,
-        `--load-extension=${path.resolve(__dirname)}`,
-        '--no-first-run',
-        '--disable-popup-blocking',
-        '--disable-component-extensions-with-background-pages',
-      ],
-      ignoreDefaultArgs: ['--disable-extensions'],
-    },
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',

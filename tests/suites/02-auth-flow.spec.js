@@ -1,5 +1,5 @@
 // @ts-check
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../helpers/fixtures');
 const { getServiceWorker, getExtensionId, openSidePanel } = require('../helpers/extension');
 const { injectAuth, clearAuth } = require('../helpers/auth');
 
