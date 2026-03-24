@@ -379,6 +379,36 @@ app.post('/api/agent/compare', (req, res) => {
 app.post('/api/agent/chain/plan', (req, res) => {
   const userRequest = (req.body.userRequest || '').toLowerCase();
 
+  // Ghost-chain test: returns a 2-sub-task chain on localhost so no external
+  // tab navigation is needed. Sub-task 2 has a pendingInput (previous_step
+  // reference) that triggers a /api/agent/chain/resolve-inputs call, which
+  // is the observable used by 16-ghost-chain.spec.js.
+  if (userRequest.includes('__ghost_test__')) {
+    return res.json({
+      success: true,
+      isChain: true,
+      subTasks: [
+        {
+          order: 1, intent: 'ghost test sub-task 1',
+          domain: 'localhost', category: 'other',
+          inputs: [], outputs: [{ name: 'page_title', type: 'text-content' }],
+          recipe: null, recipeScore: 0, executionMethod: 'ai_reasoning',
+          resolvedInputs: {}, pendingInputs: [],
+        },
+        {
+          order: 2, intent: 'ghost test sub-task 2',
+          domain: 'localhost', category: 'other',
+          inputs: [{ name: 'prev_result', source: 'previous_step', fromStep: 1, fromOutput: 'page_title' }],
+          outputs: [],
+          recipe: null, recipeScore: 0, executionMethod: 'ai_reasoning',
+          resolvedInputs: {},
+          pendingInputs: [{ name: 'prev_result', source: 'previous_step', fromStep: 1, fromOutput: 'page_title' }],
+        },
+      ],
+      totalSteps: 2, recipeCount: 0, aiCount: 2,
+    });
+  }
+
   // Multi-site: Amazon + Gmail
   if (userRequest.includes('amazon') && (userRequest.includes('email') || userRequest.includes('gmail'))) {
     return res.json({

@@ -2565,6 +2565,12 @@ async function executeExploreAction(tabId, action, token, _retryCount = 0) {
 // Global abort flag — set by explore_cancel handler, checked by the step loop
 let explorationAborted = false;
 
+// Generation counter — incremented on every new process_request.
+// Each request captures its own generation number. When the chain loop
+// checks this, a mismatch means a newer request arrived and the old
+// chain must abort (ghost-chain prevention).
+let currentRequestGeneration = 0;
+
 // Helper: mark exploration as finished and store result for panel recovery
 async function finishExploration(result) {
   // Only reset abort flag if the user did NOT cancel. If they cancelled,
@@ -5744,6 +5750,10 @@ async function handleMessage(request, sender) {
   if (request.type === 'process_request' || request.type === 'process_request_skip_recipe') {
     const skipRecipeCheck = request.type === 'process_request_skip_recipe';
     const { userPrompt, tabId, url, availableTabs, conversationHistory, siteHint } = request.data;
+    // Capture generation number before any awaits. If a newer request arrives
+    // while this one is awaiting (memory fetch, chain plan, etc.), the counter
+    // advances and the old chain detects the mismatch and aborts.
+    const thisRequestGeneration = ++currentRequestGeneration;
 
     // Load memory (from cache or fresh fetch)
     let userMemory;
@@ -6091,7 +6101,10 @@ async function handleMessage(request, sender) {
       });
       const chainPlan = await chainPlanRes.json();
 
-      if (chainPlan?.success && chainPlan?.isChain && chainPlan.subTasks?.length > 1) {
+      // Ghost-chain guard (pre-loop): if a newer request arrived while we were
+      // waiting for the chain plan, this request is stale — skip its chain entirely.
+      if (chainPlan?.success && chainPlan?.isChain && chainPlan.subTasks?.length > 1 &&
+          thisRequestGeneration === currentRequestGeneration) {
         // Sort sub-tasks by order to guarantee correct execution sequence
         // (backend may return them out of order in edge cases)
         chainPlan.subTasks.sort((a, b) => a.order - b.order);
@@ -6115,9 +6128,10 @@ async function handleMessage(request, sender) {
         }
 
         for (const subTask of chainPlan.subTasks) {
-          // ── CANCELLATION CHECK: user clicked X/Cancel during a previous sub-task ──
-          if (explorationAborted) {
-            console.log(`[BG] Chain: aborting at sub-task ${subTask.order} — user cancelled`);
+          // ── CANCELLATION CHECK: user clicked X/Cancel OR a newer request arrived ──
+          if (explorationAborted || thisRequestGeneration !== currentRequestGeneration) {
+            const reason = explorationAborted ? 'user cancelled' : 'superseded by newer request';
+            console.log(`[BG] Chain: aborting at sub-task ${subTask.order} — ${reason}`);
             chainSuccess = false;
             break;
           }
