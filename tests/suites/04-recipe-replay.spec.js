@@ -28,38 +28,50 @@ test.describe('Recipe Replay', () => {
       siteDomain: 'localhost',
       steps: [
         {
-          type: 'click',
-          selectors: [
-            { strategy: 'css-id', value: '#first-name' },
-            { strategy: 'placeholder', value: 'First Name' },
-          ],
-          description: 'Click the First Name field',
+          stepNumber: 1,
+          action: {
+            type: 'click',
+            selectors: [
+              { strategy: 'css-id', value: '#first-name' },
+              { strategy: 'placeholder', value: 'First Name' },
+            ],
+            description: 'Click the First Name field',
+          },
         },
         {
-          type: 'type',
-          selectors: [
-            { strategy: 'css-id', value: '#first-name' },
-            { strategy: 'placeholder', value: 'First Name' },
-          ],
-          value: 'John',
-          description: 'Type the name',
+          stepNumber: 2,
+          action: {
+            type: 'type',
+            selectors: [
+              { strategy: 'css-id', value: '#first-name' },
+              { strategy: 'placeholder', value: 'First Name' },
+            ],
+            fixedValue: 'John',
+            description: 'Type the name',
+          },
         },
         {
-          type: 'click',
-          selectors: [
-            { strategy: 'css-id', value: '#email' },
-            { strategy: 'placeholder', value: 'Email address' },
-          ],
-          description: 'Click the email field',
+          stepNumber: 3,
+          action: {
+            type: 'click',
+            selectors: [
+              { strategy: 'css-id', value: '#email' },
+              { strategy: 'placeholder', value: 'Email address' },
+            ],
+            description: 'Click the email field',
+          },
         },
         {
-          type: 'type',
-          selectors: [
-            { strategy: 'css-id', value: '#email' },
-            { strategy: 'placeholder', value: 'Email address' },
-          ],
-          value: 'john@test.com',
-          description: 'Type the email',
+          stepNumber: 4,
+          action: {
+            type: 'type',
+            selectors: [
+              { strategy: 'css-id', value: '#email' },
+              { strategy: 'placeholder', value: 'Email address' },
+            ],
+            fixedValue: 'john@test.com',
+            description: 'Type the email',
+          },
         },
       ],
       variables: [],
@@ -152,11 +164,14 @@ test.describe('Recipe Replay', () => {
             id: 'test-fail-001',
             steps: [
               {
-                type: 'click',
-                selectors: [
-                  { strategy: 'css-id', value: '#nonexistent-element' },
-                ],
-                description: 'Click a non-existent element',
+                stepNumber: 1,
+                action: {
+                  type: 'click',
+                  selectors: [
+                    { strategy: 'css-id', value: '#nonexistent-element' },
+                  ],
+                  description: 'Click a non-existent element',
+                },
               },
             ],
           },
@@ -178,7 +193,7 @@ test.describe('Recipe Replay', () => {
     await formPage.close();
   });
 
-  test('replay with variable substitution replaces {{variables}}', async ({ context }) => {
+  test('replay with variable substitution uses inputType:variable schema', async ({ context }) => {
     const sw = await getServiceWorker(context);
 
     const formPage = await context.newPage();
@@ -211,15 +226,22 @@ test.describe('Recipe Replay', () => {
             id: 'test-var-001',
             steps: [
               {
-                type: 'click',
-                selectors: [{ strategy: 'css-id', value: '#first-name' }],
-                description: 'Click name field',
+                stepNumber: 1,
+                action: {
+                  type: 'click',
+                  selectors: [{ strategy: 'css-id', value: '#first-name' }],
+                  description: 'Click name field',
+                },
               },
               {
-                type: 'type',
-                selectors: [{ strategy: 'css-id', value: '#first-name' }],
-                value: '{{userName}}',
-                description: 'Type the variable name',
+                stepNumber: 2,
+                action: {
+                  type: 'type',
+                  selectors: [{ strategy: 'css-id', value: '#first-name' }],
+                  inputType: 'variable',
+                  variableName: 'userName',
+                  description: 'Type the variable name',
+                },
               },
             ],
           },
