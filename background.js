@@ -5859,7 +5859,7 @@ async function handleMessage(request, sender) {
         /\beach\s+(one|site|platform|app)\b/i.test(lower);
       // Require at least one action verb alongside sequential/parallel language
       // to avoid false positives on normal sentences containing "then"
-      const hasMultipleActionVerbs = (lower.match(/\b(search|find|send|email|compose|post|buy|open|check|ask|go|navigate|create|fill|submit|upload|write|order|browse|visit)\b/gi) || []).length >= 2;
+      const hasMultipleActionVerbs = (lower.match(/\b(search|find|send|email|compose|post|buy|open|check|ask|go|navigate|create|fill|submit|upload|write|order|browse|visit|schedule)\b/gi) || []).length >= 2;
       if ((hasSequentialLanguage || hasParallelLanguage) && hasMultipleActionVerbs) return true;
 
       return false;
@@ -5873,10 +5873,16 @@ async function handleMessage(request, sender) {
     // ── LEARNING MODE: Auto-replay matching recipe (zero-token, silent) ──
     // If a learned recipe exists for this site + task, replay it automatically
     // without asking the user. If replay fails, silently fall through to AI.
-    // ALWAYS try recipe matching first — even for multi-site prompts.
-    // If a recipe matches the current domain, replay it. The chain system handles the rest.
-    if (!skipRecipeCheck) try {
-      const siteDomain = url ? new URL(url).hostname : '';
+    //
+    // MAIL-DOMAIN GUARD: When the user is on a mail domain (Gmail, Outlook, etc.)
+    // AND the prompt is a multi-site chain, the mail action is the LAST sub-task —
+    // NOT the first. Replaying the Gmail recipe here would execute it BEFORE the
+    // chain's first sub-task (e.g., Google Meet), inverting the order.
+    // Skip pre-chain recipe match and let the chain system handle everything in order.
+    const _siteDomainForGuard = url ? new URL(url).hostname : '';
+    const _isMailDomain = /mail\.google\.com|outlook\.live\.com|mail\.yahoo\.com/i.test(_siteDomainForGuard);
+    if (!skipRecipeCheck && !(isMultiSitePrompt && _isMailDomain)) try {
+      const siteDomain = _siteDomainForGuard;
       if (siteDomain && userPrompt) {
         const recipeRes = await fetch(
           `${API_BASE}/api/recipes/match?siteDomain=${encodeURIComponent(siteDomain)}&task=${encodeURIComponent(userPrompt)}`,
