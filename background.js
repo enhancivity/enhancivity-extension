@@ -12,7 +12,7 @@ console.log('[BG] ===== BACKGROUND v4.2 (variable-by-default) LOADED =====');
 // ============================================================
 
 // Toggle for deployment: 'https://service.enhancivity.com' for production, 'http://localhost:3001' for local dev
-const API_BASE = 'https://service.enhancivity.com';
+const API_BASE = 'http://localhost:3001';
 const MEMORY_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // Allow content scripts to access chrome.storage.session (required for conversation persistence + exploration recovery)
@@ -5626,7 +5626,7 @@ async function handleMessage(request, sender) {
   // ── LOGIN: Email + Password ──────────────────────────────
   if (request.type === 'extension_login') {
     const { email, password } = request.data;
-    const res = await fetch(`${API_BASE}/api/auth/extension/login`, {
+    const res = await fetch(`http://localhost:3002/api/auth/extension/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, password })
@@ -5692,7 +5692,7 @@ async function handleMessage(request, sender) {
     const match = redirectUrl.match(/access_token=([^&]*)/);
     if (!match) return { success: false, message: 'No access token returned from Google.' };
 
-    const res = await fetch(`${API_BASE}/api/auth/extension/google`, {
+    const res = await fetch(`http://localhost:3002/api/auth/extension/google`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ access_token: match[1] })
