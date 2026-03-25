@@ -12,7 +12,7 @@ console.log('[BG] ===== BACKGROUND v4.2 (variable-by-default) LOADED =====');
 // ============================================================
 
 // Toggle for deployment: 'https://service.enhancivity.com' for production, 'http://localhost:3001' for local dev
-const API_BASE = 'https://service.enhancivity.com';
+const API_BASE = 'http://localhost:3001';
 const MEMORY_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // Allow content scripts to access chrome.storage.session (required for conversation persistence + exploration recovery)

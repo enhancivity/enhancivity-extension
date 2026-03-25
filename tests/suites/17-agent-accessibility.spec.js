@@ -226,12 +226,18 @@ test.describe('Agent Accessibility', () => {
   });
 
   test('explore detects open modals via aria attributes', async ({ context }) => {
-    const sw = await getServiceWorker(context, 60_000);
+    test.setTimeout(120_000);
 
+    // Open the target page FIRST — Chrome activity helps restart an idle service worker.
+    // Tests 17.2 and 17.3 do not interact with the SW so Chrome may idle-terminate it
+    // by the time this test runs. Loading a page before waiting for the SW gives Chrome
+    // a trigger to restart it.
     const page = await context.newPage();
     await page.goto('http://localhost:3099/harness/modal-aria.html');
     await page.waitForLoadState('domcontentloaded');
     await page.bringToFront();
+
+    const sw = await getServiceWorker(context, 90_000);
 
     const result = await takeExploreSnapshotOnActiveTab(sw);
 

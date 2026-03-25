@@ -30,6 +30,7 @@
       result: entry.result || 'unknown',
       error: entry.error || null,
       pageUrl: entry.pageUrl || window.location.href,
+      verification: entry.verification || null,
     };
   }
 
@@ -48,6 +49,227 @@
 
   function readSessionActionHistory() {
     return sessionActionHistory.slice();
+  }
+
+  function normalizeVerificationText(text) {
+    return String(text || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  function readVerificationStateValue(element, attributeName, propertyName = null) {
+    if (!element) return null;
+
+    if (propertyName && typeof element[propertyName] === 'boolean') {
+      return element[propertyName];
+    }
+
+    const attrValue = element.getAttribute(attributeName);
+    if (attrValue === 'true') return true;
+    if (attrValue === 'false') return false;
+    return attrValue || null;
+  }
+
+  function resolveVerificationTargetElement(action, targetElement) {
+    if (!targetElement || action?.type !== 'type_text') return targetElement || null;
+
+    if (targetElement.matches?.('input, textarea, select') || targetElement.isContentEditable) {
+      return targetElement;
+    }
+
+    const editableSelector = [
+      '[contenteditable="true"]',
+      '[role="textbox"]',
+      'textarea',
+      'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"])',
+      'select',
+    ].join(', ');
+
+    try {
+      const nested = targetElement.querySelector(editableSelector);
+      if (nested) return nested;
+    } catch {}
+
+    if (targetElement.shadowRoot) {
+      try {
+        const nestedShadow = targetElement.shadowRoot.querySelector(editableSelector);
+        if (nestedShadow) return nestedShadow;
+      } catch {}
+    }
+
+    return targetElement;
+  }
+
+  function readVerificationTargetValue(action, targetElement) {
+    const resolvedTarget = resolveVerificationTargetElement(action, targetElement);
+    if (!resolvedTarget) return '';
+
+    if (resolvedTarget.tagName === 'INPUT' || resolvedTarget.tagName === 'TEXTAREA' || resolvedTarget.tagName === 'SELECT') {
+      return String(resolvedTarget.value || '');
+    }
+
+    if (resolvedTarget.isContentEditable || resolvedTarget.getAttribute?.('contenteditable') === 'true') {
+      return String(resolvedTarget.innerText || resolvedTarget.textContent || '');
+    }
+
+    return String(
+      resolvedTarget.innerText ||
+      resolvedTarget.textContent ||
+      resolvedTarget.getAttribute?.('aria-label') ||
+      ''
+    );
+  }
+
+  function captureActionBeforeState(action, targetElement) {
+    const resolvedTarget = resolveVerificationTargetElement(action, targetElement);
+    const parent = resolvedTarget?.parentElement || null;
+
+    return {
+      url: window.location.href,
+      targetValue: readVerificationTargetValue(action, resolvedTarget),
+      targetText: String(
+        resolvedTarget?.innerText ||
+        resolvedTarget?.textContent ||
+        resolvedTarget?.getAttribute?.('aria-label') ||
+        ''
+      ).trim().slice(0, 300),
+      parentText: String(parent?.innerText || parent?.textContent || '').trim().slice(0, 500),
+      aria: {
+        expanded: readVerificationStateValue(resolvedTarget, 'aria-expanded'),
+        pressed: readVerificationStateValue(resolvedTarget, 'aria-pressed'),
+        selected: readVerificationStateValue(resolvedTarget, 'aria-selected'),
+        checked: readVerificationStateValue(resolvedTarget, 'aria-checked', 'checked'),
+        modal: readVerificationStateValue(resolvedTarget, 'aria-modal'),
+      },
+    };
+  }
+
+  function shouldVerifyActionResult(action) {
+    return ['click_element', 'type_text', 'navigate'].includes(action?.type);
+  }
+
+  async function verifyActionResult(action, targetElement, beforeState) {
+    if (!action?.type || !beforeState) {
+      return { verified: false, signal: 'missing-before-state' };
+    }
+
+    const resolvedTarget = resolveVerificationTargetElement(action, targetElement);
+
+    if (action.type === 'click_element') {
+      await new Promise(resolve => setTimeout(resolve, 250));
+
+      const afterUrl = window.location.href;
+      if (beforeState.url && afterUrl !== beforeState.url) {
+        return {
+          verified: true,
+          signal: 'url-change',
+          beforeUrl: beforeState.url,
+          afterUrl,
+        };
+      }
+
+      const ariaChecks = [
+        { key: 'expanded', signal: 'aria-expanded' },
+        { key: 'pressed', signal: 'aria-pressed' },
+        { key: 'selected', signal: 'aria-selected' },
+        { key: 'checked', signal: 'aria-checked' },
+        { key: 'modal', signal: 'aria-modal' },
+      ];
+
+      for (const check of ariaChecks) {
+        const afterValue = readVerificationStateValue(
+          resolvedTarget,
+          `aria-${check.key}`,
+          check.key === 'checked' ? 'checked' : null
+        );
+        if (beforeState.aria?.[check.key] !== afterValue && afterValue !== null) {
+          return {
+            verified: true,
+            signal: check.signal,
+            before: beforeState.aria?.[check.key],
+            after: afterValue,
+          };
+        }
+      }
+
+      const afterParentText = String(resolvedTarget?.parentElement?.innerText || resolvedTarget?.parentElement?.textContent || '').trim().slice(0, 500);
+      if (afterParentText && beforeState.parentText && normalizeVerificationText(afterParentText) !== normalizeVerificationText(beforeState.parentText)) {
+        return {
+          verified: true,
+          signal: 'dom-change',
+          before: beforeState.parentText,
+          after: afterParentText,
+        };
+      }
+
+      const afterTargetText = String(
+        resolvedTarget?.innerText ||
+        resolvedTarget?.textContent ||
+        resolvedTarget?.getAttribute?.('aria-label') ||
+        ''
+      ).trim().slice(0, 300);
+      if (afterTargetText && beforeState.targetText && normalizeVerificationText(afterTargetText) !== normalizeVerificationText(beforeState.targetText)) {
+        return {
+          verified: true,
+          signal: 'target-text-change',
+          before: beforeState.targetText,
+          after: afterTargetText,
+        };
+      }
+
+      return { verified: false, signal: 'no-observable-change' };
+    }
+
+    if (action.type === 'type_text') {
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      const expectedValue = String(action.value || '');
+      const actualValue = readVerificationTargetValue(action, resolvedTarget);
+      const normalizedExpected = normalizeVerificationText(expectedValue);
+      const normalizedActual = normalizeVerificationText(actualValue);
+
+      if (normalizedExpected && (normalizedActual === normalizedExpected || normalizedActual.includes(normalizedExpected))) {
+        return {
+          verified: true,
+          signal: 'input-value',
+          expectedLength: expectedValue.length,
+          actualLength: actualValue.length,
+        };
+      }
+
+      return {
+        verified: false,
+        signal: 'input-mismatch',
+        expected: expectedValue.slice(0, 120),
+        actual: actualValue.slice(0, 120),
+      };
+    }
+
+    if (action.type === 'navigate') {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const afterUrl = window.location.href;
+      return {
+        verified: !!beforeState.url && afterUrl !== beforeState.url,
+        signal: beforeState.url && afterUrl !== beforeState.url ? 'url-change' : 'no-url-change',
+        beforeUrl: beforeState.url,
+        afterUrl,
+      };
+    }
+
+    return { verified: false, signal: 'unsupported-action' };
+  }
+
+  async function attachVerificationToExploreResult(result, action, targetElement, beforeState) {
+    if (!result || !result.success || !shouldVerifyActionResult(action) || !beforeState) {
+      return result;
+    }
+
+    const verification = await verifyActionResult(action, targetElement, beforeState);
+    return {
+      ...result,
+      verification,
+    };
   }
 
   // ── Safety Guards ───────────────────────────────────────────
@@ -3285,11 +3507,18 @@
       return true;
     }
 
+    // Capture before-state for verifiable actions (click, type, navigate)
+    const _actionObj = { type: actionType, target, value };
+    const _needsVerify = shouldVerifyActionResult(_actionObj);
+    const _targetEl = _needsVerify ? findBySid(target) : null;
+    const _beforeState = _needsVerify ? captureActionBeforeState(_actionObj, _targetEl) : null;
+
     const result = handler({ target, value, consentApproved });
 
     // Handle async actions (type_text, wait, etc.)
     if (result instanceof Promise) {
       result
+        .then(r => _needsVerify ? attachVerificationToExploreResult(r, _actionObj, _targetEl, _beforeState) : r)
         .then(sendResponse)
         .catch((err) => {
           console.error(`[content_explore] Async handler "${actionType}" threw:`, err);
@@ -3298,6 +3527,13 @@
             error: `Handler "${actionType}" crashed: ${err.message || String(err)}`,
           });
         });
+      return true;
+    }
+
+    if (_needsVerify) {
+      attachVerificationToExploreResult(result, _actionObj, _targetEl, _beforeState)
+        .then(sendResponse)
+        .catch(() => sendResponse(result));
       return true;
     }
 
