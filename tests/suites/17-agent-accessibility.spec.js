@@ -73,6 +73,27 @@ async function readLearningSessionStepCount(sw) {
   });
 }
 
+async function runReplayOnActiveTab(sw, recipe, variables = {}) {
+  return sw.evaluate(async ({ recipe, variables }) => {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) {
+      return { success: false, error: 'No active tab found' };
+    }
+
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ['content_replay.js'],
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 300));
+    return chrome.tabs.sendMessage(tab.id, {
+      type: 'replay_recipe',
+      recipe,
+      variables,
+    });
+  }, { recipe, variables });
+}
+
 test.describe('Agent Accessibility', () => {
   test('recording captures DOM-derived accessibility metadata in recipe steps', async ({ context }) => {
     const sw = await getServiceWorker(context);
@@ -113,5 +134,49 @@ test.describe('Agent Accessibility', () => {
 
     await page.close();
     await extensionPage.close();
+  });
+
+  test('replay falls back to accessibility data when DOM selectors are stale', async ({ context }) => {
+    const sw = await getServiceWorker(context);
+
+    const page = await context.newPage();
+    await page.goto('http://localhost:3099/harness/icon-only.html');
+    await page.waitForLoadState('domcontentloaded');
+    await page.bringToFront();
+
+    const recipe = {
+      id: 'a11y-replay-fallback-001',
+      workflowName: 'Click icon-only home button',
+      siteDomain: 'localhost',
+      steps: [
+        {
+          stepNumber: 1,
+          action: {
+            type: 'click',
+            selectors: [
+              { strategy: 'css-id', value: '#legacy-home-button', priority: 1 },
+              { strategy: 'css', value: '.missing-home-button', priority: 2 },
+            ],
+            description: 'Activate the icon-only home control',
+            semanticContext: {
+              a11y: {
+                name: 'Home',
+                role: 'button',
+                ariaLabel: 'Home',
+              },
+            },
+          },
+        },
+      ],
+    };
+
+    const result = await runReplayOnActiveTab(sw, recipe);
+
+    expect(result).toBeTruthy();
+    expect(result.success).toBe(true);
+    expect(result.results?.[0]?.usedStrategy).toBe('a11y-exact');
+    await expect(page.locator('#status')).toHaveText('clicked-home');
+
+    await page.close();
   });
 });

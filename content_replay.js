@@ -74,6 +74,155 @@
       .toLowerCase();
   }
 
+  function getImplicitRole(el) {
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+
+    if (tag === 'button') return 'button';
+    if (tag === 'a' && el.hasAttribute('href')) return 'link';
+    if (tag === 'select') return 'combobox';
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'summary') return 'button';
+    if (tag === 'dialog') return 'dialog';
+    if (tag === 'option') return 'option';
+
+    if (tag === 'input') {
+      if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
+      if (type === 'checkbox') return 'checkbox';
+      if (type === 'radio') return 'radio';
+      if (type === 'range') return 'slider';
+      if (type === 'number') return 'spinbutton';
+      return 'textbox';
+    }
+
+    return '';
+  }
+
+  function resolveIdReferenceText(doc, idRefs) {
+    if (!doc || !idRefs) return '';
+
+    return idRefs
+      .split(/\s+/)
+      .map(id => doc.getElementById(id))
+      .filter(Boolean)
+      .map(node => normalizeMatchText(node.innerText || node.textContent || ''))
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+  }
+
+  function getAccessibleRole(el) {
+    return normalizeMatchText(el.getAttribute('role') || getImplicitRole(el));
+  }
+
+  function getAccessibleName(el, doc) {
+    return normalizeMatchText(
+      el.getAttribute('aria-label') ||
+      resolveIdReferenceText(doc, el.getAttribute('aria-labelledby')) ||
+      getDirectText(el) ||
+      el.innerText ||
+      el.textContent ||
+      ''
+    );
+  }
+
+  function getRoleText(doc, el) {
+    return normalizeMatchText(getDirectText(el) || el.innerText || el.textContent || '');
+  }
+
+  function getA11yCandidates(doc) {
+    if (!doc) return [];
+    try {
+      return Array.from(doc.querySelectorAll(
+        'button, a[href], input, select, textarea, summary, dialog, [role], [aria-label], [aria-labelledby], [contenteditable="true"]'
+      )).filter(el => isVisibleInDocument(el, doc));
+    } catch {
+      return [];
+    }
+  }
+
+  function toFoundElement(doc, element, usedStrategy) {
+    return {
+      element,
+      usedStrategy,
+      iframe: doc === document ? null : doc.defaultView?.frameElement || null,
+    };
+  }
+
+  function findElementByA11y(a11yData) {
+    if (!a11yData) return null;
+
+    const targetRole = normalizeMatchText(a11yData.role);
+    const labelCandidates = Array.from(new Set([
+      a11yData.ariaLabel,
+      a11yData.name,
+      a11yData.ariaLabelledBy,
+    ].map(normalizeMatchText).filter(Boolean)));
+
+    if (!targetRole && labelCandidates.length === 0) return null;
+
+    for (const doc of getAllReachableDocuments()) {
+      const candidates = getA11yCandidates(doc);
+
+      for (const candidate of candidates) {
+        const candidateRole = getAccessibleRole(candidate);
+        const candidateName = getAccessibleName(candidate, doc);
+        const roleMatches = !targetRole || candidateRole === targetRole;
+
+        if (!roleMatches || !candidateName) continue;
+        if (labelCandidates.some(label => candidateName === label)) {
+          return toFoundElement(doc, candidate, 'a11y-exact');
+        }
+      }
+    }
+
+    let bestFuzzyMatch = null;
+    for (const doc of getAllReachableDocuments()) {
+      const candidates = getA11yCandidates(doc);
+
+      for (const candidate of candidates) {
+        const candidateName = getAccessibleName(candidate, doc);
+        if (!candidateName) continue;
+
+        const matchedLabel = labelCandidates.find(label =>
+          candidateName.includes(label) || label.includes(candidateName)
+        );
+        if (!matchedLabel) continue;
+
+        const score = Math.abs(candidateName.length - matchedLabel.length);
+        if (!bestFuzzyMatch || score < bestFuzzyMatch.score) {
+          bestFuzzyMatch = {
+            doc,
+            candidate,
+            score,
+          };
+        }
+      }
+    }
+
+    if (bestFuzzyMatch) {
+      return toFoundElement(bestFuzzyMatch.doc, bestFuzzyMatch.candidate, 'a11y-fuzzy');
+    }
+
+    if (!targetRole || labelCandidates.length === 0) return null;
+
+    for (const doc of getAllReachableDocuments()) {
+      const candidates = getA11yCandidates(doc);
+
+      for (const candidate of candidates) {
+        const candidateRole = getAccessibleRole(candidate);
+        const candidateText = getRoleText(doc, candidate);
+        if (candidateRole !== targetRole || !candidateText) continue;
+
+        if (labelCandidates.some(label => candidateText === label || candidateText.includes(label))) {
+          return toFoundElement(doc, candidate, 'a11y-role-text');
+        }
+      }
+    }
+
+    return null;
+  }
+
   async function resolveViaSemanticFallback(description, semanticContext) {
     const goalParts = [];
     if (description) goalParts.push(description);
@@ -504,6 +653,15 @@
         elementFindTimings.push(elapsed);
         return found;
       }
+
+      const a11yFound = semanticContext?.a11y ? findElementByA11y(semanticContext.a11y) : null;
+      if (a11yFound) {
+        const elapsed = Date.now() - startTime;
+        console.log(`[Enhancivity Replay] Found element after ${attempts} attempts (${elapsed}ms) using "${a11yFound.usedStrategy}"`);
+        elementFindTimings.push(elapsed);
+        return a11yFound;
+      }
+
       attempts++;
       // Poll faster initially, slower after 5s (element likely waiting for page load)
       const elapsed = Date.now() - startTime;
@@ -515,6 +673,12 @@
     );
     if (description) {
       console.warn('[Enhancivity Replay] Step description:', description);
+    }
+
+    const a11yFound = semanticContext?.a11y ? findElementByA11y(semanticContext.a11y) : null;
+    if (a11yFound) {
+      console.log('[Enhancivity Replay] Found element via accessibility fallback after deterministic failure.');
+      return a11yFound;
     }
 
     const semanticFound = await resolveViaSemanticFallback(description, semanticContext);
@@ -1612,7 +1776,8 @@
         sendResponse({ found: false });
         return false;
       }
-      const result = findElement(selectors, description, semanticContext);
+      const result = findElement(selectors, description, semanticContext)
+        || (semanticContext?.a11y ? findElementByA11y(semanticContext.a11y) : null);
       sendResponse({ found: !!result });
       return false; // Synchronous response
     }
