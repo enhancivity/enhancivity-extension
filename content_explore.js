@@ -19,6 +19,37 @@
   if (window.__enhExploreInjected) return;
   window.__enhExploreInjected = true;
 
+  const MAX_SESSION_ACTION_HISTORY = 20;
+  let sessionActionHistory = [];
+
+  function normalizeSessionActionHistoryEntry(entry = {}) {
+    return {
+      step: Number.isFinite(entry.step) ? entry.step : null,
+      action: entry.action || 'unknown',
+      target: entry.target || null,
+      result: entry.result || 'unknown',
+      error: entry.error || null,
+      pageUrl: entry.pageUrl || window.location.href,
+    };
+  }
+
+  function appendSessionActionHistory(entry) {
+    sessionActionHistory.push(normalizeSessionActionHistoryEntry(entry));
+    if (sessionActionHistory.length > MAX_SESSION_ACTION_HISTORY) {
+      sessionActionHistory = sessionActionHistory.slice(-MAX_SESSION_ACTION_HISTORY);
+    }
+    return sessionActionHistory.slice();
+  }
+
+  function resetSessionActionHistory() {
+    sessionActionHistory = [];
+    return [];
+  }
+
+  function readSessionActionHistory() {
+    return sessionActionHistory.slice();
+  }
+
   // ── Safety Guards ───────────────────────────────────────────
 
   const SENSITIVE_SELECTORS = [
@@ -3186,6 +3217,23 @@
     if (actionType === 'session_context') {
       const result = SessionContextValidator.detectActiveAccount();
       sendResponse({ success: true, ...result });
+      return true;
+    }
+
+    if (actionType === 'history_reset') {
+      resetSessionActionHistory();
+      sendResponse({ success: true, count: 0 });
+      return true;
+    }
+
+    if (actionType === 'history_get') {
+      sendResponse({ success: true, entries: readSessionActionHistory() });
+      return true;
+    }
+
+    if (actionType === 'history_append') {
+      const entries = appendSessionActionHistory(request.entry || {});
+      sendResponse({ success: true, count: entries.length });
       return true;
     }
 

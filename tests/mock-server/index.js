@@ -236,6 +236,41 @@ app.post('/api/agent/explore-step', (req, res) => {
   }
 
   // ── Default explore-step behavior ──
+  if (activeScenario === 'action-history') {
+    dataTransferStep++;
+    const semanticElements = req.body.currentPageState?.semanticElements || [];
+    const findSid = (needle) => {
+      const lowerNeedle = needle.toLowerCase();
+      const match = semanticElements.find((element) => {
+        const text = String(element?.text || '').toLowerCase();
+        const ariaLabel = String(element?.aria?.label || element?.attrs?.ariaLabel || '').toLowerCase();
+        return text.includes(lowerNeedle) || ariaLabel.includes(lowerNeedle);
+      });
+      return match?.sid || null;
+    };
+
+    const usageSid = findSid('usage');
+    const billingSid = findSid('billing');
+    const generalSid = findSid('general');
+    const steps = [
+      { nextAction: { type: 'click_element', target: usageSid, description: 'Open the usage tab' }, reasoning: 'First, inspect usage settings.' },
+      { nextAction: { type: 'click_element', target: billingSid, description: 'Open the billing tab' }, reasoning: 'Next, inspect billing settings.' },
+      { nextAction: { type: 'click_element', target: generalSid, description: 'Return to the general tab' }, reasoning: 'Finally, return to the general tab.' },
+      { isGoalComplete: true, goalResult: 'Exploration completed after reviewing all three settings tabs.', nextAction: null },
+    ];
+    const step = steps[Math.min(dataTransferStep - 1, steps.length - 1)];
+    return res.json({
+      nextAction: step.nextAction || null,
+      reasoning: step.reasoning || 'Completing task.',
+      revisedStrategy: null,
+      isGoalComplete: step.isGoalComplete || false,
+      goalResult: step.goalResult || null,
+      extractedData: null,
+      needsConsent: false,
+      consentReason: null,
+    });
+  }
+
   exploreStepCounter++;
 
   if (exploreStepCounter >= 5) {

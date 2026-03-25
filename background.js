@@ -1971,7 +1971,7 @@ async function runParallelExplore(parallelPlan, userPrompt, token) {
         for (let microStep = 0; microStep < 4 && currentAction; microStep++) {
           console.log(`[ParallelExplore] "${state.label}" micro-step ${microStep}: ${currentAction.type} ${currentAction.target || ''}`);
 
-          const actionResult = await executeExploreAction(state.tabId, currentAction, token);
+          const actionResult = await executeExploreActionWithHistory(state.tabId, currentAction, token, microStep + 1);
           actionsExecuted++;
 
           if (!actionResult.success) {
@@ -2571,6 +2571,103 @@ let explorationAborted = false;
 // chain must abort (ghost-chain prevention).
 let currentRequestGeneration = 0;
 
+const SESSION_ACTION_HISTORY_KEY = 'sessionActionHistory';
+const MAX_SESSION_ACTION_HISTORY = 20;
+let sessionActionHistory = [];
+
+function normalizeSessionActionHistoryEntry(entry = {}) {
+  return {
+    step: Number.isFinite(entry.step) ? entry.step : null,
+    action: entry.action || 'unknown',
+    target: entry.target || null,
+    result: entry.result || 'unknown',
+    error: entry.error || null,
+    pageUrl: entry.pageUrl || null,
+  };
+}
+
+async function syncSessionActionHistoryStorage() {
+  try {
+    await chrome.storage.session.set({
+      [SESSION_ACTION_HISTORY_KEY]: sessionActionHistory.slice(),
+    });
+  } catch (err) {
+    console.warn('[Explore] Could not sync session action history:', err.message);
+  }
+}
+
+async function mirrorSessionActionHistoryToTab(tabId, mode, entry = null) {
+  if (!tabId) return;
+  try {
+    await safeSendMessage(tabId, {
+      type: 'explore_action',
+      actionType: mode === 'reset' ? 'history_reset' : 'history_append',
+      entry,
+    }, 'content_explore.js');
+  } catch (err) {
+    console.warn(`[Explore] Could not ${mode} content action history on tab ${tabId}:`, err.message);
+  }
+}
+
+async function resetSessionActionHistory(tabId = null) {
+  sessionActionHistory = [];
+  await syncSessionActionHistoryStorage();
+  if (tabId) {
+    await mirrorSessionActionHistoryToTab(tabId, 'reset');
+  }
+}
+
+async function appendSessionActionHistory(entry, tabId = null) {
+  const normalized = normalizeSessionActionHistoryEntry(entry);
+  sessionActionHistory.push(normalized);
+  if (sessionActionHistory.length > MAX_SESSION_ACTION_HISTORY) {
+    sessionActionHistory = sessionActionHistory.slice(-MAX_SESSION_ACTION_HISTORY);
+  }
+  await syncSessionActionHistoryStorage();
+  if (tabId) {
+    await mirrorSessionActionHistoryToTab(tabId, 'append', normalized);
+  }
+  return normalized;
+}
+
+async function resolveSessionActionHistoryUrl(tabId, actionResult) {
+  if (actionResult?.newUrl) return actionResult.newUrl;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    return tab?.url || null;
+  } catch {
+    return null;
+  }
+}
+
+function getRecentSessionActionHistory(limit = 5) {
+  if (!limit || limit < 1) return [];
+  return sessionActionHistory.slice(-limit);
+}
+
+function shouldTrackSessionActionHistory(action) {
+  const skippedActionTypes = new Set(['take_snapshot', 'dom_fingerprint', 'auth_check', 'session_context']);
+  return !!action?.type && !skippedActionTypes.has(action.type);
+}
+
+async function executeExploreActionWithHistory(tabId, action, token, step = null) {
+  const actionResult = await executeExploreAction(tabId, action, token);
+  if (!shouldTrackSessionActionHistory(action)) {
+    return actionResult;
+  }
+  const historyTabId = actionResult?.newTabId || tabId;
+  const pageUrl = await resolveSessionActionHistoryUrl(historyTabId, actionResult);
+  await appendSessionActionHistory({
+    step,
+    action: action?.type || 'unknown',
+    target: action?.target || null,
+    result: actionResult?.success ? 'success' : 'failure',
+    error: actionResult?.success ? null : (actionResult?.error || null),
+    pageUrl,
+  }, historyTabId);
+  return actionResult;
+}
+
 // Helper: mark exploration as finished and store result for panel recovery
 async function finishExploration(result) {
   // Only reset abort flag if the user did NOT cancel. If they cancelled,
@@ -2980,7 +3077,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
       await hudUpdate(currentTabId, 'explore-0', 'processing', startAction.description);
       await updateExplorationProgress(0, maxSteps, startAction.description, 'running');
 
-      const startResult = await executeExploreAction(currentTabId, startAction, token);
+      const startResult = await executeExploreActionWithHistory(currentTabId, startAction, token, null);
       stepLog.push({
         step: 0,
         action: startAction,
@@ -4040,7 +4137,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
       // ── LAYER 2: Capture pre-action snapshot for heuristic completion detection ──
       const preActionSnapshot = { url: snapshot.url, mainContent: snapshot.mainContent };
 
-      const actionResult = await executeExploreAction(currentTabId, decision.nextAction, token);
+      const actionResult = await executeExploreActionWithHistory(currentTabId, decision.nextAction, token, step);
 
       // ── TAB SWIPE: Update currentTabId if navigate opened/switched to a different tab ──
       if (actionResult.newTabId && actionResult.newTabId !== currentTabId) {
@@ -7015,6 +7112,8 @@ async function handleMessage(request, sender) {
       return { success: false, error: 'Could not determine which tab to explore.' };
     }
 
+    await resetSessionActionHistory(tabId);
+
     // Clear stale result before starting
     await chrome.storage.session.remove(['explorationResult']).catch(() => {});
 
@@ -7062,6 +7161,8 @@ async function handleMessage(request, sender) {
     if (!parallelPlan || !parallelPlan.tabs || parallelPlan.tabs.length < 2) {
       return { success: false, error: 'Invalid parallel plan: need at least 2 tabs.' };
     }
+
+    await resetSessionActionHistory();
 
     // Clear stale result before starting
     await chrome.storage.session.remove(['parallelExploreResult']).catch(() => {});
