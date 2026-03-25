@@ -94,6 +94,28 @@ async function runReplayOnActiveTab(sw, recipe, variables = {}) {
   }, { recipe, variables });
 }
 
+async function takeExploreSnapshotOnActiveTab(sw) {
+  return sw.evaluate(async () => {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) {
+      return { success: false, error: 'No active tab found' };
+    }
+
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files: ['content_explore.js'],
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 300));
+    return new Promise((resolve) => {
+      chrome.tabs.sendMessage(tab.id, {
+        type: 'explore_action',
+        actionType: 'take_snapshot',
+      }, (resp) => resolve(resp || { success: false, error: chrome.runtime.lastError?.message }));
+    });
+  });
+}
+
 test.describe('Agent Accessibility', () => {
   test('recording captures DOM-derived accessibility metadata in recipe steps', async ({ context }) => {
     const sw = await getServiceWorker(context);
@@ -176,6 +198,29 @@ test.describe('Agent Accessibility', () => {
     expect(result.success).toBe(true);
     expect(result.results?.[0]?.usedStrategy).toBe('a11y-exact');
     await expect(page.locator('#status')).toHaveText('clicked-home');
+
+    await page.close();
+  });
+
+  test('explore snapshots include aria role and label metadata', async ({ context }) => {
+    const sw = await getServiceWorker(context);
+
+    const page = await context.newPage();
+    await page.goto('http://localhost:3099/harness/a11y-form.html');
+    await page.waitForLoadState('domcontentloaded');
+    await page.bringToFront();
+
+    const result = await takeExploreSnapshotOnActiveTab(sw);
+
+    expect(result?.success).toBe(true);
+    const snapshot = result.snapshot;
+    expect(snapshot).toBeTruthy();
+
+    const composeElement = snapshot.semanticElements.find(element =>
+      element?.aria?.role === 'button' && element?.aria?.label === 'Compose'
+    );
+
+    expect(composeElement).toBeTruthy();
 
     await page.close();
   });

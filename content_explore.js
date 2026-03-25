@@ -2536,6 +2536,52 @@
       // Scans siblings, parent's children, and aria-describedby targets for patterns
       // like "0/300", "245 / 280", "3000 characters remaining", "Max 100 characters".
       // Works universally across Reddit, Twitter, LinkedIn, Facebook, etc.
+      function getImplicitAriaRole(node) {
+        const tag = node.tagName?.toLowerCase();
+        const type = (node.getAttribute('type') || '').toLowerCase();
+
+        if (tag === 'button') return 'button';
+        if (tag === 'a' && node.hasAttribute('href')) return 'link';
+        if (tag === 'select') return 'combobox';
+        if (tag === 'textarea') return 'textbox';
+        if (tag === 'summary') return 'button';
+        if (tag === 'dialog') return 'dialog';
+
+        if (tag === 'input') {
+          if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
+          if (type === 'checkbox') return 'checkbox';
+          if (type === 'radio') return 'radio';
+          return 'textbox';
+        }
+
+        return '';
+      }
+
+      function resolveAriaReferenceText(idRefs) {
+        if (!idRefs) return '';
+
+        return idRefs
+          .split(/\s+/)
+          .map(id => document.getElementById(id))
+          .filter(Boolean)
+          .map(node => (node.innerText || node.textContent || '').trim())
+          .filter(Boolean)
+          .join(' ')
+          .slice(0, 120)
+          .trim();
+      }
+
+      function getSnapshotAriaLabel(node, text) {
+        return (
+          node.getAttribute('aria-label') ||
+          resolveAriaReferenceText(node.getAttribute('aria-labelledby')) ||
+          node.getAttribute('title') ||
+          node.getAttribute('placeholder') ||
+          text ||
+          ''
+        ).slice(0, 120).trim();
+      }
+
       function findNearbyCharLimit(inputNode) {
         // Pattern 1: "X/Y" or "X / Y" where Y is the max (Reddit "0/300", Twitter style)
         const counterRegex = /(\d{1,5})\s*\/\s*(\d{1,5})/;
@@ -2600,6 +2646,8 @@
         try { node.setAttribute('data-enh-sid', sid); } catch {}
 
         const attrs = {};
+        const ariaRole = node.getAttribute('role') || getImplicitAriaRole(node);
+        const ariaLabel = getSnapshotAriaLabel(node, text);
         if (node.href) attrs.href = node.href.slice(0, 200);
         if (node.name) attrs.name = node.name;
         if (node.type) attrs.type = node.type;
@@ -2782,6 +2830,10 @@
 
         return {
           sid, type, text: finalText, attrs,
+          aria: {
+            role: ariaRole || null,
+            label: ariaLabel || null,
+          },
           context: parentText,
           inModal: isModal,
           section: sectionHeading,        // nearest heading above this element
