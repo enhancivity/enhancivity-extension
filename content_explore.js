@@ -2421,10 +2421,13 @@
       // ── Modal/Dialog Detection ─────────────────────────────────
       // Find open modals/dialogs and prioritize their contents
       function findOpenModals() {
-        const modalSelectors = [
+        const ariaModalSelectors = [
+          '[aria-modal="true"]',
           '[role="dialog"]',
           '[role="alertdialog"]',
-          '[aria-modal="true"]',
+        ];
+
+        const modalSelectors = [
           '[role="menu"]',
           '[role="listbox"]',
           '[role="tooltip"][aria-expanded="true"]',
@@ -2456,17 +2459,28 @@
 
         const modals = [];
         const seen = new Set();
+        function maybeAddModal(el) {
+          if (!el || seen.has(el)) return;
+          const rect = el.getBoundingClientRect();
+          // Dropdown menus can be narrow — use smaller thresholds
+          if (rect.width < 40 || rect.height < 30) return;
+          if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') return;
+          seen.add(el);
+          modals.push(el);
+        }
+
+        for (const sel of ariaModalSelectors) {
+          try {
+            for (const el of document.querySelectorAll(sel)) {
+              maybeAddModal(el);
+            }
+          } catch {}
+        }
+
         for (const sel of modalSelectors) {
           try {
             for (const el of document.querySelectorAll(sel)) {
-              // Skip if already found, hidden, or too small to be a real modal
-              if (seen.has(el)) continue;
-              const rect = el.getBoundingClientRect();
-              // Dropdown menus can be narrow — use smaller thresholds
-              if (rect.width < 40 || rect.height < 30) continue;
-              if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') continue;
-              seen.add(el);
-              modals.push(el);
+              maybeAddModal(el);
             }
           } catch {}
         }

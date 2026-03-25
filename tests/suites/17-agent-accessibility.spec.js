@@ -224,4 +224,20 @@ test.describe('Agent Accessibility', () => {
 
     await page.close();
   });
+
+  test('explore detects open modals via aria attributes', async ({ context }) => {
+    const sw = await getServiceWorker(context, 60_000);
+
+    const page = await context.newPage();
+    await page.goto('http://localhost:3099/harness/modal-aria.html');
+    await page.waitForLoadState('domcontentloaded');
+    await page.bringToFront();
+
+    const result = await takeExploreSnapshotOnActiveTab(sw);
+
+    expect(result?.success).toBe(true);
+    expect(result?.snapshot?.hasOpenModal).toBe(true);
+
+    await page.close();
+  });
 });
