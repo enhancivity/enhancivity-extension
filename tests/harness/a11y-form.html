@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Accessibility Harness</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 720px;
+      margin: 40px auto;
+      padding: 24px;
+      background: #f5f7fb;
+      color: #1f2937;
+    }
+
+    h1 {
+      margin-bottom: 24px;
+    }
+
+    .card {
+      padding: 20px;
+      border-radius: 12px;
+      background: #ffffff;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+    }
+
+    .icon-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 48px;
+      height: 48px;
+      border: none;
+      border-radius: 999px;
+      background: #2563eb;
+      color: #ffffff;
+      cursor: pointer;
+      font-size: 24px;
+    }
+
+    #composer-panel[hidden] {
+      display: none;
+    }
+
+    #composer-panel {
+      margin-top: 16px;
+      padding: 12px;
+      border-radius: 8px;
+      background: #dbeafe;
+    }
+  </style>
+</head>
+<body>
+  <h1>Accessibility Harness</h1>
+
+  <div class="card">
+    <p id="compose-help">Open the composer panel</p>
+    <button
+      id="compose-button"
+      class="icon-button"
+      type="button"
+      aria-label="Compose"
+      aria-describedby="compose-help"
+      aria-expanded="false"
+    >
+      <span aria-hidden="true">+</span>
+    </button>
+
+    <div id="composer-panel" hidden>
+      Composer panel is open.
+    </div>
+  </div>
+
+  <script>
+    const button = document.getElementById('compose-button');
+    const panel = document.getElementById('composer-panel');
+
+    button.addEventListener('click', () => {
+      const expanded = button.getAttribute('aria-expanded') === 'true';
+      const nextExpanded = !expanded;
+      button.setAttribute('aria-expanded', String(nextExpanded));
+      panel.hidden = !nextExpanded;
+    });
+  </script>
+</body>
+</html>

@@ -311,6 +311,86 @@
     };
   }
 
+  function resolveIdReferenceText(idRefs) {
+    if (!idRefs) return '';
+
+    const texts = idRefs
+      .split(/\s+/)
+      .map(id => document.getElementById(id))
+      .filter(Boolean)
+      .map(node => sanitizeLabelText(node.innerText || node.textContent || ''))
+      .filter(Boolean);
+
+    return texts.join(' ').slice(0, 240).trim();
+  }
+
+  function getImplicitRole(el) {
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+
+    if (tag === 'button') return 'button';
+    if (tag === 'a' && el.hasAttribute('href')) return 'link';
+    if (tag === 'select') return 'combobox';
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'summary') return 'button';
+    if (tag === 'dialog') return 'dialog';
+    if (tag === 'option') return 'option';
+
+    if (tag === 'input') {
+      if (['button', 'submit', 'reset', 'image'].includes(type)) return 'button';
+      if (type === 'checkbox') return 'checkbox';
+      if (type === 'radio') return 'radio';
+      if (type === 'range') return 'slider';
+      if (type === 'number') return 'spinbutton';
+      return 'textbox';
+    }
+
+    return '';
+  }
+
+  function readAriaBooleanState(el, attributeName) {
+    const value = el.getAttribute(attributeName);
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return undefined;
+  }
+
+  function captureA11yAttributes(element) {
+    if (!element) return {};
+
+    const role = element.getAttribute('role') || getImplicitRole(element);
+    const ariaLabel = sanitizeLabelText(element.getAttribute('aria-label') || '');
+    const labelledByText = resolveIdReferenceText(element.getAttribute('aria-labelledby'));
+    const describedByText = resolveIdReferenceText(element.getAttribute('aria-describedby'));
+    const checkedState =
+      typeof element.checked === 'boolean'
+        ? element.checked
+        : readAriaBooleanState(element, 'aria-checked');
+
+    return {
+      name: ariaLabel || labelledByText || describeElement(element) || undefined,
+      role: role || undefined,
+      ariaLabel: ariaLabel || undefined,
+      ariaLabelledBy: labelledByText || undefined,
+      ariaDescribedBy: describedByText || undefined,
+      states: {
+        disabled: !!element.disabled || readAriaBooleanState(element, 'aria-disabled') === true,
+        expanded: readAriaBooleanState(element, 'aria-expanded'),
+        pressed: readAriaBooleanState(element, 'aria-pressed'),
+        selected: readAriaBooleanState(element, 'aria-selected'),
+        checked: checkedState,
+        modal: readAriaBooleanState(element, 'aria-modal') === true,
+      },
+    };
+  }
+
+  function buildSemanticContextWithA11y(el) {
+    return {
+      ...buildSemanticContext(el),
+      a11y: captureA11yAttributes(el),
+    };
+  }
+
   function generateDescription(action, el) {
     const label = describeElement(el);
     switch (action) {
@@ -438,7 +518,7 @@
         type: 'click',
         selectors,
         description: generateDescription('click', el),
-        semanticContext: buildSemanticContext(el),
+        semanticContext: buildSemanticContextWithA11y(el),
       },
       url: window.location.href,
       timestamp: now,
@@ -496,7 +576,7 @@
         selectors,
         inputType: nextInputIsVariable ? 'variable' : 'fixed',
         description: generateDescription('type', el),
-        semanticContext: buildSemanticContext(el),
+        semanticContext: buildSemanticContextWithA11y(el),
       },
       url: window.location.href,
       timestamp: now,
