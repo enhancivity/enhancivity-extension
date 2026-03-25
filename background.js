@@ -3479,6 +3479,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         console.log(`[Explore] Step ${step}: calling ${exploreStepUrl}`);
         console.log(`[Explore] Step ${step}: snapshot url=${snapshot.url}, elements=${snapshot.semanticElements?.length || 0}, content=${(snapshot.mainContent || '').length} chars`);
         const exploreByokConfig = await getByokConfig();
+        const recentActionHistory = getRecentSessionActionHistory(5);
         const stepPayload = {
           goal,
           strategy: currentStrategy,
@@ -3490,6 +3491,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           originalPrompt: originalPrompt || undefined,
           dataBuffer: dataBuffer || undefined,
           failedActions: failedActions.length > 0 ? failedActions : undefined,
+          recentActionHistory: recentActionHistory.length > 0 ? recentActionHistory : undefined,
           completionHint: stepLog._completionHint || undefined,
           ...byokPayload(exploreByokConfig),
         };
