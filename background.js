@@ -4228,6 +4228,16 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         continue; // loop back → takePageSnapshot() runs at top → fresh SIDs → new AI decision
       }
 
+      // ── PRE-SWITCH CAPTURE: Save current page content before navigating away ──
+      // Safety net: if the AI issues a navigate action without setting extractedData,
+      // and dataBuffer is empty, auto-capture the current page mainContent.
+      // Prevents data loss for deictic prompts ("this email", "this page") where the
+      // AI navigates to the target app before extracting the referenced content.
+      if (decision.nextAction?.type === 'navigate' && !dataBuffer && snapshot?.mainContent?.trim()) {
+        dataBuffer = `[Pre-switch capture from: ${snapshot.url || 'current page'}]\n${snapshot.mainContent}`.slice(0, DATA_BUFFER_MAX);
+        console.log(`[Explore] Step ${step}: Pre-switch capture — ${dataBuffer.length} chars from ${snapshot.url || 'current page'}`);
+      }
+
       const actionDesc = decision.nextAction.description || decision.nextAction.type || 'Action';
       await hudUpdate(currentTabId, `explore-${step}`, 'processing', actionDesc);
       await updateExplorationProgress(step, maxSteps, actionDesc, 'running');
