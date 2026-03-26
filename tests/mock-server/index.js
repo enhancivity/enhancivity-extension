@@ -33,6 +33,10 @@ let exploreStepCounter = 0;
 let activeScenario = 'default';
 let dataTransferStep = 0;
 
+// ── SPA-stale scenario support ────────────────────────────────
+let spaStaleStep = 0;
+let spaStaleReady = false; // set true when explore-step is in-flight → signals harness page to pushState
+
 const SUBSCRIPTION_TSV = 'Service\tPlan\tAmount\tNext Billing\nSpotify\tPremium\t$9.99\tApr 15\nNetflix\tStandard\t$15.49\tApr 20\nGitHub\tPro\t$4.00\tApr 1\nClaude\tMax\t$100.00\tApr 10';
 const SUBSCRIPTION_TSV_BATCH2 = 'AWS\tBusiness\t$29.99\tApr 5';
 const SPREADSHEET_URL = 'http://localhost:3099/harness/spreadsheet.html';
@@ -58,7 +62,14 @@ app.post('/test/reset', (req, res) => {
   exploreStepCounter = 0;
   activeScenario = 'default';
   dataTransferStep = 0;
+  spaStaleStep = 0;
+  spaStaleReady = false;
   res.json({ success: true });
+});
+
+// ── SPA-stale coordination: harness page polls this until ready to pushState ──
+app.get('/test/spa-stale-ready', (req, res) => {
+  res.json({ ready: spaStaleReady });
 });
 
 // Error mode middleware — BEFORE all route handlers
@@ -268,6 +279,41 @@ app.post('/api/agent/explore-step', (req, res) => {
       extractedData: null,
       needsConsent: false,
       consentReason: null,
+    });
+  }
+
+  // ── SPA-stale scenario ──────────────────────────────────────
+  // Step 1: signal the harness page to do pushState, then after 300ms respond
+  //         with "click butt-0" (targeting a Phase-A SID). The 300ms gap ensures
+  //         the page's pushState fires — and sidsStale=true is set in background.js —
+  //         before the response arrives, so the SPA_STALE_GUARD triggers.
+  // Step 2+: return goal complete (agent recovered after re-snapshot).
+  if (activeScenario === 'spa-stale') {
+    spaStaleStep++;
+    if (spaStaleStep === 1) {
+      spaStaleReady = true; // harness page is polling this — it will pushState immediately
+      return setTimeout(() => {
+        res.json({
+          nextAction: { type: 'click_element', target: 'butt-0', description: 'Click DELETE ALL DATA' },
+          reasoning: 'Targeting the primary action button on the page.',
+          isGoalComplete: false,
+          goalResult: null,
+          revisedStrategy: null,
+          needsConsent: false,
+          consentReason: null,
+          extractedData: null,
+        });
+      }, 300);
+    }
+    return res.json({
+      nextAction: null,
+      isGoalComplete: true,
+      goalResult: 'Goal achieved after re-snapshot following SPA navigation.',
+      reasoning: 'Fresh snapshot confirmed goal completion.',
+      revisedStrategy: null,
+      needsConsent: false,
+      consentReason: null,
+      extractedData: null,
     });
   }
 

@@ -12,7 +12,7 @@ console.log('[BG] ===== BACKGROUND v4.2 (variable-by-default) LOADED =====');
 // ============================================================
 
 // Toggle for deployment: 'https://service.enhancivity.com' for production, 'http://localhost:3001' for local dev
-const API_BASE = 'https://service.enhancivity.com';
+const API_BASE = 'http://localhost:3001';
 const MEMORY_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // Allow content scripts to access chrome.storage.session (required for conversation persistence + exploration recovery)
@@ -3013,11 +3013,19 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
   // Reddit, Gmail, YouTube, Amazon, etc. change URLs via History API without a
   // full page load — onCompleted never fires, so the content script goes stale.
   // This listener catches those soft navigations and re-injects immediately.
+
+  // ── SPA Staleness Flag ───────────────────────────────────────
+  // Set to true whenever onHistoryStateUpdated fires mid-step.
+  // The main loop checks this just before executing any SID-targeted action.
+  // Cleared immediately after the guard acts on it.
+  let sidsStale = false;
+
   const spaNavListener = (details) => {
     if (details.tabId !== currentTabId || details.frameId !== 0) return;
     console.log('[Explore] SPA navigation (onHistoryStateUpdated) — re-injecting DOM scripts on', details.url);
     injectAndConfirm(currentTabId, 'content_explore.js').catch(() => {});
     chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: [HUD_SCRIPT] }).catch(() => {});
+    sidsStale = true;
   };
   chrome.webNavigation.onHistoryStateUpdated.addListener(spaNavListener);
 
@@ -4132,6 +4140,26 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         }
       }
 
+      // ── SPA STALENESS GUARD ──────────────────────────────────────
+      // If onHistoryStateUpdated fired since the snapshot was taken, the DOM
+      // has re-rendered and all element SIDs are new numbers. The existing
+      // stale SID guard above only checks the OLD snapshot — it cannot catch
+      // this race. Discard the stale decision and loop back for a fresh snapshot.
+      // navigate/scrape_page/scroll/wait/press_key are exempt — they don't use SIDs.
+      if (sidsStale &&
+          decision.nextAction &&
+          !['navigate', 'scrape_page', 'scroll', 'wait', 'press_key'].includes(decision.nextAction.type)) {
+        console.warn(`[Explore] Step ${step}: SPA_STALE_GUARD — discarding stale ${decision.nextAction.type}(${decision.nextAction.target}). Retaking snapshot.`);
+        sidsStale = false;
+        stepLog.push({
+          step,
+          action: { type: 'spa_stale_guard', description: `SPA re-render: discarded stale ${decision.nextAction.type} on ${decision.nextAction.target}` },
+          result: { success: false, failureReason: 'SPA_STALE' },
+          observation: 'SPA navigation fired between snapshot and action. Element IDs were regenerated. Re-scanning page.',
+        });
+        continue; // loop back → takePageSnapshot() runs at top → fresh SIDs → new AI decision
+      }
+
       const actionDesc = decision.nextAction.description || decision.nextAction.type || 'Action';
       await hudUpdate(currentTabId, `explore-${step}`, 'processing', actionDesc);
       await updateExplorationProgress(step, maxSteps, actionDesc, 'running');
@@ -4164,6 +4192,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           console.log('[Explore] SPA navigation (onHistoryStateUpdated) — re-injecting DOM scripts on', details.url);
           injectAndConfirm(currentTabId, 'content_explore.js').catch(() => {});
           chrome.scripting.executeScript({ target: { tabId: currentTabId }, files: [HUD_SCRIPT] }).catch(() => {});
+          sidsStale = true;
         };
         chrome.webNavigation.onCompleted.addListener(newNavListener);
         chrome.webNavigation.onHistoryStateUpdated.addListener(newSpaNavListener);
