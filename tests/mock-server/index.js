@@ -37,6 +37,10 @@ let dataTransferStep = 0;
 let spaStaleStep = 0;
 let spaStaleReady = false; // set true when explore-step is in-flight → signals harness page to pushState
 
+// ── DOM-verify scenario support ───────────────────────────────
+let domVerifyStep = 0;
+let domVerifyStep2Content = null; // mainContent seen by the AI at step 2 (after the click)
+
 const SUBSCRIPTION_TSV = 'Service\tPlan\tAmount\tNext Billing\nSpotify\tPremium\t$9.99\tApr 15\nNetflix\tStandard\t$15.49\tApr 20\nGitHub\tPro\t$4.00\tApr 1\nClaude\tMax\t$100.00\tApr 10';
 const SUBSCRIPTION_TSV_BATCH2 = 'AWS\tBusiness\t$29.99\tApr 5';
 const SPREADSHEET_URL = 'http://localhost:3099/harness/spreadsheet.html';
@@ -64,12 +68,19 @@ app.post('/test/reset', (req, res) => {
   dataTransferStep = 0;
   spaStaleStep = 0;
   spaStaleReady = false;
+  domVerifyStep = 0;
+  domVerifyStep2Content = null;
   res.json({ success: true });
 });
 
 // ── SPA-stale coordination: harness page polls this until ready to pushState ──
 app.get('/test/spa-stale-ready', (req, res) => {
   res.json({ ready: spaStaleReady });
+});
+
+// ── DOM-verify: expose the mainContent the AI saw at step 2 (after the click) ──
+app.get('/test/dom-verify-step2-snapshot', (req, res) => {
+  res.json({ content: domVerifyStep2Content });
 });
 
 // Error mode middleware — BEFORE all route handlers
@@ -246,6 +257,67 @@ app.post('/api/agent/explore-step', (req, res) => {
     });
   }
 
+  // ── needs-consent scenario: step 2 requires One-Inch Rule approval ──
+  // Tests that the exploration loop resumes after user clicks "Approve & Execute".
+  // BUG 1: hudConsent() used sendMessage — SW suspension dropped the Promise.
+  // FIX: Route consent through chrome.storage.session (storage.onChanged wakes SW).
+  if (activeScenario === 'needs-consent') {
+    dataTransferStep++;
+    const steps = [
+      // Step 1: Scrape current page (no consent needed)
+      { nextAction: { type: 'scrape_page', description: 'Read current page' }, reasoning: 'Initial observation.' },
+      // Step 2: Require One-Inch Rule consent before modifying spreadsheet
+      {
+        needsConsent: true, consentReason: 'Adding database headers to spreadsheet',
+        nextAction: { type: 'type_text', target: 'inp-0', value: 'Subject', description: 'Type Subject header' },
+        reasoning: 'Consent required before modifying the spreadsheet.',
+      },
+      // Step 3: Post-approval — loop resumes here (proves BUG 1 is fixed)
+      { nextAction: { type: 'type_text', target: 'inp-1', value: 'Sender', description: 'Type Sender header' }, reasoning: 'Adding second column header.' },
+      // Step 4: Goal complete
+      { isGoalComplete: true, goalResult: 'Database headers added successfully', nextAction: null },
+    ];
+    const step = steps[Math.min(dataTransferStep - 1, steps.length - 1)];
+    return res.json({
+      nextAction: step.nextAction || null,
+      reasoning: step.reasoning || 'Completing task.',
+      revisedStrategy: null,
+      isGoalComplete: step.isGoalComplete || false,
+      goalResult: step.goalResult || null,
+      extractedData: null,
+      needsConsent: step.needsConsent || false,
+      consentReason: step.consentReason || null,
+    });
+  }
+
+  // ── pre-switch-no-extract scenario: AI omits extractedData before navigate ──
+  // Tests the pre-switch capture safety net in background.js.
+  // BUG 2: If AI navigates away without setting extractedData, dataBuffer stays
+  // empty and paste_tsv has nothing to paste. FIX: background.js auto-captures
+  // mainContent before any navigate when dataBuffer is empty.
+  if (activeScenario === 'pre-switch-no-extract') {
+    dataTransferStep++;
+    const steps = [
+      // Step 1: Navigate WITHOUT setting extractedData (simulates AI forgetting Rule 8)
+      { nextAction: { type: 'navigate', target: SPREADSHEET_URL, description: 'Navigate to spreadsheet' }, reasoning: 'Opening spreadsheet (omitting pre-navigation capture).' },
+      // Step 2: Paste from scratchpad — should work via pre-switch capture safety net
+      { nextAction: { type: 'paste_tsv', value: '__USE_SCRATCHPAD__', description: 'Paste captured source data' }, reasoning: 'Pasting pre-captured data from scratchpad.' },
+      // Step 3: Goal complete
+      { isGoalComplete: true, goalResult: 'Data pasted to spreadsheet.', nextAction: null },
+    ];
+    const step = steps[Math.min(dataTransferStep - 1, steps.length - 1)];
+    return res.json({
+      nextAction: step.nextAction || null,
+      reasoning: step.reasoning || 'Completing task.',
+      revisedStrategy: null,
+      isGoalComplete: step.isGoalComplete || false,
+      goalResult: step.goalResult || null,
+      extractedData: null,  // INTENTIONALLY absent — tests the safety net
+      needsConsent: false,
+      consentReason: null,
+    });
+  }
+
   // ── Default explore-step behavior ──
   if (activeScenario === 'action-history') {
     dataTransferStep++;
@@ -287,6 +359,39 @@ app.post('/api/agent/explore-step', (req, res) => {
   //         with "click butt-0" (targeting a Phase-A SID). The 300ms gap ensures
   //         the page's pushState fires — and sidsStale=true is set in background.js —
   //         before the response arrives, so the SPA_STALE_GUARD triggers.
+  // ── DOM-verify scenario ──────────────────────────────────────────────────────
+  // Step 1: Agent sees the page. Tell it to click butt-0 (the "Load Content" button).
+  // Step 2: Agent sends the snapshot taken AFTER the click. Record mainContent so the
+  //         test can assert it contains "FINAL CONTENT LOADED" (proving waitForDomChange
+  //         waited for the 1500ms content load before snapshotting). Return goal complete.
+  if (activeScenario === 'dom-verify') {
+    domVerifyStep++;
+    if (domVerifyStep === 1) {
+      return res.json({
+        nextAction: { type: 'click_element', target: 'butt-0', description: 'Click the Load Content button' },
+        reasoning: 'Clicking the primary button to load content.',
+        isGoalComplete: false,
+        goalResult: null,
+        revisedStrategy: null,
+        needsConsent: false,
+        consentReason: null,
+        extractedData: null,
+      });
+    }
+    // Step 2+: capture what the agent saw and finish.
+    domVerifyStep2Content = req.body.currentPageState?.mainContent || '';
+    return res.json({
+      nextAction: null,
+      isGoalComplete: true,
+      goalResult: 'Content loaded successfully.',
+      reasoning: 'Page shows loaded content — goal complete.',
+      revisedStrategy: null,
+      needsConsent: false,
+      consentReason: null,
+      extractedData: null,
+    });
+  }
+
   // Step 2+: return goal complete (agent recovered after re-snapshot).
   if (activeScenario === 'spa-stale') {
     spaStaleStep++;
