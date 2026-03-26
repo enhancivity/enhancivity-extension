@@ -1058,11 +1058,49 @@ async function hudTrust(tabId, trustBadge, trustScore, siteName) {
 }
 
 async function hudConsent(tabId, message, targetSelector) {
-  return chrome.tabs.sendMessage(tabId, {
-    type: 'hud_consent',
-    message,
-    targetSelector,
-  }).catch(() => ({ approved: false, reason: 'hud_not_available' }));
+  // Route consent through chrome.storage.session instead of chrome.tabs.sendMessage.
+  // Reason: the exploration loop awaits this function while the user decides. Chrome
+  // MV3 suspends service workers during inactivity — a sendMessage-based Promise is
+  // dropped silently when the SW is suspended, so the loop never resumes after the
+  // user clicks "Approve". chrome.storage.onChanged WAKES a suspended SW, making
+  // the consent handshake lifecycle-safe regardless of how long the user takes.
+  const requestId = `consent_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const resultKey = `hudConsentResult_${requestId}`;
+
+  // 1. Write pending request — content script reads this to show the overlay
+  await chrome.storage.session.set({
+    hudConsentPending: { tabId, message, targetSelector, requestId, ts: Date.now() },
+  }).catch(() => {});
+
+  // 2. Notify the content script (fire-and-forget — no response needed)
+  chrome.tabs.sendMessage(tabId, { type: 'hud_consent', message, targetSelector, requestId }).catch(() => {});
+
+  // 3. Wait for the result via storage.onChanged — wakes the SW even if suspended
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve({ approved: false, reason: 'timeout' });
+    }, 120000); // 2-minute safety timeout
+
+    function cleanup() {
+      clearTimeout(timer);
+      chrome.storage.onChanged.removeListener(listener);
+      chrome.storage.session.remove(['hudConsentPending', resultKey]).catch(() => {});
+    }
+
+    function listener(changes, area) {
+      if (area !== 'session' || !changes[resultKey]) return;
+      cleanup();
+      resolve(changes[resultKey].newValue || { approved: false });
+    }
+
+    chrome.storage.onChanged.addListener(listener);
+
+    // Race-condition guard: result may already be written before listener attached
+    chrome.storage.session.get([resultKey]).then(d => {
+      if (d[resultKey]) { cleanup(); resolve(d[resultKey]); }
+    }).catch(() => {});
+  });
 }
 
 async function hudHide(tabId) {
@@ -1129,6 +1167,36 @@ async function waitForDomStable(tabId, maxWaitMs = 3000, intervalMs = 300) {
   if (remaining > 0) {
     await new Promise(r => setTimeout(r, remaining));
   }
+}
+
+// ── Post-Click DOM Change Detection ─────────────────────────
+// Polls dom_fingerprint every intervalMs until it DIFFERS from baseline.
+// Called after click_element to detect that the page has actually responded.
+// CSS-only clicks (spinner added, class toggled) leave the fingerprint
+// identical — waitForDomStable would exit immediately at ~450ms, causing the
+// next snapshot to capture the spinner state instead of loaded content.
+// Once the fingerprint shifts, waitForDomStable (inside takePageSnapshot)
+// takes over to wait for full stability.
+async function waitForDomChange(tabId, baseline, maxWaitMs = 2000, intervalMs = 100) {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, intervalMs));
+    try {
+      const result = await chrome.tabs.sendMessage(tabId, {
+        type: 'explore_action',
+        actionType: 'dom_fingerprint',
+      });
+      if (result?.fingerprint && result.fingerprint !== baseline) {
+        console.log('[Explore] waitForDomChange: DOM responded after click (fingerprint shifted)');
+        return { changed: true };
+      }
+    } catch (_) {
+      // Content script dead — treat as changed (SPA nav probably fired)
+      return { changed: true };
+    }
+  }
+  console.log('[Explore] waitForDomChange: no DOM change within', maxWaitMs, 'ms — CSS-only click or slow page');
+  return { changed: false };
 }
 
 // ── Response Timeout ────────────────────────────────────────
@@ -4167,6 +4235,19 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
       // ── LAYER 2: Capture pre-action snapshot for heuristic completion detection ──
       const preActionSnapshot = { url: snapshot.url, mainContent: snapshot.mainContent };
 
+      // ── POST-CLICK DOM CHANGE: Capture baseline fingerprint for click_element actions ──
+      // CSS-only clicks (spinner added, class toggled) produce an identical fingerprint
+      // before and after the click. waitForDomStable would exit immediately (~450ms),
+      // causing postActionSnapshot to capture the spinner state, not the loaded content.
+      // Capture baseline now so waitForDomChange can poll until the fingerprint shifts.
+      let preClickFingerprint = null;
+      if (decision.nextAction?.type === 'click_element') {
+        try {
+          const fpMsg = await chrome.tabs.sendMessage(currentTabId, { type: 'explore_action', actionType: 'dom_fingerprint' });
+          preClickFingerprint = fpMsg?.fingerprint || null;
+        } catch (_) { /* non-blocking — fall through, waitForDomChange will be skipped */ }
+      }
+
       const actionResult = await executeExploreActionWithHistory(currentTabId, decision.nextAction, token, step);
 
       // ── TAB SWIPE: Update currentTabId if navigate opened/switched to a different tab ──
@@ -4310,6 +4391,13 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         consecutiveFailures = 0;
         await hudUpdate(currentTabId, `explore-${step}`, 'success', actionDesc);
         await updateExplorationProgress(step, maxSteps, `Done: ${actionDesc}`, 'running');
+
+        // ── POST-CLICK DOM CHANGE: Wait for page to respond before snapshotting ──
+        // If the click caused full navigation, waitForTabReady above already handled it.
+        // For in-page responses (CSS spinner → content loads), poll until fingerprint shifts.
+        if (preClickFingerprint && !clickCausedNavigation) {
+          await waitForDomChange(currentTabId, preClickFingerprint);
+        }
 
         // ── LAYER 2: Run heuristic completion detector after successful action ──
         // Takes a quick post-action snapshot and checks for completion signals.

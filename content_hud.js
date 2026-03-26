@@ -492,7 +492,7 @@
 
   // ─── Consent Overlay ───────────────────────────────────
 
-  function showConsentOverlay(message, targetSelector) {
+  function showConsentOverlay(message, targetSelector, requestId = null) {
     const msgEl = document.getElementById('enh-consent-message');
     const iconEl = document.getElementById('enh-consent-icon');
     const titleEl = document.getElementById('enh-consent-title');
@@ -511,9 +511,18 @@
       applyGlow(targetSelector);
     }
 
-    // Return a promise that resolves when user approves or cancels
+    // Return a promise that resolves when user approves or cancels.
+    // The resolver is wrapped so it also writes to chrome.storage.session when
+    // requestId is provided — this is how the background SW (which may have been
+    // suspended while waiting) gets woken up via storage.onChanged.
     return new Promise((resolve) => {
-      consentResolver = resolve;
+      consentResolver = (result) => {
+        if (requestId) {
+          chrome.storage.session.set({ [`hudConsentResult_${requestId}`]: result }).catch(() => {});
+          chrome.storage.session.remove(['hudConsentPending']).catch(() => {});
+        }
+        resolve(result);
+      };
     });
   }
 
@@ -589,12 +598,10 @@
       }
 
       case 'hud_consent': {
-        // Show consent modal — pauses execution until user responds
-        const { message, targetSelector } = request;
-        showConsentOverlay(message, targetSelector).then(result => {
-          sendResponse(result);
-        });
-        return true; // Keep channel open for async response
+        // Result delivered via chrome.storage.session — no sendResponse needed
+        const { message, targetSelector, requestId } = request;
+        showConsentOverlay(message, targetSelector, requestId);
+        break;  // NOT return true
       }
 
       case 'hud_hide': {
