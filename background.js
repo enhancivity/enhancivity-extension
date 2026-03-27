@@ -6130,6 +6130,10 @@ async function handleMessage(request, sender) {
           const matchScore = recipeMatch.score || 0;
           console.log(`[BG] Recipe auto-match: "${recipe.workflowName}" (score=${matchScore}, confidence=${recipe.confidence})`);
 
+          if (matchScore < 50) {
+            console.log(`[BG] Recipe score ${matchScore} below threshold (50) — skipping auto-replay, falling through to AI`);
+          } else {
+
           // Try to auto-fill recipe variables from the user's prompt
           const variables = Array.isArray(recipe.variables) ? recipe.variables : [];
           const filledVars = {};
@@ -6309,6 +6313,7 @@ async function handleMessage(request, sender) {
               console.warn('[BG] Recipe auto-replay threw, falling through to AI:', replayErr.message);
             }
           }
+          } // end else (matchScore >= 50)
         }
       }
     } catch (recipeErr) {
