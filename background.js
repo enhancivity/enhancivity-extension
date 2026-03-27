@@ -5980,6 +5980,9 @@ async function handleMessage(request, sender) {
     // while this one is awaiting (memory fetch, chain plan, etc.), the counter
     // advances and the old chain detects the mismatch and aborts.
     const thisRequestGeneration = ++currentRequestGeneration;
+    // Tracks recipe IDs attempted in this request — prevents the same recipe from
+    // replaying multiple times (e.g., once in the main check, again in last-chance chain).
+    const triedRecipeIds = new Set();
 
     // Load memory (from cache or fresh fetch)
     let userMemory;
@@ -6199,6 +6202,7 @@ async function handleMessage(request, sender) {
           const unfilledVarCount = variables.filter(v => !filledVars[v.name]).length;
           if (unfilledVarCount === 0) {
             // Auto-replay: dispatch internally to the replay handler
+            triedRecipeIds.add(recipe.id); // Mark as attempted before replay
             try {
               const replayResult = await handleMessage({
                 type: 'learning_replay_recipe',
@@ -6757,9 +6761,16 @@ async function handleMessage(request, sender) {
                 );
                 const lastChance = await lastChanceRes.json();
                 if (lastChance?.success && lastChance?.found && lastChance?.recipe) {
-                  console.log(`[BG] Chain sub-task ${subTask.order}: last-chance recipe found! "${lastChance.recipe.autoDescription || lastChance.recipe.workflowName}" (score=${lastChance.score})`);
-                  // Replay this recipe instead of falling through to AI
+                  const lastChanceScore = lastChance.score || 0;
                   const lcRecipe = lastChance.recipe;
+                  if (lastChanceScore < 50) {
+                    console.log(`[BG] Chain sub-task ${subTask.order}: last-chance recipe score ${lastChanceScore} below threshold — skipping, falling to AI`);
+                  } else if (triedRecipeIds.has(lcRecipe.id)) {
+                    console.log(`[BG] Chain sub-task ${subTask.order}: last-chance recipe "${lcRecipe.id}" already attempted this request — skipping duplicate`);
+                  } else {
+                  triedRecipeIds.add(lcRecipe.id);
+                  console.log(`[BG] Chain sub-task ${subTask.order}: last-chance recipe found! "${lastChance.recipe.autoDescription || lastChance.recipe.workflowName}" (score=${lastChanceScore})`);
+                  // Replay this recipe instead of falling through to AI
                   const lcVars = { ...resolvedInputs };
                   // Map variables like the normal chain replay path
                   const lcRecipeVars = Array.isArray(lcRecipe.variables) ? lcRecipe.variables : [];
@@ -6792,6 +6803,7 @@ async function handleMessage(request, sender) {
                     console.warn(`[BG] Chain sub-task ${subTask.order}: last-chance recipe replay failed:`, lcErr.message);
                     stepResult = null; // Fall through to AI below
                   }
+                  } // end else (score >= 50 && not already tried)
                 }
               } catch { /* last-chance lookup failed — continue to AI */ }
             }
