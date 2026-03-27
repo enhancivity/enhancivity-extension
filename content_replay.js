@@ -1336,8 +1336,22 @@
     return { success: typed, usedStrategy: found.usedStrategy, llmChars: generatedText.length };
   }
 
-  async function executeNavigate(action) {
-    window.location.href = action.url;
+  async function executeNavigate(action, vars = {}) {
+    const SEARCH_PARAMS = ['k', 'q', 's', 'search', 'query', 'keywords'];
+    let targetUrl = action.url;
+    if (vars.__search_query) {
+      try {
+        const u = new URL(targetUrl);
+        for (const p of SEARCH_PARAMS) {
+          if (u.searchParams.has(p)) {
+            u.searchParams.set(p, vars.__search_query);
+            targetUrl = u.toString();
+            break;
+          }
+        }
+      } catch { /* malformed URL — skip */ }
+    }
+    window.location.href = targetUrl;
     // Navigation will reload the page — the background.js handles continuation
     return { success: true, navigated: true };
   }
@@ -1496,7 +1510,7 @@
             case 'wait':
               return await executeWait(action);
             case 'navigate':
-              return await executeNavigate(action);
+              return await executeNavigate(action, variables || {});
             default:
               return { success: false, error: `Unknown action type: ${action.type}` };
           }
@@ -1661,7 +1675,7 @@
             case 'wait':
               return await executeWait(action);
             case 'navigate':
-              return await executeNavigate(action);
+              return await executeNavigate(action, variables || {});
             default:
               return { success: false, error: `Unknown action type: ${action.type}` };
           }

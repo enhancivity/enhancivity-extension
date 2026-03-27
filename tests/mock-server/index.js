@@ -670,6 +670,79 @@ app.get('/api/recipes/match', (req, res) => {
   if (task.includes('fill') && task.includes('form')) {
     return res.json(fixture('recipe-match-fingerprint.json'));
   }
+  // Bug 1 regression test: recipe with navigate URL baked in from recording time
+  // The navigate step has ?k=tshirt — after fix, this should be replaced with __search_query
+  if (task.includes('url-sub-test')) {
+    return res.json({
+      success: true,
+      found: true,
+      score: 75,
+      recipe: {
+        id: 'url-sub-test-001',
+        workflowName: 'URL substitution test recipe',
+        siteDomain: 'localhost',
+        confidence: 0.8,
+        validationCount: 5,
+        status: 'CANDIDATE',
+        steps: [
+          {
+            stepNumber: 1,
+            action: {
+              type: 'type',
+              inputType: 'variable',
+              variableName: '__search_query',
+              originalFixedValue: 'tshirt',
+              selectors: [{ strategy: 'css-id', value: '#search-box', priority: 1 }],
+              description: 'Search box',
+            },
+          },
+          {
+            stepNumber: 2,
+            action: {
+              type: 'navigate',
+              url: 'http://localhost:3099/harness/search-results.html?k=tshirt',
+              description: 'Navigate to search results',
+            },
+          },
+        ],
+        variables: [{ name: '__search_query', description: 'Search query' }],
+        fingerprint: { domains: ['localhost'], category: 'search', actionSignature: ['type', 'navigate'], requiresInputs: [], producesOutputs: ['page-url'] },
+        autoDescription: 'URL substitution test',
+      },
+    });
+  }
+
+  // Bug 2 regression test: low-score recipe (27/100) should NOT auto-replay
+  // Before fix: recipe fires and navigates away. After fix: skipped, page stays.
+  if (task.includes('low-score-test')) {
+    return res.json({
+      success: true,
+      found: true,
+      score: 27,
+      recipe: {
+        id: 'low-score-test-001',
+        workflowName: 'Low score test recipe',
+        siteDomain: 'localhost',
+        confidence: 0.3,
+        validationCount: 1,
+        status: 'CANDIDATE',
+        steps: [
+          {
+            stepNumber: 1,
+            action: {
+              type: 'navigate',
+              url: 'http://localhost:3099/harness/search-results.html',
+              description: 'Navigate to search results (wrong page)',
+            },
+          },
+        ],
+        variables: [],
+        fingerprint: { domains: ['localhost'], category: 'other', actionSignature: ['navigate'], requiresInputs: [], producesOutputs: ['page-url'] },
+        autoDescription: 'Low score test',
+      },
+    });
+  }
+
   // Low-score own recipe — always matched regardless of score
   if (task.includes('low-score-own')) {
     return res.json({
