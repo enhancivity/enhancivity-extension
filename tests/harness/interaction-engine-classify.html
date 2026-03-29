@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Interaction Engine — Classification Test Harness</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    .section { margin-bottom: 20px; padding: 12px; border: 1px solid #ccc; border-radius: 6px; }
+    h2 { margin-top: 0; font-size: 14px; color: #666; }
+    label { display: block; margin-bottom: 6px; font-size: 13px; }
+  </style>
+</head>
+<body>
+
+  <h1>Classification Test Harness</h1>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- NATIVE INPUTS                                      -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>Native Inputs</h2>
+    <input id="plain-text" type="text" placeholder="Plain text input">
+    <input id="plain-email" type="email" placeholder="Email input">
+    <textarea id="plain-textarea" placeholder="Plain textarea"></textarea>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- IGNORE                                              -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>Ignore</h2>
+    <input id="hidden-input" type="hidden" value="secret">
+    <input id="readonly-input" type="text" readonly value="Cannot edit">
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- DATEPICKER                                          -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>Datepicker</h2>
+    <div class="date-picker-wrapper">
+      <input id="readonly-date" type="text" readonly value="2026-03-29" placeholder="Pick a date">
+    </div>
+    <input id="native-date" type="date" value="2026-03-29">
+    <input id="native-datetime" type="datetime-local">
+    <input id="native-time" type="time">
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- CONTENTEDITABLE                                     -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>ContentEditable</h2>
+    <div id="generic-editable" contenteditable="true" style="border:1px solid #ccc; padding:8px; min-height:40px;">
+      Generic editable div
+    </div>
+    <div id="prosemirror-editor" class="ProseMirror" contenteditable="true" style="border:1px solid #ccc; padding:8px; min-height:40px;">
+      ProseMirror editor
+    </div>
+    <div id="slate-editor" data-slate-editor="true" contenteditable="true" style="border:1px solid #ccc; padding:8px; min-height:40px;">
+      Slate editor
+    </div>
+    <div class="DraftEditor-root">
+      <div id="draftjs-editor" contenteditable="true" style="border:1px solid #ccc; padding:8px; min-height:40px;">
+        DraftJS editor
+      </div>
+    </div>
+    <div id="quill-editor" class="ql-editor" contenteditable="true" style="border:1px solid #ccc; padding:8px; min-height:40px;">
+      Quill editor
+    </div>
+    <div data-lexical-editor="true">
+      <div id="lexical-editor" contenteditable="true" style="border:1px solid #ccc; padding:8px; min-height:40px;">
+        Lexical editor
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- DROPDOWNS                                           -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>Dropdowns</h2>
+    <select id="native-select">
+      <option value="">Choose...</option>
+      <option value="a">Option A</option>
+      <option value="b">Option B</option>
+    </select>
+    <div id="custom-dropdown" role="combobox" aria-haspopup="listbox" aria-expanded="false" tabindex="0"
+         style="border:1px solid #999; padding:8px; cursor:pointer; display:inline-block;">
+      Custom dropdown (div)
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- AUTOCOMPLETE                                        -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>Autocomplete</h2>
+    <input id="autocomplete-aria" type="text" role="combobox" aria-autocomplete="list" placeholder="Autocomplete (aria)">
+    <input id="autocomplete-google" type="text" data-google-places placeholder="Google Places autocomplete">
+    <div class="autocomplete-wrapper">
+      <input id="autocomplete-class" type="text" placeholder="Autocomplete (class context)">
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- MASKED INPUTS                                       -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>Masked Inputs</h2>
+    <input id="masked-datamask" type="text" data-mask="(000) 000-0000" placeholder="Phone (data-mask)">
+    <input id="masked-inputmask" type="text" data-inputmask="'mask': '99/99/9999'" placeholder="Date (data-inputmask)">
+    <input id="masked-tel" type="tel" maxlength="14" placeholder="Phone (tel + maxlength)">
+    <div class="imask-wrapper">
+      <input id="masked-imask" type="text" placeholder="IMask wrapper">
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- FRAMEWORK CONTROLLED                                -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>Framework Controlled</h2>
+    <input id="react-input" type="text" placeholder="React controlled input">
+    <input id="vue-input" type="text" placeholder="Vue controlled input">
+    <div ng-version="17.0.0">
+      <input id="angular-input" type="text" placeholder="Angular controlled input">
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Simulate framework markers via JS                   -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <script>
+    // React: add _valueTracker and __reactFiber property
+    const reactInput = document.getElementById('react-input');
+    reactInput._valueTracker = { getValue: () => '', setValue: () => {} };
+    reactInput['__reactFiber$abc123'] = { tag: 5, type: 'input' };
+
+    // Vue: add __vue__ property
+    const vueInput = document.getElementById('vue-input');
+    vueInput.__vue__ = { $el: vueInput, _data: {} };
+  </script>
+
+</body>
+</html>

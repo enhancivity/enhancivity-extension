@@ -74,7 +74,7 @@
 
   const EXECUTORS = {
 
-    fill_field(step) {
+    async fill_field(step) {
       if (!step.selector) {
         return { success: false, error: 'No selector provided for fill_field' };
       }
@@ -87,17 +87,83 @@
         return { success: false, error: `Element not found: ${step.selector}` };
       }
 
-      el.focus();
+      const value = step.value != null ? String(step.value) : '';
 
-      // Handle contenteditable elements (like Gmail compose body)
-      if (el.isContentEditable) {
-        el.innerHTML = escapeHtml(step.value).replace(/\n/g, '<br>');
-      } else {
-        el.value = step.value || '';
+      // ── INTERACTION ENGINE (if loaded) ──
+      // The Universal Interaction Engine handles React, custom dropdowns, autocomplete,
+      // masked inputs, and contenteditable with better strategies than legacy fill.
+      // If available, use it and return early. Falls through to legacy code if not loaded.
+      if (window.__enhInteractionEngine && typeof window.__enhInteractionEngine.fillField === 'function') {
+        try {
+          const engineResult = await window.__enhInteractionEngine.fillField(el, value);
+          return { success: engineResult.success, error: engineResult.success ? undefined : engineResult.reason };
+        } catch (engineErr) {
+          console.debug('[fill_field] InteractionEngine threw:', engineErr.message, '— falling through to legacy');
+        }
       }
 
-      // Dispatch events so frameworks (React, Angular, Vue) pick up the change
-      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.focus();
+
+      // ── Checkbox / Radio ────────────────────────────────────────────────────
+      if (el.type === 'checkbox' || el.type === 'radio') {
+        el.checked = /^(true|yes|on|1|checked)$/i.test(value);
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return { success: true };
+      }
+
+      // ── Select ──────────────────────────────────────────────────────────────
+      if (el.tagName === 'SELECT') {
+        el.value = value;
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return { success: true };
+      }
+
+      // ── ContentEditable (ProseMirror, Lexical, Slate, rich editors) ─────────
+      // Rich editors intercept `beforeinput` to apply changes to their internal
+      // document model — the event must fire BEFORE the DOM mutates.
+      // Tier 1: execCommand('insertText') fires the native sequence in real browsers.
+      // Tier 2: synthetic InputEvent sequence — deterministic fallback when
+      //         execCommand is unavailable (MV3 sandbox, DevTools, headless contexts).
+      if (el.isContentEditable) {
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        const inserted = document.execCommand('insertText', false, value);
+        if (!inserted) {
+          // Synthetic beforeinput → DOM mutation → input sequence
+          const beforeEv = new InputEvent('beforeinput', {
+            bubbles: true, cancelable: true,
+            inputType: 'insertText', data: value,
+          });
+          el.dispatchEvent(beforeEv);
+          if (!beforeEv.defaultPrevented) {
+            el.textContent = value;
+          }
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+        }
+        return { success: true };
+      }
+
+      // ── Standard Input / Textarea — nativeSetter path ───────────────────────
+      // React / Vue 3 / Angular override the element's own `value` property with
+      // a controlled setter that records the value in framework state but does NOT
+      // write it to the DOM (deferred until re-render). The native setter on the
+      // prototype always writes directly to the DOM.
+      // Step 1: native setter → DOM reflects the new value.
+      // Step 2: InputEvent with inputType:'insertText' → framework event listener
+      //         syncs internal state from the now-updated DOM value.
+      const proto = el.tagName === 'TEXTAREA'
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+      const nativeDescriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (nativeDescriptor && nativeDescriptor.set) {
+        nativeDescriptor.set.call(el, value);
+      } else {
+        el.value = value;
+      }
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
 
       return { success: true };

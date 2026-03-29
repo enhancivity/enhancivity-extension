@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Rich Editor Form — Enhancivity Test Harness</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #6366f1; font-size: 18px; }
+    label { display: block; margin-top: 16px; font-size: 13px; color: #a5b4fc; }
+    input { display: block; width: 100%; padding: 10px; margin-top: 4px; border: 1px solid #333; border-radius: 6px; background: #12121a; color: #e0e0e0; font-size: 14px; box-sizing: border-box; }
+    .rich-editor {
+      display: block; width: 100%; min-height: 120px; padding: 10px; margin-top: 4px;
+      border: 1px solid #333; border-radius: 6px; background: #12121a; color: #e0e0e0;
+      font-size: 14px; box-sizing: border-box; outline: none;
+      white-space: pre-wrap;
+    }
+    .rich-editor:empty::before { content: attr(data-placeholder); color: #6b7280; pointer-events: none; }
+    .hint { font-size: 11px; color: #6b7280; margin-top: 2px; }
+    #event-log { margin-top: 20px; padding: 12px; background: #0a0a14; border-radius: 6px; border: 1px solid #222; font-size: 11px; font-family: monospace; color: #a5b4fc; max-height: 200px; overflow-y: auto; }
+    #event-log .entry { padding: 1px 0; }
+  </style>
+</head>
+<body>
+  <h1>Rich Editor Form (ProseMirror-style)</h1>
+  <p class="hint">
+    The "Cover Letter" field is a contenteditable div that simulates a ProseMirror-style rich
+    text editor. It tracks <code>beforeinput</code> and <code>input</code> events to verify
+    whether the typing mechanism correctly fires them. The "Subject" field is a plain input.
+  </p>
+
+  <label for="subject">Subject (plain input)</label>
+  <input
+    type="text"
+    id="subject"
+    name="subject"
+    placeholder="Subject line"
+    aria-label="Subject"
+    role="textbox"
+  />
+
+  <label>Cover Letter (rich editor — contenteditable)</label>
+  <div
+    id="rich-editor"
+    class="rich-editor"
+    contenteditable="true"
+    role="textbox"
+    aria-label="Cover Letter"
+    aria-multiline="true"
+    data-placeholder="Write your cover letter here..."
+    data-enh-sid="rich-0"
+  ></div>
+
+  <div class="hint">Events fired on the rich editor:</div>
+  <div id="event-log"><div class="entry" id="no-events">(no events yet)</div></div>
+
+  <script>
+    'use strict';
+
+    // ── Rich editor event tracking ─────────────────────────────────────────────
+    // Tracks every event that fires on the contenteditable div.
+    // Tests use this to verify whether the typing mechanism fires beforeinput
+    // before mutating the DOM (required by ProseMirror/Lexical/Slate).
+
+    const editor = document.getElementById('rich-editor');
+    const log    = document.getElementById('event-log');
+    const noEvt  = document.getElementById('no-events');
+
+    const eventHistory = [];
+
+    function logEvent(name, detail) {
+      if (noEvt) noEvt.remove();
+      const entry = { name, detail, timestamp: Date.now() };
+      eventHistory.push(entry);
+      const el = document.createElement('div');
+      el.className = 'entry';
+      el.textContent = `[${name}] ${detail || ''}`;
+      log.appendChild(el);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    ['beforeinput', 'input', 'keydown', 'keypress', 'keyup', 'focus', 'blur', 'paste'].forEach(evName => {
+      editor.addEventListener(evName, (e) => {
+        const detail = e.data ? `data="${e.data}"` :
+                       e.inputType ? `inputType="${e.inputType}"` : '';
+        logEvent(evName, detail);
+      });
+    });
+
+    // Expose for test assertions
+    window.getEventHistory = () => eventHistory;
+    window.getEditorText   = () => editor.innerText || editor.textContent || '';
+    window.getEditorHTML   = () => editor.innerHTML;
+
+    // Track whether beforeinput fired before the DOM was mutated (ProseMirror requirement).
+    // If beforeinput fires BEFORE innerHTML changes, set this flag.
+    let lastBeforeInputText = null;
+    let beforeInputFiredBeforeMutation = false;
+
+    editor.addEventListener('beforeinput', () => {
+      lastBeforeInputText = editor.textContent || '';
+    });
+
+    editor.addEventListener('input', () => {
+      if (lastBeforeInputText !== null && (editor.textContent || '') !== lastBeforeInputText) {
+        // DOM changed after beforeinput — correct sequence
+        beforeInputFiredBeforeMutation = true;
+      }
+      lastBeforeInputText = null;
+    });
+
+    window.wasBeforeInputFiredBeforeMutation = () => beforeInputFiredBeforeMutation;
+  </script>
+</body>
+</html>

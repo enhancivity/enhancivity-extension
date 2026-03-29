@@ -75,46 +75,49 @@
     }
 
     // ── DELEGATE_TASK: Dashboard "Delegate" button ──
-    // 1. Ensure the side panel is open
-    // 2. Send auto-fill payload via chrome.runtime.sendMessage (side panel listens)
+    // Strategy:
+    //   1. Store pendingDelegation first (always survives panel-open failures).
+    //   2. If panel is already open: send enh_delegate_autofill directly.
+    //      chrome.runtime.sendMessage from a content script reaches ALL extension
+    //      pages (including the side panel) via their onMessage listeners.
+    //   3. If panel is not open: show "Task saved" toast — initMainView() reads
+    //      pendingDelegation from storage when the user opens the panel.
     if (event.data.type === 'DELEGATE_TASK') {
       const payload = event.data.payload;
       console.log('[Bridge] Handling DELEGATE_TASK:', payload?.taskTitle);
 
-      let panelReady = false;
+      // 1. Store pending task — survives panel-open failures and extension reloads
       try {
-        panelReady = await ensureSidePanelOpen();
-      } catch (err) {
-        if (err.message?.includes('Extension context invalidated')) {
-          console.warn('[Bridge] Extension was reloaded — page needs refresh');
+        await chrome.storage.local.set({ pendingDelegation: payload });
+        console.log('[Bridge] Pending delegation stored in chrome.storage.local');
+      } catch (storageErr) {
+        if (storageErr.message?.includes('Extension context invalidated')) {
           alert('Enhancivity extension was updated. Please refresh this page (Ctrl+R) and try again.');
           return;
         }
-        console.error('[Bridge] Side panel open error:', err.message);
+        console.error('[Bridge] Could not store pending delegation:', storageErr.message);
       }
 
-      if (!panelReady) {
-        console.error('[Bridge] Could not open side panel — delegation aborted');
-        showDashboardToast('Could not open Enhancivity panel. Make sure the extension is installed and try again.');
-        return;
-      }
-
-      // Send auto-fill to side panel via chrome.runtime.sendMessage
-      console.log('[Bridge] Sending auto-fill to side panel via runtime message');
+      // 2. Try direct autofill — works if the panel is already open.
+      //    sendMessage from a content script fires onMessage in all extension pages.
       try {
         const fillRes = await chrome.runtime.sendMessage({
           type: 'enh_delegate_autofill',
           payload,
         });
         if (fillRes?.ok) {
-          showDashboardToast('Task sent to Enhancivity — check the side panel', 'info');
-        } else {
-          showDashboardToast('Side panel is open but could not auto-fill. Try typing the task manually.');
+          console.log('[Bridge] Panel auto-filled successfully');
+          showDashboardToast('Task loaded — check the Enhancivity panel', 'info');
+          return;
         }
-      } catch (err) {
-        console.error('[Bridge] Auto-fill send failed:', err.message);
-        showDashboardToast('Could not send task to side panel. Try again.');
+      } catch {
+        // Panel is not open — fall through to storage-only path
       }
+
+      // 3. Panel not open — task is safe in storage.
+      //    initMainView() reads pendingDelegation when the user opens the panel.
+      console.warn('[Bridge] Panel not open — task saved for manual open');
+      showDashboardToast('Task saved — click the Enhancivity icon to start', 'info');
     }
 
     // ── BRIEFING_ACTION: Briefing dynamic action button ──

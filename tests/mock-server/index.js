@@ -41,6 +41,11 @@ let spaStaleReady = false; // set true when explore-step is in-flight → signal
 let domVerifyStep = 0;
 let domVerifyStep2Content = null; // mainContent seen by the AI at step 2 (after the click)
 
+// ── Form-fill baseline support ────────────────────────────────
+// Captures the last parse-intent request body so baseline tests can inspect
+// whether user memory/profile data was included (it currently isn't — that's the bug).
+let lastParseIntentBody = null;
+
 const SUBSCRIPTION_TSV = 'Service\tPlan\tAmount\tNext Billing\nSpotify\tPremium\t$9.99\tApr 15\nNetflix\tStandard\t$15.49\tApr 20\nGitHub\tPro\t$4.00\tApr 1\nClaude\tMax\t$100.00\tApr 10';
 const SUBSCRIPTION_TSV_BATCH2 = 'AWS\tBusiness\t$29.99\tApr 5';
 const SPREADSHEET_URL = 'http://localhost:3099/harness/spreadsheet.html';
@@ -70,7 +75,15 @@ app.post('/test/reset', (req, res) => {
   spaStaleReady = false;
   domVerifyStep = 0;
   domVerifyStep2Content = null;
+  lastParseIntentBody = null;
   res.json({ success: true });
+});
+
+// ── Form-fill baseline inspection endpoint ────────────────────
+// Returns the body of the last /api/agent/parse-intent call in fill_form mode.
+// Used by baseline test B-pi to verify whether user identity data was included.
+app.get('/test/last-parse-intent-body', (req, res) => {
+  res.json({ body: lastParseIntentBody });
 });
 
 // ── SPA-stale coordination: harness page polls this until ready to pushState ──
@@ -81,6 +94,28 @@ app.get('/test/spa-stale-ready', (req, res) => {
 // ── DOM-verify: expose the mainContent the AI saw at step 2 (after the click) ──
 app.get('/test/dom-verify-step2-snapshot', (req, res) => {
   res.json({ content: domVerifyStep2Content });
+});
+
+// ── Teach-agent memory endpoint (used by background.js getOrRefreshMemory) ───
+// Returns deterministic Tier 1 profile facts for the test user so that
+// stageAction can include user identity data in the parse-intent payload (B3).
+app.get('/api/teach-agent/:userId', (req, res) => {
+  res.json({
+    tier1: [
+      { key: 'name',  value: 'Jane Smith' },
+      { key: 'email', value: 'jane@example.com' },
+      { key: 'phone', value: '555-123-4567' },
+    ],
+    tier2: [],
+    tier3: [],
+  });
+});
+
+// ── Memory harvest endpoint (chat-to-memory — C2) ────────────────────────────
+// Accepts personal info fragments extracted from chat messages and stores them.
+// In production this updates UserProfile.customFacts; in tests it just ACKs.
+app.post('/api/memory/harvest', (req, res) => {
+  res.json({ success: true, harvested: true });
 });
 
 // Error mode middleware — BEFORE all route handlers
@@ -141,6 +176,19 @@ app.post('/api/auth/extension/google', (req, res) => {
 // ── AGENT PROCESS (main AI brain) ────────────────────────────
 app.post('/api/agent/process', (req, res) => {
   const prompt = (req.body.userPrompt || '').toLowerCase();
+
+  // ── FILL_FORM trigger (used by baseline form-fill tests) ──────
+  if (prompt.includes('fill this form') || prompt.includes('fill the form')) {
+    return res.json({
+      action_type: 'FILL_FORM',
+      headline: 'Filling form fields from memory',
+      rationale: 'Using Ghost-Driver to fill the form with your profile data.',
+      primary_content: 'Filling form fields with your saved information.',
+      dom_actions: [{ action: 'semantic_fill', value: prompt, description: 'Fill form fields from user profile' }],
+      consent_level: 'auto',
+      preview: { summary: 'Fill form with your profile data.' },
+    });
+  }
 
   if (prompt.includes('desktop') && (prompt.includes('800') || prompt.includes('8000'))) {
     return res.json({
@@ -422,6 +470,20 @@ app.post('/api/agent/explore-step', (req, res) => {
     });
   }
 
+  // ── scrape-loop scenario: always return scrape_page to test circuit breaker ──
+  if (activeScenario === 'scrape-loop') {
+    exploreStepCounter++;
+    return res.json({
+      nextAction: { type: 'scrape_page', description: 'Re-scan the page for fresh elements' },
+      isGoalComplete: false,
+      reasoning: 'Elements seem stale. Re-scanning to get fresh element IDs.',
+      revisedStrategy: null,
+      needsConsent: false,
+      consentReason: null,
+      extractedData: null,
+    });
+  }
+
   exploreStepCounter++;
 
   if (exploreStepCounter >= 5) {
@@ -449,6 +511,59 @@ app.post('/api/agent/explore-step', (req, res) => {
 app.post('/api/agent/parse-intent', (req, res) => {
   const goal = (req.body.userGoal || '').toLowerCase();
   const pageUrl = req.body.semanticMap?.pageUrl || req.body.pageUrl || '';
+
+  // ── fill_form mode: Ghost-Driver form filling ─────────────────
+  // Build fill actions from the actual semantic map elements the scraper found.
+  // The mock returns deterministic values based on field labels so tests can
+  // assert exact DOM values after stageAction completes.
+  // NOTE: intentionally sends NO user profile/memory — that's the bug we document
+  // in baseline B-pi and fix in Problem 2.
+  if (req.body.mode === 'fill_form') {
+    lastParseIntentBody = req.body; // capture for baseline inspection
+
+    const elements = req.body.semanticMap?.elements || [];
+    const actions = [];
+
+    for (const el of elements) {
+      if (el.type !== 'input' && el.type !== 'textarea') continue;
+      if (el.attrs?.type === 'password' || el.attrs?.type === 'hidden') continue;
+
+      // Build a label string from every available attribute
+      const labelStr = [
+        el.text,
+        el.attrs?.placeholder,
+        el.attrs?.name,
+        el.attrs?.['aria-label'],
+        el.context,
+      ].filter(Boolean).join(' ').toLowerCase();
+
+      let value;
+      if (/\bname\b|\bfirst\b|\blast\b/.test(labelStr))           value = 'Jane Smith';
+      else if (/\bemail\b/.test(labelStr))                         value = 'jane@example.com';
+      else if (/\bphone\b|\btel\b/.test(labelStr))                 value = '5551234';
+      else if (/\bmessage\b|\bbody\b|\bcomment\b/.test(labelStr))  value = 'Test message from the agent.';
+      else if (/\bsubject\b|\btitle\b/.test(labelStr))             value = 'Test Subject';
+      else if (/\baddress\b|\bstreet\b/.test(labelStr))            value = '123 Test Street';
+      else if (/\bcity\b/.test(labelStr))                          value = 'Toronto';
+      else if (/\bzip\b|\bpostal\b/.test(labelStr))                value = 'M5V2T6';
+      else                                                          value = `Value-for-${el.attrs?.name || el.sid}`;
+
+      actions.push({
+        action: 'fill_field',
+        semanticId: el.sid,
+        value,
+        rationale: `Fill "${labelStr || el.sid}" with profile-matched data`,
+      });
+    }
+
+    return res.json({
+      actions,
+      pageType: 'form',
+      siteName: 'Test Form Harness',
+      trustScore: 9,
+      trustRationale: 'Known test page',
+    });
+  }
 
   if (pageUrl.includes('mock-shop-a')) {
     if (goal.includes('desktop')) {

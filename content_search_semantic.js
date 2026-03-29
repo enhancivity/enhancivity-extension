@@ -169,8 +169,17 @@
 
     const parts = [];
 
-    // Parent text (if short enough to be a label/group)
-    const parentText = getDirectText(parent);
+    // Parent text (if short enough to be a label/group).
+    // Use direct text-node children only — NOT innerText fallback — to avoid
+    // capturing all descendants' text when the parent is a large container like
+    // <form>, <section>, or <div>. Without this guard, a flat form
+    // (inputs directly inside <form>) causes every field's context to include
+    // "First Name", "Email", etc. from the whole form, polluting label matching.
+    let parentText = '';
+    for (const node of parent.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE) parentText += node.textContent;
+    }
+    parentText = parentText.replace(/\s+/g, ' ').trim();
     if (parentText && parentText.length > 2 && parentText.length < 200) {
       parts.push(parentText);
     }

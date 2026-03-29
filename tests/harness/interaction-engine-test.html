@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Interaction Engine — Test Harness</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    .section { margin-bottom: 24px; border: 1px solid #ccc; padding: 16px; border-radius: 8px; }
+    h2 { margin-top: 0; }
+    label { display: block; margin-bottom: 8px; }
+
+    /* ── Dropdown options list (hidden until opened) ── */
+    .custom-dropdown-options {
+      display: none;
+      position: absolute;
+      background: white;
+      border: 1px solid #ccc;
+      z-index: 100;
+      list-style: none;
+      padding: 0;
+      margin: 4px 0 0;
+      min-width: 200px;
+    }
+    .custom-dropdown-options.open { display: block; }
+    .custom-dropdown-options li {
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+    .custom-dropdown-options li:hover { background: #f0f0f0; }
+
+    /* ── Scroll test: tall container ── */
+    #scroll-container {
+      height: 200px;
+      overflow-y: auto;
+      border: 1px solid #999;
+    }
+    #scroll-spacer { height: 800px; }
+    #scroll-target {
+      background: #e0e7ff;
+      padding: 12px;
+      margin: 4px 0;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>Interaction Engine — Test Harness</h1>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- SECTION: findBestMatch targets                     -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section" id="match-section">
+    <h2>findBestMatch Targets</h2>
+
+    <!-- Native select for option matching -->
+    <select id="match-select">
+      <option value="">-- Choose --</option>
+      <option value="us">United States</option>
+      <option value="uk">United Kingdom</option>
+      <option value="de">Germany</option>
+      <option value="fr">France</option>
+      <option value="jp">Japan</option>
+    </select>
+
+    <!-- List items for fuzzy matching -->
+    <ul id="match-list">
+      <li>Email Address</li>
+      <li>Full Name</li>
+      <li>Phone Number</li>
+      <li>Street Address</li>
+      <li>City</li>
+      <li>State / Province</li>
+      <li>ZIP / Postal Code</li>
+    </ul>
+
+    <!-- Custom dropdown (MUI-style) -->
+    <div id="custom-dropdown" role="combobox" aria-haspopup="listbox" aria-expanded="false" tabindex="0"
+         style="border:1px solid #999; padding:8px 12px; cursor:pointer; display:inline-block; min-width:200px; position:relative;">
+      <span id="dropdown-display">Select a color...</span>
+      <ul id="dropdown-listbox" class="custom-dropdown-options" role="listbox">
+        <li role="option" data-value="red">Red</li>
+        <li role="option" data-value="blue">Blue</li>
+        <li role="option" data-value="green">Green</li>
+        <li role="option" data-value="dark-blue">Dark Blue</li>
+        <li role="option" data-value="light-green">Light Green</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- SECTION: ensureElementInView scroll target         -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section" id="scroll-section">
+    <h2>Scroll Target</h2>
+    <div id="scroll-container">
+      <div id="scroll-spacer"></div>
+      <div id="scroll-target">I am far below the fold — scroll to me!</div>
+      <div style="height: 200px;"></div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- SECTION: Masked input test values                  -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section" id="normalize-section">
+    <h2>Normalize Test Values</h2>
+    <input id="phone-formatted" type="tel" value="(123) 456-7890" readonly>
+    <input id="phone-raw" type="tel" value="1234567890" readonly>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Inject interaction-engine.js for in-page testing   -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <script>
+    // Custom dropdown open/close behavior (MUI-style)
+    const dropdown = document.getElementById('custom-dropdown');
+    const listbox = document.getElementById('dropdown-listbox');
+    dropdown.addEventListener('click', () => {
+      const isOpen = listbox.classList.contains('open');
+      listbox.classList.toggle('open');
+      dropdown.setAttribute('aria-expanded', String(!isOpen));
+    });
+    listbox.querySelectorAll('[role="option"]').forEach(opt => {
+      opt.addEventListener('click', (e) => {
+        e.stopPropagation();
+        document.getElementById('dropdown-display').textContent = opt.textContent;
+        listbox.classList.remove('open');
+        dropdown.setAttribute('aria-expanded', 'false');
+      });
+    });
+  </script>
+
+</body>
+</html>

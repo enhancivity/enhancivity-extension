@@ -355,8 +355,48 @@ async function initMainView() {
   // Initialize Learning Mode
   setupLearningMode();
 
+  // ── Pending delegation: consume task stored by dashboard_bridge on Delegate click ──
+  try {
+    const { pendingDelegation } = await chrome.storage.local.get('pendingDelegation');
+    consumePendingDelegation(pendingDelegation);
+  } catch { /* non-critical */ }
+
   promptInput.focus();
 }
+
+// ── Delegation auto-fill helper ───────────────────────────────
+// Called from initMainView() on startup AND from the storage.onChanged listener
+// when the panel is already open at the moment the user clicks Delegate.
+function consumePendingDelegation(delegation) {
+  if (!delegation?.taskTitle) return;
+  chrome.storage.local.remove('pendingDelegation').catch(() => {});
+  const { taskTitle, taskDescription, priority, dueDate, tags } = delegation;
+  const parts = [`Task: ${taskTitle}`];
+  if (taskDescription) parts.push(`Description: ${taskDescription}`);
+  if (dueDate) {
+    try { parts.push(`Due: ${new Date(dueDate).toLocaleDateString()}`); } catch { parts.push(`Due: ${dueDate}`); }
+  }
+  if (priority) parts.push(`Importance: ${priority}`);
+  if (tags && tags.length) parts.push(`Tags: ${Array.isArray(tags) ? tags.join(', ') : tags}`);
+  parts.push('Please help me complete this.');
+  promptInput.value = parts.join(', ');
+  submitBtn.disabled = false;
+  submitBtn.classList.add('active');
+  if (greeting) greeting.style.display = 'none';
+  promptInput.focus();
+  console.log('[Panel] Consumed pending delegation:', taskTitle);
+}
+
+// ── Live delegation listener ──────────────────────────────────
+// Fires if the panel is already open when the user clicks Delegate.
+// initMainView() handles the case where the panel opens AFTER the click;
+// this listener handles the case where the panel is already open BEFORE the click.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes.pendingDelegation?.newValue) return;
+  const mainView = document.getElementById('main-view');
+  if (!mainView || mainView.classList.contains('hidden')) return;
+  consumePendingDelegation(changes.pendingDelegation.newValue);
+});
 
 // ── Tab Change Listener ──────────────────────────────────────
 // Side panel persists, so we update context when user switches tabs
@@ -3521,6 +3561,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     submitBtn.classList.add('active');
     if (greeting) greeting.style.display = 'none';
     promptInput.focus();
+
+    // Clear storage entry so initMainView doesn't double-fill if panel reloads
+    chrome.storage.local.remove('pendingDelegation').catch(() => {});
 
     sendResponse({ ok: true });
     return true;

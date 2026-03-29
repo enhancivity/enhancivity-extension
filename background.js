@@ -1259,6 +1259,15 @@ async function injectAndConfirm(tabId, scriptFile = 'content_explore.js') {
           files: ['consequential_actions.js'],
         }).catch(() => {}); // Non-fatal — content scripts have inline fallbacks
       }
+      // Inject Universal Interaction Engine before content scripts that use it
+      // (content_explore.js type_text, content_actions.js fill_field).
+      // Has double-injection guard — safe to inject multiple times.
+      if (scriptFile === 'content_explore.js') {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          files: ['interaction-engine.js'],
+        }).catch(() => {}); // Non-fatal — content scripts fall through to legacy code
+      }
       await chrome.scripting.executeScript({
         target: { tabId },
         files: [scriptFile],
@@ -3022,6 +3031,27 @@ async function tryDismissModal(snapshot, tabId, token) {
   return { dismissed, method };
 }
 
+// ── Structured step helpers (multi-step mode) ──
+
+/**
+ * Check if all machine-verifiable success signals for a step are satisfied.
+ * Returns true if all signals pass (or if no machine signals are defined).
+ */
+function checkMachineSignals(step, currentPageState, structuredData) {
+  if (!step?.successSignals?.machine?.length) return true; // No signals = vacuous truth
+  return step.successSignals.machine.every(signal => {
+    if (signal.startsWith('extractedData.')) {
+      const key = signal.replace('extractedData.', '').split(' ')[0];
+      return structuredData[key] != null && structuredData[key] !== '';
+    }
+    if (signal.startsWith('URL contains ')) {
+      const fragment = signal.replace('URL contains ', '');
+      return (currentPageState?.url || '').includes(fragment);
+    }
+    return false; // Unknown signal type — don't block on it
+  });
+}
+
 async function runExplorationLoop(explorePlan, tabId, token, resumeState = null, continuationContext = null) {
   const { goal, strategy, maxSteps, creditBudget, startAction } = explorePlan;
 
@@ -3043,7 +3073,27 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
   let creditsUsed = resumeState?.creditsUsed || 0;
   let currentTabId = resumeState?.tabId || tabId;
   let consecutiveFailures = resumeState?.consecutiveFailures || 0;
+  let consecutiveScrapeDecisions = 0; // circuit breaker: counts consecutive AI-initiated scrape_page decisions
   const startStep = resumeState?.nextStep || 1;
+
+  // ── Structured step tracking state (multi-step mode) ──
+  let isStructuredMode = false;
+  let structuredSteps = null;
+  let currentStepIndex = 0;
+  let stepAttemptCount = 0;
+  let stepStartTime = null;
+  let structuredData = {};
+  const MAX_ATTEMPTS_PER_STEP = 5;
+  const STEP_TIMEOUT_MS = 45000; // 45 seconds per step
+
+  // Restore structured mode from continuation context (phase transitions)
+  if (continuationContext?.remainingSteps?.length > 0) {
+    isStructuredMode = true;
+    structuredSteps = continuationContext.remainingSteps;
+    structuredData = continuationContext.structuredData || {};
+    stepStartTime = Date.now();
+    console.log(`[Explore] Phase continuation: resuming structured mode with ${structuredSteps.length} remaining steps`);
+  }
 
   // Auto-continuation context
   const currentPhase = continuationContext?.phase || 1;
@@ -3184,6 +3234,13 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
             currentPageState: planSnapshot,
             previousPhases: previousPhases.length > 0 ? previousPhases : undefined,
             originalPrompt: originalPrompt || undefined,
+            isMultiStep: explorePlan.isMultiStep || undefined,
+            // Structured mode refinement context (phase transitions)
+            ...(isStructuredMode && structuredSteps ? {
+              isRefinement: true,
+              completedSteps: structuredSteps.slice(0, currentStepIndex),
+              remainingSteps: structuredSteps.slice(currentStepIndex),
+            } : {}),
             ...byokPayload(planByokConfig),
           });
 
@@ -3209,6 +3266,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
 
           if (planRes.ok) {
             const planData = await planRes.json();
+            console.log(`[Explore] ★ PLANNER RESPONSE: hasSteps=${!!(planData.steps && planData.steps.length)} | stepsCount=${planData.steps?.length || 0} | hasStrategy=${!!(planData.strategy && planData.strategy.length > 10)} | hasInstantAnswer=${!!planData.instantAnswer} | maxSteps=${planData.maxSteps}`);
 
             // ── INSTANT ANSWER: planner determined answer is already on the page ──
             // Skip the entire exploration loop — return the answer directly.
@@ -3231,6 +3289,15 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
                 creditsUsed,
                 stepLog,
               });
+            }
+
+            // ── Detect structured mode from planner response ──
+            // Source of truth: actual planner output (steps array), NOT the isMultiStep hint.
+            if (planData.steps && Array.isArray(planData.steps) && planData.steps.length > 0) {
+              isStructuredMode = true;
+              structuredSteps = planData.steps;
+              stepStartTime = Date.now();
+              console.log(`[Explore] STRUCTURED MODE activated: ${structuredSteps.length} steps — ${structuredSteps.map(s => `${s.id}:${s.goal.slice(0,40)}`).join(' → ')}`);
             }
 
             if (planData.strategy && planData.strategy.length > 10) {
@@ -3569,6 +3636,18 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           failedActions: failedActions.length > 0 ? failedActions : undefined,
           recentActionHistory: recentActionHistory.length > 0 ? recentActionHistory : undefined,
           completionHint: stepLog._completionHint || undefined,
+          // Structured step context (only in multi-step mode)
+          ...(isStructuredMode && structuredSteps ? {
+            currentStep: structuredSteps[currentStepIndex],
+            currentStepIndex,
+            totalStructuredSteps: structuredSteps.length,
+            nextStepPreview: structuredSteps[currentStepIndex + 1]?.goal || null,
+            structuredDataKeys: Object.keys(structuredData),
+            allSteps: structuredSteps.map((s, i) => ({
+              id: s.id, goal: s.goal,
+              status: i < currentStepIndex ? 'completed' : i === currentStepIndex ? 'current' : 'pending',
+            })),
+          } : {}),
           ...byokPayload(exploreByokConfig),
         };
 
@@ -3691,8 +3770,9 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           const lastType = lastEntry.action?.type;
           const lastTarget = lastEntry.action?.target;
 
-          if (lastSucceeded && lastType === currType && lastTarget === currTarget) {
+          if (!isStructuredMode && lastSucceeded && lastType === currType && lastTarget === currTarget) {
             // Exact same action+target after success — very likely the goal is done
+            // (Disabled in structured mode — step advancement system handles completion)
             // Check if there's a completion hint already detected
             if (stepLog._completionHint) {
               console.warn(`[Explore] Step ${step}: SUCCESS-THEN-REPEAT detected: ${currType}(${currTarget}) after success + completion hint. Forcing goal completion check.`);
@@ -4045,6 +4125,90 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         }
       }
 
+      // ── STRUCTURED MODE: Capture structuredOutput and check step advancement ──
+      if (isStructuredMode && structuredSteps && decision) {
+        // Capture structuredOutput from AI response (key-value data for machine signals)
+        if (decision.structuredOutput && typeof decision.structuredOutput === 'object' && decision.structuredOutput !== null) {
+          structuredData = { ...structuredData, ...decision.structuredOutput };
+          console.log(`[Explore] Step ${step}: structuredData updated — keys: [${Object.keys(structuredData).join(', ')}]`);
+        }
+
+        const currentStep = structuredSteps[currentStepIndex];
+        if (currentStep) {
+          const machineOk = checkMachineSignals(currentStep, snapshot, structuredData);
+          const aiDone = decision.stepCompleted === true || decision.stepStatus === 'completed';
+          const noAiSignals = !currentStep.successSignals?.ai?.length;
+
+          console.log(`[Explore] ★ STEP ${currentStepIndex + 1}/${structuredSteps.length} CHECK: machineOk=${machineOk} | aiDone=${aiDone} | noAiSignals=${noAiSignals} | stepAttempts=${stepAttemptCount} | structuredDataKeys=[${Object.keys(structuredData)}] | currentURL=${(snapshot?.url || '').slice(0, 80)} | stepGoal="${currentStep.goal.slice(0, 50)}"`);
+
+          // DUAL-SIGNAL: advance only when both agree (or no AI signals defined)
+          if (machineOk && (aiDone || noAiSignals)) {
+            // POST-CONDITION: verify declared outputs actually exist in structuredData
+            const missingOutputs = (currentStep.outputs || []).filter(k => structuredData[k] == null || structuredData[k] === '');
+            if (missingOutputs.length > 0) {
+              console.warn(`[Explore] Step ${currentStepIndex + 1}: signals pass but outputs missing: [${missingOutputs}] — not advancing`);
+              stepAttemptCount++;
+            } else {
+              console.log(`[Explore] Step ${currentStepIndex + 1}/${structuredSteps.length} COMPLETED: "${currentStep.goal}"`);
+              currentStepIndex++;
+              stepAttemptCount = 0;
+              stepStartTime = Date.now();
+              if (currentStepIndex >= structuredSteps.length) {
+                decision.isGoalComplete = true;
+                decision.goalResult = decision.goalResult || `All ${structuredSteps.length} steps completed successfully.`;
+              }
+            }
+          } else if (aiDone && !machineOk) {
+            // AI hallucinating completion — post-condition guard rejects
+            console.warn(`[Explore] Step ${currentStepIndex + 1}: AI says complete but machine signals FAIL — continuing step`);
+            stepAttemptCount++;
+          } else {
+            // Normal in-progress — check step-level timeout
+            if (stepStartTime && (Date.now() - stepStartTime) > STEP_TIMEOUT_MS) {
+              console.warn(`[Explore] Step ${currentStepIndex + 1} TIMEOUT (${STEP_TIMEOUT_MS}ms)`);
+              stepAttemptCount = MAX_ATTEMPTS_PER_STEP; // Force bailout
+            }
+          }
+
+          // Bailout logic: too many attempts on this step
+          if (stepAttemptCount >= MAX_ATTEMPTS_PER_STEP && currentStepIndex < structuredSteps.length) {
+            // Check if outputs already satisfied despite "failure"
+            const alreadySatisfied = (currentStep.outputs || []).every(k => structuredData[k] != null && structuredData[k] !== '');
+            if (alreadySatisfied) {
+              console.log(`[Explore] Step ${currentStepIndex + 1}: outputs already satisfied despite attempts — advancing`);
+              currentStepIndex++;
+              stepAttemptCount = 0;
+              stepStartTime = Date.now();
+            } else {
+              // Dependency-aware skip-or-stop
+              const futureNeedsThis = structuredSteps.slice(currentStepIndex + 1)
+                .some(s => (s.inputs || []).some(i => (currentStep.outputs || []).includes(i)));
+              if (futureNeedsThis) {
+                console.error(`[Explore] Step ${currentStepIndex + 1} STUCK — future steps depend on its outputs. Stopping.`);
+                decision.isGoalComplete = true;
+                decision.goalResult = `I got stuck on step ${currentStepIndex + 1}: "${currentStep.goal}". Future steps need data from this step, so I can't skip it.`;
+              } else {
+                console.warn(`[Explore] Step ${currentStepIndex + 1} STUCK — no dependencies, skipping to next step`);
+                currentStepIndex++;
+                stepAttemptCount = 0;
+                stepStartTime = Date.now();
+              }
+            }
+            // Check if all steps now complete after bailout advancement
+            if (currentStepIndex >= structuredSteps.length && !decision.isGoalComplete) {
+              decision.isGoalComplete = true;
+              decision.goalResult = decision.goalResult || `All ${structuredSteps.length} steps completed.`;
+            }
+          }
+
+          // Override premature goal completion: if AI sets isGoalComplete but we're not on the final step
+          if (decision.isGoalComplete && currentStepIndex < structuredSteps.length) {
+            console.warn(`[Explore] AI set isGoalComplete=true but only on step ${currentStepIndex + 1}/${structuredSteps.length} — overriding to false`);
+            decision.isGoalComplete = false;
+          }
+        }
+      }
+
       // Check if goal is complete
       if (decision.isGoalComplete) {
         await hudUpdate(currentTabId, `explore-${step}`, 'success', 'Goal achieved!');
@@ -4153,8 +4317,8 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         }
       }
 
-      // Update strategy if revised
-      if (decision.revisedStrategy) {
+      // Update strategy if revised (disabled in structured mode — step array is the authority)
+      if (decision.revisedStrategy && !isStructuredMode) {
         currentStrategy = decision.revisedStrategy;
       }
 
@@ -4179,6 +4343,31 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           (!decision.nextAction?.value || decision.nextAction?.value === '__USE_SCRATCHPAD__')) {
         decision.nextAction.value = dataBuffer || '';
         console.log(`[Explore] Step ${step}: paste_tsv — substituted scratchpad data (${(dataBuffer || '').length} chars)`);
+      }
+
+      // ── SCRAPE-PAGE LOOP CIRCUIT BREAKER ─────────────────────────────────────
+      // If the AI requests scrape_page 3+ consecutive times it is stuck in a defensive
+      // loop (stale-element history makes it think re-scanning helps). It does NOT help:
+      // takePageSnapshot() already runs at the top of every step, so element IDs are
+      // always fresh when the AI receives them. Stop here to prevent unbounded credit burn.
+      if (decision.nextAction.type === 'scrape_page') {
+        consecutiveScrapeDecisions++;
+      } else {
+        consecutiveScrapeDecisions = 0;
+      }
+      if (consecutiveScrapeDecisions >= 3) {
+        console.warn(`[Explore] Step ${step}: SCRAPE_LOOP — AI requested scrape_page ${consecutiveScrapeDecisions}× in a row. Stopping phase.`);
+        await hudUpdate(currentTabId, `explore-${step}`, 'error', 'Stuck re-scanning — stopping');
+        stepLog.push({
+          step,
+          action: { type: 'scrape_loop_break', description: `Consecutive scrape_page loop (${consecutiveScrapeDecisions}×)` },
+          result: { success: false, failureReason: 'SCRAPE_LOOP' },
+          observation: 'Agent requested scrape_page repeatedly without progress. Element IDs are already fresh each step via takePageSnapshot(). The page may need a different approach, a navigation to a new URL, or the task may be ambiguous.',
+        });
+        // Set consecutiveFailures ≥ 5 so stoppedDueToFailures=true after the loop,
+        // which prevents auto-continuation into additional phases.
+        consecutiveFailures = 5;
+        break;
       }
 
       // ── STALE SID GUARD: Verify target element exists in current snapshot ──
@@ -4226,6 +4415,31 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           observation: 'SPA navigation fired between snapshot and action. Element IDs were regenerated. Re-scanning page.',
         });
         continue; // loop back → takePageSnapshot() runs at top → fresh SIDs → new AI decision
+      }
+
+      // ── STEP-LOCK GUARDRAIL: Block actions that obviously belong to a future step ──
+      if (isStructuredMode && structuredSteps && decision.nextAction) {
+        const currentStep = structuredSteps[currentStepIndex];
+        if (currentStep) {
+          const goalText = (currentStep.goal || '').toLowerCase();
+          const actionDesc = (decision.nextAction.description || '').toLowerCase();
+          const isCreateStep = ['meeting', 'create', 'schedule', 'generate'].some(k => goalText.includes(k));
+          const isCommsAction = ['compose', 'send email', 'write email', 'email body', 'to field', 'recipient'].some(k => actionDesc.includes(k));
+          const isEmailStep = goalText.includes('email') || goalText.includes('compose') || goalText.includes('send');
+          const isMeetingAction = actionDesc.includes('new meeting') || actionDesc.includes('create meeting') || actionDesc.includes('schedule meeting');
+
+          if ((isCreateStep && isCommsAction) || (isEmailStep && isMeetingAction)) {
+            console.warn(`[Explore] Step ${step}: STEP-LOCK — blocked "${actionDesc}" during step "${currentStep.goal.slice(0, 50)}"`);
+            stepAttemptCount++;
+            stepLog.push({
+              step,
+              action: { type: 'step_lock', description: `Blocked cross-step action: ${decision.nextAction.type}` },
+              result: { success: false, failureReason: 'STEP_LOCK' },
+              observation: `Action "${actionDesc}" blocked — it belongs to a future step. Current step: "${currentStep.goal}".`,
+            });
+            continue;
+          }
+        }
       }
 
       // ── PRE-SWITCH CAPTURE: Save current page content before navigating away ──
@@ -4414,7 +4628,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         // The hint is passed to the next AI step call (Layer 1 STOP CHECK amplifies it).
         try {
           const postActionSnapshot = await takePageSnapshot(currentTabId);
-          const hint = detectGoalCompletionSignals(goal, preActionSnapshot, postActionSnapshot, decision.nextAction);
+          const hint = isStructuredMode ? null : detectGoalCompletionSignals(goal, preActionSnapshot, postActionSnapshot, decision.nextAction);
           if (hint) {
             // Store hint — it will be sent with the next explore-step API call
             stepLog._completionHint = hint;
@@ -4579,7 +4793,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
     // Before auto-continuing, check if the phase's step log contains evidence
     // that the goal was already achieved (even though isGoalComplete was never set).
     // This prevents wasting entire phases on goals that were done mid-phase.
-    if (!stoppedDueToFailures && phaseContainsCompletionEvidence(stepLog, goal)) {
+    if (!stoppedDueToFailures && !isStructuredMode && phaseContainsCompletionEvidence(stepLog, goal)) {
       console.log('[Explore] LAYER 4 GATE: Phase contains completion evidence — NOT auto-continuing.');
       cleanupLoop();
       const successObservations = stepLog
@@ -4628,6 +4842,12 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         originalPrompt: originalPrompt || goal,
         totalSteps: newTotalSteps,
         dataBuffer: dataBuffer || undefined,
+        // Structured mode: carry remaining steps and data across phases
+        ...(isStructuredMode && structuredSteps ? {
+          remainingSteps: structuredSteps.slice(currentStepIndex),
+          completedSteps: structuredSteps.slice(0, currentStepIndex),
+          structuredData,
+        } : {}),
       };
 
       // Brief pause between phases
@@ -4734,6 +4954,17 @@ async function stageAction(tabId, userGoal, category, token) {
 
   // Step 2: Send to parse-intent in fill_form mode
   await hudUpdate(tabId, 'analyze', 'processing');
+
+  // Fetch Tier 1 memory so the AI knows who to fill the form for.
+  // Converts [{ key, value }] array to a flat { name, email, ... } object.
+  const memory = await getOrRefreshMemory().catch(() => null);
+  const userProfile = {};
+  if (memory?.tier1 && Array.isArray(memory.tier1)) {
+    for (const fact of memory.tier1) {
+      if (fact.key && fact.value != null) userProfile[fact.key] = fact.value;
+    }
+  }
+
   const fillByokConfig = await getByokConfig();
   const parseRes = await fetch(`${API_BASE}/api/agent/parse-intent`, {
     method: 'POST',
@@ -4744,6 +4975,7 @@ async function stageAction(tabId, userGoal, category, token) {
       pageUrl: semanticMap.pageUrl,
       category: category || 'forms',
       mode: 'fill_form',
+      userProfile,
       ...byokPayload(fillByokConfig),
     }),
   });
@@ -4836,11 +5068,40 @@ async function stageAction(tabId, userGoal, category, token) {
     setTimeout(() => hudHide(tabId), 1500);
   }
 
+  // Step 5: Read-back verification — compare actual DOM values against intended
+  // Builds a per-field report so callers know exactly what landed vs what was asked.
+  const fillActions = resolvedActions.filter(a => a.action === 'fill_field');
+  let fillReport = [];
+  if (fillActions.length > 0) {
+    const readBack = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (fillSteps) => {
+        return fillSteps.map(step => {
+          const el = document.querySelector(step.selector);
+          if (!el) return { selector: step.selector, intended: step.value || '', actual: null, matched: false };
+          let actual;
+          if (el.isContentEditable) {
+            actual = (el.innerText || el.textContent || '').trim();
+          } else if (el.type === 'checkbox' || el.type === 'radio') {
+            actual = el.checked ? 'true' : 'false';
+          } else {
+            actual = (el.value || '').trim();
+          }
+          const intended = (step.value || '').trim();
+          return { selector: step.selector, intended, actual, matched: actual === intended };
+        });
+      },
+      args: [fillActions],
+    }).catch(() => null);
+    fillReport = readBack?.[0]?.result || [];
+  }
+
   return {
     success: allSuccess,
     results,
     actionsPlanned: actions.length,
     actionsExecuted: results.length,
+    fillReport,
     pageStateAfter,
   };
 }
@@ -5447,7 +5708,37 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   return true; // Keep message channel open for async response
 });
 
+// ── Personal-info signal detection ───────────────────────────────────────────
+// Returns true when the text likely contains personal information worth
+// harvesting into Tier 1 memory (name, phone, address, email, location move).
+function containsPersonalInfo(text) {
+  if (!text || text.length < 8) return false;
+  // 7-digit or 10-digit phone number patterns (e.g., 555-9876, 555-867-5309)
+  if (/\b\d{3}[-.\s]\d{4}\b|\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b/.test(text)) return true;
+  // "my [optional word] phone/email/address/number/name" — e.g. "my work phone", "my email"
+  if (/\bmy\s+(\w+\s+)?(phone|email|address|number|name|mobile|cell|city|location)\b/i.test(text)) return true;
+  // Location change signals — e.g. "just moved to Vancouver", "I live in London"
+  if (/\b(moved\s+to|just\s+moved|i\s+live\s+in|living\s+in|i'm\s+from|i\s+am\s+from)\b/i.test(text)) return true;
+  // Bare email address in text
+  if (/\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b/i.test(text)) return true;
+  return false;
+}
+
 async function handleMessage(request, sender) {
+
+  // ── DELEGATE AUTOFILL RELAY ──────────────────────────────────────────────────
+  // Content scripts (dashboard_bridge.js) can only sendMessage to the service worker
+  // in MV3 — they cannot reach extension pages (side panel) directly. This handler
+  // receives enh_delegate_autofill from the content script and re-sends it from the
+  // service worker, which CAN reach the side panel's onMessage listener.
+  if (request.type === 'enh_delegate_autofill') {
+    let relayed = false;
+    try {
+      await chrome.runtime.sendMessage({ type: 'enh_delegate_autofill', payload: request.payload });
+      relayed = true;
+    } catch { /* side panel not open — pendingDelegation in storage handles fallback */ }
+    return { success: true, ok: relayed };
+  }
 
   // ── CDP INSERT TEXT: Universal text insertion via Chrome DevTools Protocol ──
   // Used as Tier 3 fallback when DOM-based methods (execCommand, ClipboardEvent)
@@ -6329,11 +6620,15 @@ async function handleMessage(request, sender) {
     // If the user's request involves multiple sites (e.g., "search Amazon and email the link"),
     // ask the backend to decompose it and execute sub-tasks sequentially.
     if (!skipRecipeCheck) try {
+      const chainAbort = new AbortController();
+      const chainTimeout = setTimeout(() => chainAbort.abort(), 20000); // 20s safety net
       const chainPlanRes = await fetch(`${API_BASE}/api/agent/chain/plan`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({ userRequest: userPrompt, currentDomain: url ? new URL(url).hostname : null }),
+        signal: chainAbort.signal,
       });
+      clearTimeout(chainTimeout);
       const chainPlan = await chainPlanRes.json();
 
       // Ghost-chain guard (pre-loop): if a newer request arrived while we were
@@ -7041,6 +7336,18 @@ async function handleMessage(request, sender) {
       data = await res.json();
     } catch (parseErr) {
       return { success: false, errorType: 'PARSE_ERROR', error: 'Server returned invalid JSON.' };
+    }
+
+    // ── Chat-to-memory: harvest personal info from chat messages ─────────────
+    // Fire-and-forget — does not delay the AI response. The fetch() call itself
+    // is synchronous in terms of initiating the request, so the URL is captured
+    // by any fetch interceptor (e.g. tests) before this function returns.
+    if (containsPersonalInfo(userPrompt)) {
+      fetch(`${API_BASE}/api/memory/harvest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ source: 'chat', text: userPrompt }),
+      }).catch(() => {});
     }
 
     return { success: true, data };
@@ -8958,7 +9265,18 @@ chrome.action.onClicked.addListener(async (tab) => {
     await chrome.sidePanel.open({ windowId: tab.windowId });
   } catch (err) {
     console.warn('[Enhancivity] Side panel open failed:', err.message);
+    return;
   }
+
+  // If there is a pending delegation (user clicked Delegate on dashboard then opened panel),
+  // relay it to the panel after a short delay for sidepanel.js to finish initialising.
+  try {
+    const { pendingDelegation } = await chrome.storage.local.get('pendingDelegation');
+    if (pendingDelegation?.taskTitle) {
+      await new Promise(r => setTimeout(r, 600));
+      await chrome.runtime.sendMessage({ type: 'enh_delegate_autofill', payload: pendingDelegation });
+    }
+  } catch { /* panel not ready or no pending delegation */ }
 });
 
 // ══════════════════════════════════════════════════════════════

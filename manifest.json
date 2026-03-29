@@ -53,7 +53,8 @@
         "https://enhancivity.com/*",
         "https://*.enhancivity.com/*",
         "http://localhost:3001/*",
-        "http://localhost:3002/*"
+        "http://localhost:3002/*",
+        "http://localhost:3099/*"
       ],
       "js": [
         "dashboard_bridge.js"

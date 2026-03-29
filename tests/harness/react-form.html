@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Controlled Input Form — Enhancivity Test Harness</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #6366f1; font-size: 18px; }
+    label { display: block; margin-top: 16px; font-size: 13px; color: #a5b4fc; }
+    input, textarea { display: block; width: 100%; padding: 10px; margin-top: 4px; border: 1px solid #333; border-radius: 6px; background: #12121a; color: #e0e0e0; font-size: 14px; box-sizing: border-box; }
+    .hint { font-size: 11px; color: #6b7280; margin-top: 2px; }
+    #state-display { margin-top: 20px; padding: 12px; background: #0a0a14; border-radius: 6px; border: 1px solid #222; font-size: 12px; font-family: monospace; color: #a5b4fc; }
+  </style>
+</head>
+<body>
+  <h1>Controlled Input Form (React-style)</h1>
+  <p class="hint">
+    The "Controlled Name" input simulates a React controlled component: its value setter is
+    overridden so that <code>el.value = X</code> does NOT update the displayed value (React
+    reconciliation pattern). Only the nativeSetter from HTMLInputElement.prototype bypasses it.
+    The "Plain Name" input is a standard bare input for comparison.
+  </p>
+
+  <label for="controlled-name">Controlled Name (React-style)</label>
+  <input
+    type="text"
+    id="controlled-name"
+    name="controlledName"
+    placeholder="React-controlled — direct assignment rejected"
+    aria-label="Controlled Name"
+    role="textbox"
+  />
+
+  <label for="plain-name">Plain Name (bare HTML)</label>
+  <input
+    type="text"
+    id="plain-name"
+    name="plainName"
+    placeholder="Bare input — direct assignment accepted"
+    aria-label="Plain Name"
+    role="textbox"
+  />
+
+  <label for="validated-phone">Phone (digits only, validated)</label>
+  <input
+    type="tel"
+    id="validated-phone"
+    name="validatedPhone"
+    placeholder="Digits only — letters stripped by validator"
+    aria-label="Phone"
+    maxlength="10"
+  />
+
+  <label for="email">Email</label>
+  <input
+    type="email"
+    id="email"
+    name="email"
+    placeholder="Email address"
+    aria-label="Email"
+  />
+
+  <div id="state-display">React state: <span id="react-state-value">(empty)</span></div>
+
+  <script>
+    'use strict';
+
+    // ── Controlled input: override the value property descriptor ──────────────
+    // This simulates how React wraps the native input's value setter.
+    // When code does `el.value = X`:
+    //   - Our overridden setter intercepts it
+    //   - It updates `reactState` (React's internal state)
+    //   - But does NOT update the DOM display (React would re-render asynchronously)
+    //   - Result: the visible input remains empty until a re-render copies reactState back
+    //
+    // The content_actions.js fill_field does:  el.value = X  →  rejected by our setter
+    // The content_explore.js type_text does:   nativeSetter.call(el, X)  →  bypasses, works
+    //
+    // After the DOM value is set via nativeSetter, the InputEvent with
+    // inputType:'insertText' causes our listener to sync reactState from the DOM.
+
+    const controlledInput = document.getElementById('controlled-name');
+    const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    const nativeGetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').get;
+
+    let reactState = '';
+
+    // Override the value descriptor on this specific element instance
+    Object.defineProperty(controlledInput, 'value', {
+      get() {
+        return nativeGetter.call(this);
+      },
+      set(newVal) {
+        // React's reconciliation: record the new desired value in internal state
+        // but do NOT push it to the DOM (that happens on re-render).
+        // This means a direct `el.value = X` appears to "work" (no error thrown)
+        // but the DOM stays unchanged until React re-renders.
+        reactState = String(newVal);
+        // React re-render simulation: we do NOT call nativeSetter here.
+        // The displayed value stays as whatever it was before.
+      },
+      configurable: true,
+    });
+
+    // When an InputEvent with real data arrives (nativeSetter was used externally),
+    // sync reactState from the actual DOM value (the nativeSetter path).
+    controlledInput.addEventListener('input', function(e) {
+      if (e.inputType === 'insertText' || e.inputType === 'insertFromPaste') {
+        // nativeSetter was used — update reactState from what actually landed in DOM
+        reactState = nativeGetter.call(this);
+        document.getElementById('react-state-value').textContent = reactState || '(empty)';
+      }
+    });
+
+    // Expose internal state for test verification
+    window.getReactState   = () => reactState;
+    window.getDomValue     = () => nativeGetter.call(controlledInput);
+    window.getNativeSetter = () => nativeSetter;
+
+    // ── Phone input: digits-only validator (simulates input mask) ─────────────
+    const phoneInput = document.getElementById('validated-phone');
+    phoneInput.addEventListener('input', function() {
+      // Strip non-digits — simulates a real phone mask
+      const clean = this.value.replace(/\D/g, '');
+      if (clean !== this.value) {
+        nativeSetter.call(this, clean);
+        this.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: clean }));
+      }
+    });
+  </script>
+</body>
+</html>

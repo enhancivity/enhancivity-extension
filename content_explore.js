@@ -1141,6 +1141,29 @@
         value = truncated;
       }
 
+      // ── INTERACTION ENGINE (if loaded) ──
+      // The Universal Interaction Engine handles React, Vue, Angular, dropdowns,
+      // autocomplete, masked inputs, and contenteditable with better strategies
+      // than the legacy 5-tier cascade. If available, use it and return early.
+      // If not loaded, fall through to the existing code unchanged.
+      if (window.__enhInteractionEngine && typeof window.__enhInteractionEngine.fillField === 'function') {
+        console.log('[type_text] Interaction Engine detected — using fillField()');
+        try {
+          const engineResult = await window.__enhInteractionEngine.fillField(el, value);
+          const origOutline = el.style.outline;
+          el.style.outline = engineResult.success ? '2px solid #6366f1' : '2px solid #ef4444';
+          setTimeout(() => { el.style.outline = origOutline; }, 2000);
+          return {
+            success: engineResult.success,
+            observation: engineResult.success
+              ? `Typed "${value.slice(0, 80)}" into ${el.tagName.toLowerCase()} (InteractionEngine)`
+              : `FAILED to type via InteractionEngine: ${engineResult.reason || 'unknown'}. The content was: "${value.slice(0, 120)}"`,
+          };
+        } catch (engineErr) {
+          console.log('[type_text] InteractionEngine threw:', engineErr.message, '— falling through to legacy cascade');
+        }
+      }
+
       // Focus the element
       el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       el.focus();
@@ -2327,7 +2350,14 @@
       };
     },
 
-    take_snapshot() {
+    async take_snapshot() {
+      // Wait for page stability before capturing snapshot (avoids spinner/loading states)
+      if (window.__enhInteractionEngine && typeof window.__enhInteractionEngine.waitForPageStable === 'function') {
+        try {
+          await window.__enhInteractionEngine.waitForPageStable({ timeout: 3000, quietPeriod: 300 });
+        } catch (_) {} // Non-fatal — proceed with snapshot even if stability wait fails
+      }
+
       // Build a compact semantic map
       // Increased to 100 to capture dropdown/menu items that appear after clicks
       const MAX_ELEMENTS = 100;

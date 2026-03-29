@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Interaction Engine — Fill Test Harness</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    .section { margin-bottom: 20px; padding: 12px; border: 1px solid #ccc; border-radius: 6px; }
+    h2 { margin-top: 0; font-size: 14px; color: #666; }
+    label { display: block; margin-bottom: 6px; font-size: 13px; }
+    input, textarea, select { display: block; margin-bottom: 8px; padding: 6px; width: 280px; }
+    .custom-dropdown-options {
+      display: none; position: absolute; background: white;
+      border: 1px solid #ccc; z-index: 100; list-style: none;
+      padding: 0; margin: 4px 0 0; min-width: 200px;
+    }
+    .custom-dropdown-options.open { display: block; }
+    .custom-dropdown-options li { padding: 8px 12px; cursor: pointer; }
+    .custom-dropdown-options li:hover { background: #f0f0f0; }
+    .form-group { margin-bottom: 12px; }
+    .error-message { color: red; font-size: 12px; display: none; }
+  </style>
+</head>
+<body>
+
+  <h1>Fill Test Harness</h1>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- NATIVE INPUT                                        -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>Native Inputs</h2>
+    <input id="native-text" type="text" placeholder="Native text input">
+    <textarea id="native-textarea" placeholder="Native textarea"></textarea>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- REACT CONTROLLED INPUT                              -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>React Controlled Input</h2>
+    <input id="react-controlled" type="text" placeholder="React controlled">
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- CONTENTEDITABLE                                     -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>ContentEditable</h2>
+    <div id="generic-editable" contenteditable="true"
+         style="border:1px solid #ccc; padding:8px; min-height:40px; width:280px;"></div>
+    <div class="ProseMirror" style="margin-top:8px;">
+      <div id="prosemirror-editable" contenteditable="true"
+           style="border:1px solid #ccc; padding:8px; min-height:40px; width:280px;"></div>
+    </div>
+    <div class="DraftEditor-root" style="margin-top:8px;">
+      <div id="draftjs-editable" contenteditable="true"
+           style="border:1px solid #ccc; padding:8px; min-height:40px; width:280px;"></div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- NATIVE SELECT                                       -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>Native Select</h2>
+    <select id="native-select">
+      <option value="">-- Choose --</option>
+      <option value="us">United States</option>
+      <option value="uk">United Kingdom</option>
+      <option value="de">Germany</option>
+      <option value="fr">France</option>
+    </select>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- CUSTOM DROPDOWN (MUI-style)                         -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>Custom Dropdown</h2>
+    <div id="custom-dropdown-trigger" role="combobox" aria-haspopup="listbox" aria-expanded="false" tabindex="0"
+         style="border:1px solid #999; padding:8px 12px; cursor:pointer; display:inline-block; min-width:200px; position:relative;">
+      <span id="dropdown-display">Select a size...</span>
+      <ul id="dropdown-listbox" class="custom-dropdown-options" role="listbox">
+        <li role="option" data-value="s">Small</li>
+        <li role="option" data-value="m">Medium</li>
+        <li role="option" data-value="l">Large</li>
+        <li role="option" data-value="xl">Extra Large</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- DATE INPUTS                                         -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>Date Inputs</h2>
+    <input id="native-date" type="date">
+    <input id="native-time" type="time">
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- MASKED INPUT (phone)                                -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>Masked Input</h2>
+    <input id="masked-phone" type="tel" maxlength="14" placeholder="(XXX) XXX-XXXX">
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- VERIFICATION: field with validation error           -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <div class="section">
+    <h2>Verification — Validation Error</h2>
+    <div class="form-group" id="email-group">
+      <label for="email-validated">Email</label>
+      <input id="email-validated" type="email" placeholder="Enter email">
+      <div class="error-message" id="email-error">Please enter a valid email address</div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- HIDDEN INPUT (should be skipped)                    -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <input id="hidden-field" type="hidden" value="original">
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- Scripts: simulate React + dropdown behavior          -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <script>
+    // ── React simulation ──
+    // Simulates a React controlled input by:
+    // 1. Adding _valueTracker (React's internal change detection)
+    // 2. Overriding the value property descriptor (what React does)
+    // 3. Tracking state changes via a global
+    const reactInput = document.getElementById('react-controlled');
+    let reactState = '';
+
+    // Simulate React's _valueTracker
+    reactInput._valueTracker = {
+      _value: '',
+      getValue() { return this._value; },
+      setValue(v) { this._value = v; },
+    };
+    reactInput['__reactFiber$test123'] = { tag: 5 };
+
+    // Override the value property to simulate React's controlled behavior
+    // React replaces the native setter with its own that records the value
+    const nativeInputDescriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+    Object.defineProperty(reactInput, 'value', {
+      get() { return nativeInputDescriptor.get.call(this); },
+      set(v) {
+        // React's setter: update internal state + DOM
+        reactState = v;
+        nativeInputDescriptor.set.call(this, v);
+      },
+      configurable: true,
+    });
+
+    // Listen for input events (React's onChange handler)
+    reactInput.addEventListener('input', () => {
+      reactState = nativeInputDescriptor.get.call(reactInput);
+      reactInput._valueTracker.setValue(reactState);
+    });
+
+    // Expose state for test assertions
+    window.getReactState = () => reactState;
+    window.getDomValue = () => nativeInputDescriptor.get.call(reactInput);
+
+    // ── Custom dropdown behavior ──
+    const trigger = document.getElementById('custom-dropdown-trigger');
+    const listbox = document.getElementById('dropdown-listbox');
+    const display = document.getElementById('dropdown-display');
+
+    trigger.addEventListener('click', () => {
+      const isOpen = listbox.classList.contains('open');
+      listbox.classList.toggle('open');
+      trigger.setAttribute('aria-expanded', String(!isOpen));
+    });
+    listbox.querySelectorAll('[role="option"]').forEach(opt => {
+      opt.addEventListener('click', (e) => {
+        e.stopPropagation();
+        display.textContent = opt.textContent;
+        trigger.dataset.selectedValue = opt.dataset.value;
+        listbox.classList.remove('open');
+        trigger.setAttribute('aria-expanded', 'false');
+      });
+    });
+
+    // ── Email validation simulation ──
+    const emailInput = document.getElementById('email-validated');
+    const emailError = document.getElementById('email-error');
+    emailInput.addEventListener('blur', () => {
+      const val = emailInput.value;
+      if (val && !val.includes('@')) {
+        emailError.style.display = 'block';
+      } else {
+        emailError.style.display = 'none';
+      }
+    });
+  </script>
+
+</body>
+</html>
