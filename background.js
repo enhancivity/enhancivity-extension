@@ -4216,9 +4216,22 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
 
         cleanupLoop();
 
+        // Fire-and-forget: harvest EXPLORE outcome into 3-Tier Memory
+        const exploreGoalResult = decision.goalResult || 'Exploration complete.';
+        if (exploreGoalResult.length >= 20) {
+          fetch(`${API_BASE}/api/memory/signal`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            body: JSON.stringify({
+              signalType: 'explore_completion',
+              data: { goalResult: exploreGoalResult, userPrompt: originalPrompt || goal },
+            }),
+          }).catch(err => console.warn('[Explore] Completion harvest signal failed:', err.message));
+        }
+
         return finishExploration({
           success: true,
-          goalResult: decision.goalResult || 'Exploration complete.',
+          goalResult: exploreGoalResult,
           stepsUsed: step,
           creditsUsed,
           stepLog,
