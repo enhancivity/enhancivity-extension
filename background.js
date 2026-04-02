@@ -6662,6 +6662,15 @@ async function handleMessage(request, sender) {
         // Broadcast chain progress to all UI surfaces (panel, sidepanel, popup)
         function broadcastChainProgress(step, total, description, nextStep) {
           const payload = { type: 'chain_progress', data: { step, total, description, nextStep } };
+          chrome.storage.session.set({
+            replayActivity: {
+              active: true,
+              stepNumber: step,
+              totalSteps: total,
+              description,
+              source: 'chain',
+            },
+          }).catch(() => {});
           // Reach popup + sidepanel
           try { chrome.runtime.sendMessage(payload).catch(() => {}); } catch {}
           // Reach content scripts (panel)
@@ -7317,6 +7326,7 @@ async function handleMessage(request, sender) {
 
         // If all recipe sub-tasks succeeded, return the chain result
         if (chainSuccess) {
+          chrome.storage.session.remove('replayActivity').catch(() => {});
           const totalDuration = chainResults.reduce((sum, r) => sum + (r.duration || 0), 0);
           const recipesUsed = chainResults.filter(r => r.method === 'recipe_replay' && r.success).length;
           const awaitingActions = chainResults.filter(r => r.awaitingUserAction);
@@ -7340,10 +7350,12 @@ async function handleMessage(request, sender) {
           };
         }
         // If chain failed partway, fall through to AI for the remaining request
+        chrome.storage.session.remove('replayActivity').catch(() => {});
         console.log('[BG] Chain execution incomplete, falling through to AI');
       }
     } catch (chainErr) {
       // Non-critical — fall through to normal AI flow
+      chrome.storage.session.remove('replayActivity').catch(() => {});
       console.warn('[BG] Chain execution check failed (non-fatal):', chainErr.message);
     }
 
