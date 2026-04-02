@@ -41,6 +41,7 @@ let orchestrationListener = null;
 let explorationListener = null;
 let replayActivityListener = null;
 let conversationMessages = [];
+let activeThreadId = null;
 let lastUserPrompt = '';
 let primaryLoadingActive = false;
 let replayActivityState = null;
@@ -77,8 +78,34 @@ function truncateForDisplay(text, maxLen = 500) {
 
 let _navigationInFlight = false; // suppresses onActivated conversation reset during agent-initiated navigation
 
+const ACTIVE_THREAD_KEY = 'enhActiveThreadId';
+
 function convKey() {
   return currentTabId ? `enhConversation_${currentTabId}` : 'enhConversation_global';
+}
+
+function threadConvKey(threadId = activeThreadId) {
+  return threadId ? `enhConversation_thread_${threadId}` : null;
+}
+
+async function restoreActiveThreadId() {
+  try {
+    const stored = await chrome.storage.session.get([ACTIVE_THREAD_KEY]);
+    activeThreadId = stored[ACTIVE_THREAD_KEY] || null;
+  } catch {
+    activeThreadId = null;
+  }
+}
+
+async function setActiveThreadId(threadId) {
+  activeThreadId = threadId || null;
+  try {
+    if (activeThreadId) {
+      await chrome.storage.session.set({ [ACTIVE_THREAD_KEY]: activeThreadId });
+    } else {
+      await chrome.storage.session.remove(ACTIVE_THREAD_KEY);
+    }
+  } catch { /* non-critical */ }
 }
 
 async function saveConversation() {
@@ -88,8 +115,31 @@ async function saveConversation() {
       msgs = msgs.slice(2);
     }
     conversationMessages = msgs;
-    await chrome.storage.session.set({ [convKey()]: msgs });
+    const storagePayload = { [convKey()]: msgs };
+    const activeThreadConvKey = threadConvKey();
+    if (activeThreadConvKey) storagePayload[activeThreadConvKey] = msgs;
+    await chrome.storage.session.set(storagePayload);
   } catch { /* non-critical */ }
+}
+
+async function loadConversationForCurrentContext() {
+  try {
+    const keys = [convKey()];
+    const activeThreadConvKey = threadConvKey();
+    if (activeThreadConvKey) keys.push(activeThreadConvKey);
+    const stored = await chrome.storage.session.get(keys);
+    const enhConversation = stored[convKey()] || (activeThreadConvKey ? stored[activeThreadConvKey] : null);
+    if (enhConversation && enhConversation.length > 0) {
+      conversationMessages = enhConversation;
+      rebuildChatThread();
+      return;
+    }
+  } catch { /* non-critical */ }
+
+  conversationMessages = [];
+  resultsArea.innerHTML = '';
+  resultsArea.classList.add('hidden');
+  if (greeting) greeting.style.display = '';
 }
 
 function rebuildChatThread() {
@@ -310,6 +360,7 @@ async function init() {
 }
 
 async function initMainView() {
+  await restoreActiveThreadId();
   // Get current active tab
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -332,14 +383,7 @@ async function initMainView() {
   if (userApiKey) byokBadge.classList.remove('hidden');
 
   // Restore conversation
-  try {
-    const stored = await chrome.storage.session.get([convKey()]);
-    const enhConversation = stored[convKey()];
-    if (enhConversation && enhConversation.length > 0) {
-      conversationMessages = enhConversation;
-      rebuildChatThread();
-    }
-  } catch { /* non-critical */ }
+  await loadConversationForCurrentContext();
 
   // Check for active exploration
   try {
@@ -414,19 +458,7 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
     if (_navigationInFlight) return;
 
     // Switch conversation to new tab's conversation
-    try {
-      const stored = await chrome.storage.session.get([convKey()]);
-      const enhConversation = stored[convKey()];
-      if (enhConversation && enhConversation.length > 0) {
-        conversationMessages = enhConversation;
-        rebuildChatThread();
-      } else {
-        conversationMessages = [];
-        resultsArea.innerHTML = '';
-        resultsArea.classList.add('hidden');
-        if (greeting) greeting.style.display = '';
-      }
-    } catch { /* non-critical */ }
+    await loadConversationForCurrentContext();
   } catch { /* tab may not exist */ }
 });
 
@@ -503,6 +535,7 @@ async function handleSubmit() {
     availableTabs,
     conversationHistory: conversationMessages.slice(-10).map(m => ({ role: m.role, content: m.content })),
     siteHint,
+    threadId: activeThreadId,
   });
 
   // STAGE 3: Parse & Validate
@@ -513,6 +546,11 @@ async function handleSubmit() {
     const errLabel = res?.errorType ? `[${res.errorType}] ` : '';
     showError(errLabel + (res?.error || 'Something went wrong. Please try again.'));
     return;
+  }
+
+  if (res.data?.threadId && res.data.threadId !== activeThreadId) {
+    await setActiveThreadId(res.data.threadId);
+    await saveConversation();
   }
 
   const assistantContent = res.data?.primary_content || res.data?.headline || res.data?.message || 'Response received';
@@ -1391,6 +1429,7 @@ async function executeAction(container, btn, data) {
     const parseRes = await sendToBackground('process_request', {
       userPrompt: 'Extract all actionable tasks from the current page. For each task include title, description, dueDate (YYYY-MM-DD or null), and priority (HIGH/MEDIUM/LOW). Use EXTRACT_TASKS with a JSON array in primary_content.',
       tabId: currentTabId, url: currentTabUrl,
+      threadId: activeThreadId,
     });
     if (parseRes?.success && parseRes?.data) {
       container.innerHTML = '';
@@ -3513,13 +3552,18 @@ settingsBtn?.addEventListener('click', () => {
 $('#settings-back-btn')?.addEventListener('click', () => showView('#main-view'));
 
 newChatBtn?.addEventListener('click', async () => {
+  const activeThreadConversationKey = threadConvKey();
   conversationMessages = [];
   resultsArea.innerHTML = '';
   resultsArea.classList.add('hidden');
   if (greeting) greeting.style.display = '';
   mainError.textContent = '';
   loadingBar.classList.add('hidden');
+  await setActiveThreadId(null);
   try { await chrome.storage.session.remove(convKey()); } catch {}
+  if (activeThreadConversationKey) {
+    try { await chrome.storage.session.remove(activeThreadConversationKey); } catch {}
+  }
   // Clean up exploration state so it doesn't re-trigger
   try { await chrome.storage.session.remove(['explorationActive', 'explorationResult', 'explorationProgress']); } catch {}
   try { chrome.runtime.sendMessage({ type: 'explore_cancel' }).catch(() => {}); } catch {}
