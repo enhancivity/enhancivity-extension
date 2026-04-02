@@ -6825,9 +6825,7 @@ async function handleMessage(request, sender) {
               const targetDomain = subTask.domain.toLowerCase();
 
               // Check if we need to navigate (different domain family)
-              const currentFamily = currentHost.split('.').slice(-2, -1)[0] || currentHost;
-              const targetFamily = targetDomain.split('.').slice(-2, -1)[0] || targetDomain;
-              const needsNavigation = currentFamily !== targetFamily &&
+              const needsNavigation = currentHost !== targetDomain &&
                 !currentHost.includes(targetDomain) && !targetDomain.includes(currentHost);
 
               if (needsNavigation && currentTab) {
@@ -7149,6 +7147,36 @@ async function handleMessage(request, sender) {
               const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
               const currentUrl = currentTab?.url || `https://${subTask.domain}`;
 
+              // Deterministic compose path: if this chain step already resolved the
+              // recipient/body/subject and we're on Gmail, use the native compose
+              // helper instead of re-parsing the whole prompt through /agent/process.
+              if (
+                subTask.category === 'compose' &&
+                /mail\.google\.com/i.test(subTask.domain || '') &&
+                currentTab?.id &&
+                /mail\.google\.com/i.test(currentUrl) &&
+                (resolvedInputs.recipient || resolvedInputs.to) &&
+                (resolvedInputs.body || resolvedInputs.message || resolvedInputs.replyBody)
+              ) {
+                const composeResult = await handleMessage({
+                  type: 'gmail_compose',
+                  data: {
+                    tabId: currentTab.id,
+                    data: {
+                      to: resolvedInputs.recipient || resolvedInputs.to,
+                      subject: resolvedInputs.subject || '',
+                      body: resolvedInputs.body || resolvedInputs.message || resolvedInputs.replyBody || '',
+                    },
+                  },
+                }, {});
+
+                stepResult = {
+                  success: !!composeResult?.success,
+                  durationMs: 0,
+                  error: composeResult?.error || null,
+                };
+              } else {
+
               // Scrape page context for AI
               let aiPageContext = { url: currentUrl, siteHint: null };
               try {
@@ -7214,6 +7242,7 @@ async function handleMessage(request, sender) {
                 }
               } else {
                 stepResult = { success: false, error: 'AI reasoning failed for chain sub-task' };
+              }
               }
             } catch (aiErr) {
               stepResult = { success: false, error: `AI fallback error: ${aiErr.message}` };
