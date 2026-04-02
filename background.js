@@ -6279,7 +6279,7 @@ async function handleMessage(request, sender) {
   // now that recipe selection is automatic (no user choice UI).
   if (request.type === 'process_request' || request.type === 'process_request_skip_recipe') {
     const skipRecipeCheck = request.type === 'process_request_skip_recipe';
-    const { userPrompt, tabId, url, availableTabs, conversationHistory, siteHint } = request.data;
+    const { userPrompt, tabId, url, availableTabs, conversationHistory, siteHint, threadId } = request.data;
     // Capture generation number before any awaits. If a newer request arrives
     // while this one is awaiting (memory fetch, chain plan, etc.), the counter
     // advances and the old chain detects the mismatch and aborts.
@@ -7325,7 +7325,7 @@ async function handleMessage(request, sender) {
       res = await fetch(`${API_BASE}/api/agent/process`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ userPrompt, pageContext: { ...pageContext, siteHint: siteHint || null }, userMemory, conversationHistory: conversationHistory || [], ...byokPayload(byokConfig) })
+        body: JSON.stringify({ userPrompt, pageContext: { ...pageContext, siteHint: siteHint || null }, userMemory, conversationHistory: conversationHistory || [], threadId: threadId || null, ...byokPayload(byokConfig) })
       });
     } catch (fetchErr) {
       return { success: false, errorType: 'NETWORK_ERROR', error: `Cannot reach server: ${fetchErr.message}` };
