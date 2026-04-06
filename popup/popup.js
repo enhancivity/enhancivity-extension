@@ -27,16 +27,24 @@ const BADGE_CONFIG = {
 let currentTabId   = null;
 let currentTabUrl  = '';
 let currentSite    = 'general';
+let agentProgressListener = null;
 let replayActivityListener = null;
 let primaryLoadingActive = false;
+let agentProgressState = null;
 let replayActivityState = null;
+let activeMissionRunId = 0;
+const missionAbortResolvers = new Set();
 
 function getReplayActivityLabel(progress) {
   if (!progress?.active) return '';
   const stepNumber = Number(progress.stepNumber) || 0;
   const totalSteps = Number(progress.totalSteps) || 0;
   const prefix = stepNumber > 0 && totalSteps > 0 ? `Step ${stepNumber}/${totalSteps}: ` : '';
-  return `${prefix}${progress.description || 'Enhancivity is working...'}`;
+  const main = progress.description || 'Enhancivity is working...';
+  if (progress.source === 'chain' && progress.nextStep) {
+    return `${prefix}${main}. Next: ${progress.nextStep}`;
+  }
+  return `${prefix}${main}`;
 }
 
 function syncLoadingBar() {
@@ -44,25 +52,135 @@ function syncLoadingBar() {
   const label = document.querySelector('.loading-label');
   const submitBtn = document.getElementById('submit-btn');
   const greeting = document.getElementById('chat-greeting');
-  const shouldShow = primaryLoadingActive || replayActivityState?.active;
+  const liveProgress = agentProgressState?.active ? agentProgressState : replayActivityState;
+  const shouldShow = primaryLoadingActive || liveProgress?.active;
 
   if (bar) bar.classList.toggle('hidden', !shouldShow);
   if (submitBtn) submitBtn.disabled = primaryLoadingActive;
 
-  if (!primaryLoadingActive && replayActivityState?.active) {
-    if (label) label.textContent = getReplayActivityLabel(replayActivityState);
+  if (!primaryLoadingActive && liveProgress?.active) {
+    if (label) label.textContent = getReplayActivityLabel(liveProgress);
     if (greeting) greeting.style.display = 'none';
   } else if (label) {
     label.textContent = 'Thinking with your memory...';
   }
 }
 
-function applyReplayActivity(progress) {
-  replayActivityState = progress?.active ? progress : null;
-  if (!primaryLoadingActive && !replayActivityState) {
+function applyAgentProgress(progress) {
+  agentProgressState = progress?.active ? progress : null;
+  if (!primaryLoadingActive && !agentProgressState && !replayActivityState) {
     setStage('');
   }
   syncLoadingBar();
+}
+
+function applyReplayActivity(progress) {
+  replayActivityState = progress?.active ? progress : null;
+  if (!primaryLoadingActive && !replayActivityState && !agentProgressState) {
+    setStage('');
+  }
+  syncLoadingBar();
+}
+
+function beginMissionRun() {
+  activeMissionRunId += 1;
+  return activeMissionRunId;
+}
+
+function isMissionRunActive(runId) {
+  return runId === activeMissionRunId;
+}
+
+function isSilentMissionStop(res) {
+  return Boolean(
+    !res?.success &&
+    res?.silent &&
+    (res?.errorType === 'REQUEST_SUPERSEDED' || res?.errorType === 'REQUEST_CANCELLED')
+  );
+}
+
+async function cancelActiveMissionUi() {
+  activeMissionRunId += 1;
+  const resolvers = Array.from(missionAbortResolvers);
+  missionAbortResolvers.clear();
+  for (const resolve of resolvers) {
+    try { resolve({ cancelled: true }); } catch {}
+  }
+  setLoading(false);
+  setStage('');
+  try {
+    await chrome.storage.session.remove(['agentProgress', 'replayActivity', 'explorationActive', 'explorationResult', 'explorationProgress']);
+  } catch {}
+  try {
+    await chrome.runtime.sendMessage({ type: 'explore_cancel' });
+  } catch {}
+}
+
+function waitForExplorationOutcome(runId, timeoutMs = 600000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeout = null;
+    let resultListener = null;
+
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      if (resultListener) chrome.storage.onChanged.removeListener(resultListener);
+      missionAbortResolvers.delete(abortResolver);
+    };
+
+    const finish = (value) => {
+      cleanup();
+      resolve(value);
+    };
+
+    const abortResolver = () => finish({ cancelled: true });
+    missionAbortResolvers.add(abortResolver);
+
+    timeout = setTimeout(() => finish({ success: false, error: 'Exploration timed out after 10 minutes.' }), timeoutMs);
+
+    resultListener = (changes, areaName) => {
+      if (!isMissionRunActive(runId)) {
+        finish({ cancelled: true });
+        return;
+      }
+      if (areaName !== 'session' || !changes.explorationResult) return;
+      finish(changes.explorationResult.newValue);
+    };
+    chrome.storage.onChanged.addListener(resultListener);
+
+    chrome.storage.session.get(['explorationResult']).then(data => {
+      if (!isMissionRunActive(runId)) {
+        finish({ cancelled: true });
+        return;
+      }
+      if (data.explorationResult) {
+        chrome.storage.session.remove(['explorationResult']).catch(() => {});
+        finish(data.explorationResult);
+      }
+    }).catch(() => {});
+  });
+}
+
+async function initAgentProgressListener() {
+  if (agentProgressListener) {
+    chrome.storage.onChanged.removeListener(agentProgressListener);
+  }
+
+  agentProgressListener = (changes, areaName) => {
+    if (areaName !== 'session' || !changes.agentProgress) return;
+    applyAgentProgress(changes.agentProgress.newValue);
+  };
+
+  chrome.storage.onChanged.addListener(agentProgressListener);
+
+  try {
+    const { agentProgress } = await chrome.storage.session.get(['agentProgress']);
+    applyAgentProgress(agentProgress || null);
+  } catch {
+    applyAgentProgress(null);
+  }
 }
 
 async function initReplayActivityListener() {
@@ -153,6 +271,7 @@ async function initMainView() {
   }
 
   applyContext(currentSite);
+  await initAgentProgressListener();
   await initReplayActivityListener();
 
   // Show memory indicator if memory is cached
@@ -230,6 +349,7 @@ async function handleSubmit() {
   const promptInput = document.getElementById('prompt-input');
   const userPrompt  = promptInput.value.trim();
   if (!userPrompt) return;
+  const runId = beginMissionRun();
   lastUserPrompt = userPrompt;
 
   // Hide greeting on first submit
@@ -247,6 +367,7 @@ async function handleSubmit() {
     if (triageRes?.success) availableTabs = triageRes.tabs;
     // Non-critical: proceed without tabs if triage fails
   } catch { /* proceed without tab context */ }
+  if (!isMissionRunActive(runId)) return;
 
   // ── STAGE 2: Backend AI Call ─────────────────────────────
   setStage('STAGE_BACKEND');
@@ -256,6 +377,7 @@ async function handleSubmit() {
     url:   currentTabUrl,
     availableTabs,
   });
+  if (!isMissionRunActive(runId) || isSilentMissionStop(res)) return;
 
   // ── STAGE 3: Parse & Validate ────────────────────────────
   setStage('STAGE_PARSING');
@@ -286,7 +408,7 @@ async function handleSubmit() {
 
   // EXPLORE: multi-step agentic exploration loop
   if (res.data?.action_type === 'EXPLORE' && res.data?.explore_plan) {
-    renderExplorePlan(res.data, res.data.consent_level === 'auto');
+    renderExplorePlan(res.data, res.data.consent_level === 'auto', runId);
     return;
   }
 
@@ -727,6 +849,45 @@ function renderTaskDraft(container, data) {
 
 // ── Auto-Execute (non-consequential actions run immediately) ──
 
+function isAuthSensitiveMissionPrompt(prompt = '') {
+  const lower = String(prompt || '').toLowerCase();
+  return (
+    /\b(my|latest|last|recent|current)\b/.test(lower) &&
+    /\b(order|orders|cart|purchase|billing|invoice|usage|rate limit|subscription|plan|account|settings|dashboard|profile|repo|repos)\b/.test(lower)
+  ) || (
+    /\b(check|show|see|view|open|find|access|what(?:'s| is)|tell me)\b/.test(lower) &&
+    /\b(order|orders|cart|purchase|billing|invoice|usage|rate limit|subscription|plan|account|settings|dashboard|profile|repo|repos)\b/.test(lower)
+  );
+}
+
+function isPlainNavigationPrompt(prompt = '') {
+  const lower = String(prompt || '').trim().toLowerCase();
+  return /^(?:please\s+)?(?:go to|open|visit|navigate to)\b/.test(lower) &&
+    !/\b(search|find|check|see|show|view|read|extract|latest|last|order|billing|usage|rate limit|settings|account|profile|dashboard|email|reply|compose)\b/.test(lower);
+}
+
+function getNavigationStatusText(prompt = '', data = {}) {
+  if (isPlainNavigationPrompt(prompt)) {
+    return { text: 'Done — page opened.', color: '#34d399' };
+  }
+  if (isAuthSensitiveMissionPrompt(prompt)) {
+    return {
+      text: 'Page opened — still need to verify the requested account data on site.',
+      color: '#fbbf24',
+    };
+  }
+  if (data.action_type === 'SEARCH_SITE') {
+    return {
+      text: 'Search page opened — results still need to be checked on site.',
+      color: '#fbbf24',
+    };
+  }
+  return {
+    text: 'Page opened — the on-site task may still need more steps.',
+    color: '#a5b4fc',
+  };
+}
+
 function renderAutoExecute(container, data) {
   const card = document.createElement('div');
   card.className = 'action-card';
@@ -754,8 +915,15 @@ function renderAutoExecute(container, data) {
   // Fire immediately — no user approval needed
   executeAutoAction(data).then(res => {
     if (res?.success) {
-      statusEl.textContent = 'Done.';
-      statusEl.style.color = '#34d399';
+      const isNavAction = data.action_type === 'NAVIGATE' || data.action_type === 'SEARCH_SITE' || (data.dom_actions?.[0]?.action === 'navigate');
+      if (isNavAction) {
+        const navStatus = getNavigationStatusText(lastUserPrompt, data);
+        statusEl.textContent = navStatus.text;
+        statusEl.style.color = navStatus.color;
+      } else {
+        statusEl.textContent = 'Done.';
+        statusEl.style.color = '#34d399';
+      }
     } else {
       const errorMsg = res?.error || 'Action failed.';
       statusEl.textContent = `Couldn't complete: ${errorMsg}`;
@@ -1067,7 +1235,7 @@ function renderOrchestratePlan(data, autoStart = true) {
 
 // ── EXPLORE: Render plan card + run exploration loop ────────
 
-function renderExplorePlan(data, autoStart = true) {
+function renderExplorePlan(data, autoStart = true, runId = activeMissionRunId) {
   const area = document.getElementById('results-area');
   area.innerHTML = '';
   area.classList.remove('hidden');
@@ -1123,7 +1291,9 @@ function renderExplorePlan(data, autoStart = true) {
     statusEl.textContent = 'Starting exploration...';
     card.appendChild(statusEl);
     area.appendChild(card);
-    setTimeout(() => startExploration(plan), 800);
+    setTimeout(() => {
+      if (isMissionRunActive(runId)) startExploration(plan, runId);
+    }, 800);
   } else {
     const btnRow = document.createElement('div');
     btnRow.className = 'action-btn-row';
@@ -1131,13 +1301,19 @@ function renderExplorePlan(data, autoStart = true) {
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'btn consent-btn-cancel';
     cancelBtn.textContent = 'Cancel';
-    cancelBtn.addEventListener('click', () => { area.innerHTML = ''; area.classList.add('hidden'); });
+    cancelBtn.addEventListener('click', async () => {
+      await cancelActiveMissionUi();
+      area.innerHTML = '';
+      area.classList.add('hidden');
+    });
     btnRow.appendChild(cancelBtn);
 
     const exploreBtn = document.createElement('button');
     exploreBtn.className = 'btn consent-btn-soft';
     exploreBtn.textContent = 'Explore Now';
-    exploreBtn.addEventListener('click', () => startExploration(plan));
+    exploreBtn.addEventListener('click', () => {
+      if (isMissionRunActive(runId)) startExploration(plan, runId);
+    });
     btnRow.appendChild(exploreBtn);
 
     card.appendChild(btnRow);
@@ -1147,7 +1323,8 @@ function renderExplorePlan(data, autoStart = true) {
 
 let explorationListener = null;
 
-async function startExploration(explorePlan) {
+async function startExploration(explorePlan, runId = activeMissionRunId) {
+  if (!isMissionRunActive(runId)) return;
   const area = document.getElementById('results-area');
   area.innerHTML = '';
 
@@ -1182,6 +1359,7 @@ async function startExploration(explorePlan) {
   }
 
   explorationListener = (changes) => {
+    if (!isMissionRunActive(runId)) return;
     if (!changes.explorationProgress) return;
     const progress = changes.explorationProgress.newValue;
     if (!progress) return;
@@ -1220,11 +1398,25 @@ async function startExploration(explorePlan) {
   // Get active tab
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   const tabId = tabs[0]?.id;
+  if (!isMissionRunActive(runId)) {
+    if (explorationListener) {
+      chrome.storage.onChanged.removeListener(explorationListener);
+      explorationListener = null;
+    }
+    return;
+  }
 
   const startRes = await chrome.runtime.sendMessage({
     type: 'explore_start',
     data: { explorePlan, tabId, userPrompt: explorePlan.goal },
   });
+  if (!isMissionRunActive(runId) || isSilentMissionStop(startRes)) {
+    if (explorationListener) {
+      chrome.storage.onChanged.removeListener(explorationListener);
+      explorationListener = null;
+    }
+    return;
+  }
 
   if (!startRes?.success && !startRes?.async) {
     chrome.storage.onChanged.removeListener(explorationListener);
@@ -1234,34 +1426,13 @@ async function startExploration(explorePlan) {
   }
 
   // Wait for the final result via chrome.storage.session
-  const res = await new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      resolve({ success: false, error: 'Exploration timed out after 10 minutes.' });
-    }, 600000);
-
-    const resultListener = (changes, areaName) => {
-      if (areaName !== 'session' || !changes.explorationResult) return;
-      clearTimeout(timeout);
-      chrome.storage.onChanged.removeListener(resultListener);
-      resolve(changes.explorationResult.newValue);
-    };
-    chrome.storage.onChanged.addListener(resultListener);
-
-    // Race condition guard
-    chrome.storage.session.get(['explorationResult']).then(data => {
-      if (data.explorationResult) {
-        clearTimeout(timeout);
-        chrome.storage.onChanged.removeListener(resultListener);
-        chrome.storage.session.remove(['explorationResult']).catch(() => {});
-        resolve(data.explorationResult);
-      }
-    }).catch(() => {});
-  });
+  const res = await waitForExplorationOutcome(runId);
 
   if (explorationListener) {
     chrome.storage.onChanged.removeListener(explorationListener);
     explorationListener = null;
   }
+  if (!isMissionRunActive(runId) || res?.cancelled) return;
 
   // Handle login pause — agent detected a login page and paused
   if (res?.paused) {
@@ -1656,8 +1827,8 @@ function sendToBackground(type, data, timeoutMs = PIPELINE_TIMEOUT_MS) {
 // ── Chain progress listener ──────────────────────────────────
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === 'chain_progress') {
-    const { step, total, description } = message.data || {};
-    setStage(`Chain ${step}/${total}: ${description}`);
+    const { step, total, description, nextStep } = message.data || {};
+    setStage(`Chain ${step}/${total}: ${description}${nextStep ? `. Next: ${nextStep}` : ''}`);
   }
 });
 
@@ -1669,7 +1840,7 @@ function showView(id) {
 function setLoading(on) {
   primaryLoadingActive = on;
   syncLoadingBar();
-  if (!on && !replayActivityState?.active) setStage(''); // Clear stage when loading stops
+  if (!on && !agentProgressState?.active && !replayActivityState?.active) setStage(''); // Clear stage when loading stops
 }
 
 // ── Stage Tracker: visual feedback during pipeline ───────────
@@ -1685,12 +1856,13 @@ function setStage(stage) {
   const label = document.querySelector('.loading-label');
   if (!label) return;
   if (!stage) {
-    label.textContent = replayActivityState?.active
-      ? getReplayActivityLabel(replayActivityState)
+    const liveProgress = agentProgressState?.active ? agentProgressState : replayActivityState;
+    label.textContent = liveProgress?.active
+      ? getReplayActivityLabel(liveProgress)
       : 'Thinking with your memory...';
     return;
   }
-  label.textContent = STAGE_LABELS[stage] || 'Thinking with your memory...';
+  label.textContent = STAGE_LABELS[stage] || stage;
 }
 
 function clearResults() {

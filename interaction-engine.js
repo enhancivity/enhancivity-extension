@@ -458,50 +458,170 @@
     const editorType = detectEditor(el);
     log('fillContentEditable', { editorType, valueLength: value.length });
 
+    // ── FORCE FOCUS: Click + mousedown/up + focus ──
+    // ProseMirror, Slate, and other editors require a real click sequence
+    // to place the cursor inside the editable region. .focus() alone is not enough.
+    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+    el.click();
     el.focus();
+    el.dispatchEvent(new Event('focus', { bubbles: true }));
     await sleep(50);
 
-    // Select all existing content
-    document.execCommand('selectAll', false, null);
+    // ── CLEAR existing content with element-scoped Range ──
+    // Use Range.selectNodeContents instead of document.execCommand('selectAll')
+    // to avoid selecting content outside the editor.
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    const existingText = (el.innerText || el.textContent || '').trim();
+    if (existingText) {
+      const clearRange = document.createRange();
+      clearRange.selectNodeContents(el);
+      sel.addRange(clearRange);
+      document.execCommand('delete', false, null);
+      sel.removeAllRanges();
+      await sleep(30);
+    }
+
+    // ── PLACE CURSOR at start (collapsed — ready for insertion) ──
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(true);
+    sel.addRange(range);
 
     // DraftJS: ignores execCommand in newer versions — must use keyboard simulation
     if (editorType === 'draftjs') {
-      document.execCommand('delete', false, null);
-      await sleep(50);
+      await sleep(30);
       return await typeHumanLike(el, value);
     }
 
-    // For ProseMirror, Slate, Quill, TinyMCE, Lexical, generic: execCommand first
-    const success = document.execCommand('insertText', false, value);
+    // ═══════════════════════════════════════════════
+    // TIER 1: execCommand('insertText')
+    // Works on: plain contentEditable, Lexical, some Slate
+    // ═══════════════════════════════════════════════
+    log('fillContentEditable', 'Tier 1: execCommand insertText');
+    try {
+      document.execCommand('insertText', false, value);
+    } catch (e) {
+      log('fillContentEditable', 'Tier 1 threw: ' + e.message);
+    }
     await sleep(100);
 
-    // Verify it actually worked
     let verifyResult = await verifyContentEditable(el, value);
-    if (verifyResult.success) return verifyResult;
-
-    // execCommand failed — try clipboard paste
-    log('fillContentEditable', 'execCommand failed — trying clipboard paste');
-    try {
-      document.execCommand('selectAll', false, null);
-      const dt = new DataTransfer();
-      dt.setData('text/plain', value);
-      const pasteEvent = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
-      Object.defineProperty(pasteEvent, 'clipboardData', { value: dt, writable: false, configurable: true });
-      el.dispatchEvent(pasteEvent);
-      await sleep(150);
-
-      verifyResult = await verifyContentEditable(el, value);
-      if (verifyResult.success) return verifyResult;
-    } catch (clipError) {
-      log('fillContentEditable', 'clipboard paste failed: ' + clipError.message);
+    if (verifyResult.success) {
+      await syncEditorState(el);
+      return verifyResult;
     }
 
-    // Last resort: keyboard simulation (slowest but most reliable)
-    log('fillContentEditable', 'falling back to keyboard simulation');
-    document.execCommand('selectAll', false, null);
-    document.execCommand('delete', false, null);
-    await sleep(50);
-    return await typeHumanLike(el, value);
+    // ═══════════════════════════════════════════════
+    // TIER 2: ClipboardEvent paste (enhanced for ProseMirror)
+    // Chrome ignores clipboardData in ClipboardEvent constructor —
+    // we must use Object.defineProperty to force it onto the event.
+    // Also fires beforeinput(insertFromPaste) for modern ProseMirror.
+    // ═══════════════════════════════════════════════
+    log('fillContentEditable', 'Tier 2: ClipboardEvent paste');
+    try {
+      // Re-focus and place cursor
+      el.focus();
+      el.click();
+      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+      el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+      sel.removeAllRanges();
+      const r2 = document.createRange();
+      r2.selectNodeContents(el);
+      r2.collapse(false);
+      sel.addRange(r2);
+
+      // Build DataTransfer with both plain text and HTML
+      const dt = new DataTransfer();
+      dt.setData('text/plain', value);
+      dt.setData('text/html', `<p>${value.replace(/\n/g, '</p><p>')}</p>`);
+
+      // Create paste event and FORCE clipboardData onto it
+      const pasteEvent = new ClipboardEvent('paste', { bubbles: true, cancelable: true });
+      Object.defineProperty(pasteEvent, 'clipboardData', {
+        value: dt, writable: false, configurable: true,
+      });
+      el.dispatchEvent(pasteEvent);
+
+      // Also fire beforeinput with insertFromPaste — modern ProseMirror (2024+)
+      await sleep(50);
+      try {
+        el.dispatchEvent(new InputEvent('beforeinput', {
+          inputType: 'insertFromPaste', data: value, dataTransfer: dt,
+          bubbles: true, cancelable: true, composed: true,
+        }));
+        el.dispatchEvent(new InputEvent('input', {
+          inputType: 'insertFromPaste', data: value,
+          bubbles: true, cancelable: false, composed: true,
+        }));
+      } catch (e2) {
+        log('fillContentEditable', 'Tier 2 InputEvent failed (non-fatal): ' + e2.message);
+      }
+      await sleep(200);
+
+      verifyResult = await verifyContentEditable(el, value);
+      if (verifyResult.success) {
+        await syncEditorState(el);
+        return verifyResult;
+      }
+    } catch (clipError) {
+      log('fillContentEditable', 'Tier 2 clipboard paste failed: ' + clipError.message);
+    }
+
+    // ═══════════════════════════════════════════════
+    // TIER 3: Sequential keyboard simulation
+    // Slowest but most reliable — character by character with jitter.
+    // ═══════════════════════════════════════════════
+    log('fillContentEditable', 'Tier 3: keyboard simulation');
+    // Re-focus, clear, place cursor
+    el.focus();
+    el.click();
+    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    el.dispatchEvent(new Event('focus', { bubbles: true }));
+    sel.removeAllRanges();
+    const r3 = document.createRange();
+    r3.selectNodeContents(el);
+    r3.collapse(true);
+    sel.addRange(r3);
+    await sleep(30);
+
+    const kbResult = await typeHumanLike(el, value);
+    if (kbResult.success) {
+      await syncEditorState(el);
+    }
+    return kbResult;
+  }
+
+  /**
+   * ProseMirror state sync — forces the editor to reconcile its internal
+   * state with the visible DOM content. Without this, the Submit/Post button
+   * may stay grayed out even though text is visible.
+   * Technique: blur → refocus → type Space → Backspace (net zero change).
+   */
+  async function syncEditorState(el) {
+    if (!el.isContentEditable) return;
+    try {
+      el.blur();
+      await sleep(50);
+      el.focus();
+      el.click();
+      await sleep(50);
+
+      document.execCommand('insertText', false, ' ');
+      await sleep(30);
+      document.execCommand('delete', false, null);
+      await sleep(50);
+
+      // Fire a synthetic input event as a final nudge
+      el.dispatchEvent(new InputEvent('input', {
+        bubbles: true, inputType: 'insertText', data: '',
+      }));
+      log('syncEditorState', 'complete');
+    } catch (e) {
+      log('syncEditorState', 'failed (non-fatal): ' + e.message);
+    }
   }
 
   // ── 3e: selectDropdown ──────────────────────────────────────
@@ -774,14 +894,30 @@
    * Checks textContent/innerText — editors may add formatting.
    */
   async function verifyContentEditable(el, value) {
-    await sleep(100);
-    const content = (el.textContent || el.innerText || '').trim();
+    // ProseMirror and other editors need more time to update DOM after insertion
+    await sleep(500);
     const expected = value.trim();
+    const matchStr = expected.substring(0, Math.min(20, expected.length));
 
-    // Check if at least the first 20 chars match (editors may add formatting)
-    if (content.includes(expected.substring(0, Math.min(20, expected.length)))) {
-      return { success: true };
+    // Check direct textContent/innerText
+    let content = (el.textContent || el.innerText || '').trim();
+    if (content.includes(matchStr)) return { success: true };
+
+    // Check child nodes — ProseMirror renders inside <p>, <div>, <span> children
+    const children = el.querySelectorAll('p, div, span, [data-contents], [data-block]');
+    for (const child of children) {
+      const childText = (child.innerText || child.textContent || '').trim();
+      if (childText.includes(matchStr)) return { success: true };
     }
+
+    // Check parent container (for editors where text appears in a sibling)
+    const parent = el.closest('[role="textbox"], [contenteditable="true"], .editor, .ProseMirror, .ql-editor') || el.parentElement;
+    if (parent && parent !== el) {
+      const parentText = (parent.innerText || parent.textContent || '').trim();
+      if (parentText.includes(matchStr)) return { success: true };
+    }
+
+    log('verifyContentEditable', { reason: 'mismatch', expected: matchStr, actual: content.substring(0, 50) });
     return { success: false, reason: 'contenteditable_mismatch', actual: content.substring(0, 50) };
   }
 

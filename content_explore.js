@@ -58,6 +58,79 @@
       .toLowerCase();
   }
 
+  function parseTypeTextDirectives(rawValue) {
+    let text = String(rawValue ?? '');
+    let submitKey = null;
+    let working = text.trimEnd();
+
+    while (true) {
+      const markerMatch = working.match(/\s*\[(search|enter|submit)\]\s*$/i);
+      if (!markerMatch) break;
+      submitKey = 'Enter';
+      working = working.slice(0, markerMatch.index).trimEnd();
+    }
+
+    return {
+      text: working,
+      submitKey,
+    };
+  }
+
+  function dispatchKeySequence(target, keyInfo) {
+    if (!target || !keyInfo) return;
+    const eventInit = {
+      key: keyInfo.key,
+      code: keyInfo.code,
+      keyCode: keyInfo.keyCode,
+      which: keyInfo.keyCode,
+      bubbles: true,
+      cancelable: true,
+    };
+
+    target.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+    target.dispatchEvent(new KeyboardEvent('keypress', eventInit));
+    target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+  }
+
+  async function maybeSubmitTypedField(target, submitKey) {
+    if (!target || submitKey !== 'Enter') {
+      return { submitted: false, signal: null };
+    }
+
+    const ENTER_KEY = { key: 'Enter', code: 'Enter', keyCode: 13 };
+    try {
+      target.focus?.();
+      dispatchKeySequence(target, ENTER_KEY);
+
+      const form = target.form || target.closest?.('form') || null;
+      if (form && typeof form.requestSubmit === 'function') {
+        try {
+          form.requestSubmit();
+          await new Promise(resolve => setTimeout(resolve, 120));
+          return { submitted: true, signal: 'requestSubmit' };
+        } catch {}
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 120));
+      return { submitted: true, signal: 'enter-key' };
+    } catch (err) {
+      console.warn('[type_text] Submit marker handling failed:', err?.message || err);
+      return { submitted: false, signal: null };
+    }
+  }
+
+  async function finalizeTypeTextSuccess(target, submitKey, observation) {
+    const submitResult = await maybeSubmitTypedField(target, submitKey);
+    if (!submitResult.submitted) {
+      return { success: true, observation };
+    }
+
+    return {
+      success: true,
+      observation: `${observation}${submitResult.signal === 'requestSubmit' ? ' and submitted it' : ' and pressed Enter'}`,
+    };
+  }
+
   function readVerificationStateValue(element, attributeName, propertyName = null) {
     if (!element) return null;
 
@@ -99,6 +172,36 @@
     }
 
     return targetElement;
+  }
+
+  function isSearchLikeTypeTextTarget(targetElement) {
+    const resolvedTarget = resolveVerificationTargetElement({ type: 'type_text' }, targetElement);
+    if (!resolvedTarget) return false;
+
+    const role = String(resolvedTarget.getAttribute?.('role') || '').toLowerCase();
+    const type = String(resolvedTarget.getAttribute?.('type') || resolvedTarget.type || '').toLowerCase();
+    const metadata = [
+      resolvedTarget.getAttribute?.('aria-label'),
+      resolvedTarget.getAttribute?.('placeholder'),
+      resolvedTarget.getAttribute?.('name'),
+      resolvedTarget.getAttribute?.('id'),
+      resolvedTarget.getAttribute?.('title'),
+    ].filter(Boolean).join(' ').toLowerCase();
+
+    if (role === 'searchbox' || type === 'search') return true;
+    if (/\b(search|find|query|keyword|lookup)\b/.test(metadata)) return true;
+
+    const fieldName = String(resolvedTarget.getAttribute?.('name') || '').toLowerCase();
+    if (resolvedTarget.form && /^(q|k|s|query|search|keyword|term|field-keywords)$/i.test(fieldName)) {
+      return true;
+    }
+
+    return false;
+  }
+
+  function inferTypeTextSubmitKey(targetElement, explicitSubmitKey = null) {
+    if (explicitSubmitKey) return explicitSubmitKey;
+    return isSearchLikeTypeTextTarget(targetElement) ? 'Enter' : null;
   }
 
   function readVerificationTargetValue(action, targetElement) {
@@ -223,6 +326,16 @@
 
     if (action.type === 'type_text') {
       await new Promise(resolve => setTimeout(resolve, 150));
+
+      const afterUrl = window.location.href;
+      if (action.submitKey === 'Enter' && beforeState.url && afterUrl !== beforeState.url) {
+        return {
+          verified: true,
+          signal: 'submit-url-change',
+          beforeUrl: beforeState.url,
+          afterUrl,
+        };
+      }
 
       const expectedValue = String(action.value || '');
       const actualValue = readVerificationTargetValue(action, resolvedTarget);
@@ -896,7 +1009,7 @@
       return { success: true, observation: text || '(empty element)' };
     },
 
-    async type_text({ target, value }) {
+    async type_text({ target, value, submitKey }) {
       if (!target) return { success: false, error: 'No semantic ID provided for type_text' };
       if (!value) return { success: false, error: 'No text value provided to type' };
 
@@ -1497,11 +1610,17 @@
         el.style.outline = finalSet ? '2px solid #6366f1' : '2px solid #ef4444';
         setTimeout(() => { el.style.outline = origOutline; }, 1500);
 
+        if (finalSet) {
+          return finalizeTypeTextSuccess(
+            el,
+            submitKey,
+            `Typed "${value.slice(0, 80)}" into ${elTag.toLowerCase()}${el.placeholder ? ` (placeholder: "${el.placeholder}")` : ''}${truncationWarning}`
+          );
+        }
+
         return {
-          success: finalSet,
-          observation: finalSet
-            ? `Typed "${value.slice(0, 80)}" into ${elTag.toLowerCase()}${el.placeholder ? ` (placeholder: "${el.placeholder}")` : ''}${truncationWarning}`
-            : `FAILED to type into ${elTag.toLowerCase()}. The field rejected all input methods (native setter, execCommand, keyboard simulation, CDP). Try click_element first to activate it, then retry type_text.`,
+          success: false,
+          observation: `FAILED to type into ${elTag.toLowerCase()}. The field rejected all input methods (native setter, execCommand, keyboard simulation, CDP). Try click_element first to activate it, then retry type_text.`,
         };
       }
 
@@ -1566,10 +1685,11 @@
           const origOutline = el.style.outline;
           el.style.outline = '2px solid #6366f1';
           setTimeout(() => { el.style.outline = origOutline; }, 2000);
-          return {
-            success: true,
-            observation: `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (execCommand)${truncWarn}`,
-          };
+          return finalizeTypeTextSuccess(
+            el,
+            submitKey,
+            `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (execCommand)${truncWarn}`
+          );
         }
 
         // ═══════════════════════════════════════════════════════════
@@ -1647,10 +1767,11 @@
           const origOutline = el.style.outline;
           el.style.outline = '2px solid #6366f1';
           setTimeout(() => { el.style.outline = origOutline; }, 2000);
-          return {
-            success: true,
-            observation: `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (ClipboardEvent paste)${truncWarn}`,
-          };
+          return finalizeTypeTextSuccess(
+            el,
+            submitKey,
+            `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (ClipboardEvent paste)${truncWarn}`
+          );
         }
 
         // ═══════════════════════════════════════════════════════════
@@ -1717,10 +1838,11 @@
           const origOutline = el.style.outline;
           el.style.outline = '2px solid #6366f1';
           setTimeout(() => { el.style.outline = origOutline; }, 2000);
-          return {
-            success: true,
-            observation: `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (CDP clipboard paste)${truncWarn}`,
-          };
+          return finalizeTypeTextSuccess(
+            el,
+            submitKey,
+            `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (CDP clipboard paste)${truncWarn}`
+          );
         }
 
         // ═══════════════════════════════════════════════════════════
@@ -1750,10 +1872,11 @@
           const origOutline = el.style.outline;
           el.style.outline = '2px solid #6366f1';
           setTimeout(() => { el.style.outline = origOutline; }, 2000);
-          return {
-            success: true,
-            observation: `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (keyboard simulation)${truncWarn}`,
-          };
+          return finalizeTypeTextSuccess(
+            el,
+            submitKey,
+            `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (keyboard simulation)${truncWarn}`
+          );
         }
 
         // ═══════════════════════════════════════════════════════════
@@ -1799,10 +1922,11 @@
           const origOutline = el.style.outline;
           el.style.outline = '2px solid #6366f1';
           setTimeout(() => { el.style.outline = origOutline; }, 2000);
-          return {
-            success: true,
-            observation: `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (CDP insertText)${truncWarn}`,
-          };
+          return finalizeTypeTextSuccess(
+            el,
+            submitKey,
+            `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (CDP insertText)${truncWarn}`
+          );
         }
 
         // ═══════════════════════════════════════════════════════════
@@ -1853,11 +1977,17 @@
         }
 
         const truncWarn = vResult.truncated ? ` WARNING: Browser truncated text to ${vResult.actualLength} chars (field has character limit).` : '';
+        if (vResult.found) {
+          return finalizeTypeTextSuccess(
+            el,
+            submitKey,
+            `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (CDP dispatchKeyEvent)${truncWarn}`
+          );
+        }
+
         return {
-          success: vResult.found,
-          observation: vResult.found
-            ? `Typed "${value.slice(0, 80)}" into contentEditable ${el.tagName.toLowerCase()} (CDP dispatchKeyEvent)${truncWarn}`
-            : `FAILED: Could not type into this ${el.tagName.toLowerCase()} element. All 5 tiers tried: execCommand, ClipboardEvent paste, keyboard simulation, CDP insertText, CDP dispatchKeyEvent. This editor may require manual text entry. The content was: "${value.slice(0, 120)}"`,
+          success: false,
+          observation: `FAILED: Could not type into this ${el.tagName.toLowerCase()} element. All 5 tiers tried: execCommand, ClipboardEvent paste, keyboard simulation, CDP insertText, CDP dispatchKeyEvent. This editor may require manual text entry. The content was: "${value.slice(0, 120)}"`,
         };
       }
 
@@ -1870,11 +2000,17 @@
         el.dispatchEvent(new Event('change', { bubbles: true }));
       }
       const fbValue = el.value || (el.innerText || '').trim();
+      if (fbValue.length > 0) {
+        return finalizeTypeTextSuccess(
+          el,
+          submitKey,
+          `Typed "${value.slice(0, 80)}" into ${el.tagName.toLowerCase()}`
+        );
+      }
+
       return {
-        success: fbValue.length > 0,
-        observation: fbValue.length > 0
-          ? `Typed "${value.slice(0, 80)}" into ${el.tagName.toLowerCase()}`
-          : `FAILED: Element ${el.tagName.toLowerCase()} (id="${el.id || ''}", sid="${target}") is not a recognized input type. Look for a different element in the semantic map.`,
+        success: false,
+        observation: `FAILED: Element ${el.tagName.toLowerCase()} (id="${el.id || ''}", sid="${target}") is not a recognized input type. Look for a different element in the semantic map.`,
       };
     },
 
@@ -2767,7 +2903,21 @@
             }
           } catch {}
         }
-        return modals;
+
+        const modalPriority = (el) => {
+          const role = (el.getAttribute('role') || '').toLowerCase();
+          if (el.getAttribute('aria-modal') === 'true' || role === 'dialog' || role === 'alertdialog') return 3;
+          if (role === 'menu' || role === 'listbox') return 2;
+          return 1;
+        };
+
+        const pruned = modals.filter(candidate => !modals.some(other => {
+          if (!other || other === candidate) return false;
+          if (!candidate.contains(other)) return false;
+          return modalPriority(other) > modalPriority(candidate);
+        }));
+
+        return pruned.length > 0 ? pruned : modals;
       }
 
       const openModals = findOpenModals();
@@ -3529,6 +3679,11 @@
       }
     }
 
+    const normalizedTypeText = actionType === 'type_text'
+      ? parseTypeTextDirectives(value)
+      : null;
+    const normalizedValue = normalizedTypeText ? normalizedTypeText.text : value;
+
     const handlerName = handlerMap[actionType] || actionType;
     const handler = EXPLORE_ACTIONS[handlerName];
 
@@ -3538,12 +3693,29 @@
     }
 
     // Capture before-state for verifiable actions (click, type, navigate)
-    const _actionObj = { type: actionType, target, value };
-    const _needsVerify = shouldVerifyActionResult(_actionObj);
+    const _baseActionObj = {
+      type: actionType,
+      target,
+      value: normalizedValue,
+      submitKey: normalizedTypeText?.submitKey || null,
+    };
+    const _needsVerify = shouldVerifyActionResult(_baseActionObj);
     const _targetEl = _needsVerify ? findBySid(target) : null;
+    const _resolvedSubmitKey = actionType === 'type_text'
+      ? inferTypeTextSubmitKey(_targetEl, normalizedTypeText?.submitKey || null)
+      : null;
+    const _actionObj = {
+      ..._baseActionObj,
+      submitKey: _resolvedSubmitKey,
+    };
     const _beforeState = _needsVerify ? captureActionBeforeState(_actionObj, _targetEl) : null;
 
-    const result = handler({ target, value, consentApproved });
+    const result = handler({
+      target,
+      value: normalizedValue,
+      consentApproved,
+      submitKey: _resolvedSubmitKey,
+    });
 
     // Handle async actions (type_text, wait, etc.)
     if (result instanceof Promise) {

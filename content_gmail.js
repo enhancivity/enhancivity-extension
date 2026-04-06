@@ -13,6 +13,113 @@ function escapeHtml(str) {
     .replace(/'/g, '&#039;');
 }
 
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isVisible(el) {
+  return !!(el && el.offsetParent !== null);
+}
+
+async function waitForElement(getter, timeoutMs = 6000, intervalMs = 100) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const el = getter();
+    if (el) return el;
+    await wait(intervalMs);
+  }
+  return null;
+}
+
+function setNativeValue(el, value) {
+  if (!el) return;
+  const prototype = el.tagName === 'TEXTAREA'
+    ? window.HTMLTextAreaElement?.prototype
+    : window.HTMLInputElement?.prototype;
+  const setter = prototype && Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+  if (setter) setter.call(el, value);
+  else el.value = value;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function setEditableText(el, value) {
+  if (!el) return;
+  el.focus();
+  const html = escapeHtml(value || '').replace(/\n/g, '<br>');
+  el.innerHTML = html;
+  el.dispatchEvent(new InputEvent('input', {
+    bubbles: true,
+    inputType: 'insertText',
+    data: value || '',
+  }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function dispatchKeySequence(target, keyInfo) {
+  if (!target || !keyInfo) return;
+  const eventInit = {
+    key: keyInfo.key,
+    code: keyInfo.code,
+    keyCode: keyInfo.keyCode,
+    which: keyInfo.keyCode,
+    bubbles: true,
+    cancelable: true,
+  };
+
+  target.dispatchEvent(new KeyboardEvent('keydown', eventInit));
+  target.dispatchEvent(new KeyboardEvent('keypress', eventInit));
+  target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
+}
+
+async function commitRecipientField(field) {
+  if (!field) return;
+  field.focus();
+  dispatchKeySequence(field, { key: 'Enter', code: 'Enter', keyCode: 13 });
+  await wait(150);
+}
+
+function getComposeDialog() {
+  const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'))
+    .filter(dialog => isVisible(dialog) && (
+      dialog.querySelector('input[name="subjectbox"]') ||
+      dialog.querySelector('div[aria-label="Message Body"], .Am.Al.editable[role="textbox"]')
+    ));
+  return dialogs[dialogs.length - 1] || null;
+}
+
+function getComposeButton() {
+  const selectors = [
+    '.T-I.T-I-KE.L3',
+    'div[role="button"][gh="cm"]',
+    'div[role="button"][data-tooltip*="Compose" i]',
+    'div[role="button"][aria-label*="Compose" i]',
+  ];
+  for (const selector of selectors) {
+    const button = Array.from(document.querySelectorAll(selector)).find(isVisible);
+    if (button) return button;
+  }
+  return null;
+}
+
+function getToField(dialog) {
+  const selectors = [
+    'input[aria-label*="To recipients" i]',
+    'textarea[aria-label*="To recipients" i]',
+    'input[aria-label*="Recipients" i]',
+    'textarea[aria-label*="Recipients" i]',
+    'div[aria-label*="To recipients" i] input',
+    'div[aria-label*="To recipients" i] textarea',
+    'input[name="to"]',
+    'textarea[name="to"]',
+  ];
+  for (const selector of selectors) {
+    const field = Array.from(dialog.querySelectorAll(selector)).find(isVisible);
+    if (field) return field;
+  }
+  return null;
+}
+
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
 
   // ── Gmail Compose: Fill compose window with AI draft ─────
@@ -86,49 +193,62 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
 async function handleGmailCompose(data) {
   const { to, subject, body } = data || {};
 
-  // Click Gmail's Compose button
-  const composeBtn = document.querySelector('.T-I.T-I-KE.L3');
+  let composeDialog = getComposeDialog();
+  const composeBtn = composeDialog ? null : getComposeButton();
   if (!composeBtn) {
-    return { success: false, error: 'Compose button not found. Are you on Gmail?' };
+    if (!composeDialog) {
+      return { success: false, error: 'Compose button not found. Are you on Gmail?' };
+    }
+  } else {
+    composeBtn.click();
   }
-  composeBtn.click();
-
-  // Wait for compose window to open
-  await new Promise(r => setTimeout(r, 1000));
+  composeDialog = composeDialog || await waitForElement(() => getComposeDialog());
+  if (!composeDialog) {
+    return { success: false, error: 'Compose window did not open in Gmail.' };
+  }
 
   // Fill To field
   if (to) {
-    const toField = document.querySelector('textarea[name="to"], input[name="to"]');
+    const toField = await waitForElement(() => getToField(composeDialog), 4000, 100);
     if (toField) {
       toField.focus();
-      toField.value = to;
-      toField.dispatchEvent(new Event('input', { bubbles: true }));
-      // Gmail needs a slight delay to process the To field
-      await new Promise(r => setTimeout(r, 200));
+      setNativeValue(toField, to);
+      await wait(150);
+      await commitRecipientField(toField);
+      await wait(150);
+      toField.blur();
+      await wait(150);
     }
   }
 
   // Fill Subject
   if (subject) {
-    const subjectField = document.querySelector('input[name="subjectbox"]');
+    const subjectField = await waitForElement(
+      () => Array.from(composeDialog.querySelectorAll('input[name="subjectbox"]')).find(isVisible),
+      4000,
+      100
+    );
     if (subjectField) {
       subjectField.focus();
-      subjectField.value = subject;
-      subjectField.dispatchEvent(new Event('input', { bubbles: true }));
+      setNativeValue(subjectField, subject);
     }
   }
 
   // Fill Body (contenteditable div)
   if (body) {
-    const bodyField = document.querySelector('.Am.Al.editable[role="textbox"]');
+    const bodyField = await waitForElement(
+      () => Array.from(composeDialog.querySelectorAll(
+        'div[aria-label="Message Body"], .Am.Al.editable[role="textbox"], [role="textbox"][contenteditable="true"]'
+      )).find(isVisible),
+      4000,
+      100
+    );
     if (bodyField) {
-      bodyField.focus();
-      bodyField.innerHTML = escapeHtml(body).replace(/\n/g, '<br>');
-      bodyField.dispatchEvent(new Event('input', { bubbles: true }));
+      setEditableText(bodyField, body);
     }
   }
 
-  return { success: true };
+  return { success: true, filled: { to: !!to, subject: !!subject, body: !!body } };
 }
 
 // ── Gmail Reply Handler ──────────────────────────────────────

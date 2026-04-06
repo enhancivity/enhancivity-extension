@@ -37,6 +37,7 @@ const STAGE_LABELS = {
 let currentTabId = null;
 let currentTabUrl = '';
 let currentSite = 'general';
+let agentProgressListener = null;
 let orchestrationListener = null;
 let explorationListener = null;
 let replayActivityListener = null;
@@ -44,7 +45,10 @@ let conversationMessages = [];
 let activeThreadId = null;
 let lastUserPrompt = '';
 let primaryLoadingActive = false;
+let agentProgressState = null;
 let replayActivityState = null;
+let activeMissionRunId = 0;
+const missionAbortResolvers = new Set();
 
 // ── DOM Refs ─────────────────────────────────────────────────
 
@@ -72,6 +76,87 @@ const newChatBtn   = $('#new-chat-btn');
 function truncateForDisplay(text, maxLen = 500) {
   if (!text || text.length <= maxLen) return text;
   return text.slice(0, maxLen) + '... [see full results]';
+}
+
+function beginMissionRun() {
+  activeMissionRunId += 1;
+  return activeMissionRunId;
+}
+
+function isMissionRunActive(runId) {
+  return runId === activeMissionRunId;
+}
+
+function isSilentMissionStop(res) {
+  return Boolean(
+    !res?.success &&
+    res?.silent &&
+    (res?.errorType === 'REQUEST_SUPERSEDED' || res?.errorType === 'REQUEST_CANCELLED')
+  );
+}
+
+async function cancelActiveMissionUi() {
+  activeMissionRunId += 1;
+  const resolvers = Array.from(missionAbortResolvers);
+  missionAbortResolvers.clear();
+  for (const resolve of resolvers) {
+    try { resolve({ cancelled: true }); } catch {}
+  }
+  setLoading(false);
+  setStage('');
+  try {
+    await chrome.storage.session.remove(['agentProgress', 'replayActivity', 'explorationActive', 'explorationResult', 'explorationProgress']);
+  } catch {}
+  try {
+    await chrome.runtime.sendMessage({ type: 'explore_cancel' });
+  } catch {}
+}
+
+function waitForExplorationOutcome(runId, timeoutMs = 600000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timeout = null;
+    let resultListener = null;
+
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      if (timeout) clearTimeout(timeout);
+      if (resultListener) chrome.storage.onChanged.removeListener(resultListener);
+      missionAbortResolvers.delete(abortResolver);
+    };
+
+    const finish = (value) => {
+      cleanup();
+      resolve(value);
+    };
+
+    const abortResolver = () => finish({ cancelled: true });
+    missionAbortResolvers.add(abortResolver);
+
+    timeout = setTimeout(() => finish({ success: false, error: 'Exploration timed out after 10 minutes.' }), timeoutMs);
+
+    resultListener = (changes, areaName) => {
+      if (!isMissionRunActive(runId)) {
+        finish({ cancelled: true });
+        return;
+      }
+      if (areaName !== 'session' || !changes.explorationResult) return;
+      finish(changes.explorationResult.newValue);
+    };
+    chrome.storage.onChanged.addListener(resultListener);
+
+    chrome.storage.session.get(['explorationResult']).then(data => {
+      if (!isMissionRunActive(runId)) {
+        finish({ cancelled: true });
+        return;
+      }
+      if (data.explorationResult) {
+        chrome.storage.session.remove(['explorationResult']).catch(() => {});
+        finish(data.explorationResult);
+      }
+    }).catch(() => {});
+  });
 }
 
 // ── Conversation Helpers ───────────────────────────────────────
@@ -235,29 +320,62 @@ function getReplayActivityLabel(progress) {
   const stepNumber = Number(progress.stepNumber) || 0;
   const totalSteps = Number(progress.totalSteps) || 0;
   const prefix = stepNumber > 0 && totalSteps > 0 ? `Step ${stepNumber}/${totalSteps}: ` : '';
-  return `${prefix}${progress.description || 'Enhancivity is working...'}`;
+  const main = progress.description || 'Enhancivity is working...';
+  if (progress.source === 'chain' && progress.nextStep) {
+    return `${prefix}${main}. Next: ${progress.nextStep}`;
+  }
+  return `${prefix}${main}`;
 }
 
 function syncLoadingBar() {
-  const shouldShow = primaryLoadingActive || replayActivityState?.active;
+  const liveProgress = agentProgressState?.active ? agentProgressState : replayActivityState;
+  const shouldShow = primaryLoadingActive || liveProgress?.active;
   loadingBar.classList.toggle('hidden', !shouldShow);
   submitBtn.disabled = primaryLoadingActive;
 
   const label = document.querySelector('.loading-label');
-  if (!primaryLoadingActive && replayActivityState?.active) {
-    if (label) label.textContent = getReplayActivityLabel(replayActivityState);
+  if (liveProgress?.active) {
+    if (label) label.textContent = getReplayActivityLabel(liveProgress);
     if (greeting) greeting.style.display = 'none';
   } else if (label) {
     label.textContent = STAGE_LABELS.STAGE_BACKEND;
   }
 }
 
-function applyReplayActivity(progress) {
-  replayActivityState = progress?.active ? progress : null;
-  if (!primaryLoadingActive && !replayActivityState) {
+function applyAgentProgress(progress) {
+  agentProgressState = progress?.active ? progress : null;
+  if (!primaryLoadingActive && !agentProgressState && !replayActivityState) {
     setStage('');
   }
   syncLoadingBar();
+}
+
+function applyReplayActivity(progress) {
+  replayActivityState = progress?.active ? progress : null;
+  if (!primaryLoadingActive && !replayActivityState && !agentProgressState) {
+    setStage('');
+  }
+  syncLoadingBar();
+}
+
+async function initAgentProgressListener() {
+  if (agentProgressListener) {
+    chrome.storage.onChanged.removeListener(agentProgressListener);
+  }
+
+  agentProgressListener = (changes, areaName) => {
+    if (areaName !== 'session' || !changes.agentProgress) return;
+    applyAgentProgress(changes.agentProgress.newValue);
+  };
+
+  chrome.storage.onChanged.addListener(agentProgressListener);
+
+  try {
+    const { agentProgress } = await chrome.storage.session.get(['agentProgress']);
+    applyAgentProgress(agentProgress || null);
+  } catch {
+    applyAgentProgress(null);
+  }
 }
 
 async function initReplayActivityListener() {
@@ -372,6 +490,7 @@ async function initMainView() {
 
   currentSite = detectSite(currentTabUrl);
   applyContext(currentSite);
+  await initAgentProgressListener();
   await initReplayActivityListener();
 
   // Memory indicator
@@ -495,6 +614,7 @@ submitBtn.addEventListener('click', () => handleSubmit());
 async function handleSubmit() {
   const userPrompt = promptInput.value.trim();
   if (!userPrompt) return;
+  const runId = beginMissionRun();
   lastUserPrompt = userPrompt;
 
   if (greeting) greeting.style.display = 'none';
@@ -523,8 +643,7 @@ async function handleSubmit() {
     const triageRes = await sendToBackground('GET_TAB_TRIAGE_MAP', {}, 5000);
     if (triageRes?.success) availableTabs = triageRes.tabs;
   } catch { /* proceed without tab context */ }
-
-  const siteHint = extractSiteHint(userPrompt);
+  if (!isMissionRunActive(runId)) return;
 
   // STAGE 2: Backend AI Call
   setStage('STAGE_BACKEND');
@@ -534,9 +653,9 @@ async function handleSubmit() {
     url: currentTabUrl,
     availableTabs,
     conversationHistory: conversationMessages.slice(-10).map(m => ({ role: m.role, content: m.content })),
-    siteHint,
     threadId: activeThreadId,
   });
+  if (!isMissionRunActive(runId) || isSilentMissionStop(res)) return;
 
   // STAGE 3: Parse & Validate
   setStage('STAGE_PARSING');
@@ -563,12 +682,12 @@ async function handleSubmit() {
   }
 
   if (res.data?.action_type === 'ORCHESTRATE' && res.data?.search_plan) {
-    renderOrchestratePlan(res.data, res.data.consent_level === 'auto');
+    renderOrchestratePlan(res.data, res.data.consent_level === 'auto', runId);
     return;
   }
 
   if (res.data?.action_type === 'EXPLORE' && res.data?.explore_plan) {
-    renderExplorePlan(res.data, res.data.consent_level === 'auto');
+    renderExplorePlan(res.data, res.data.consent_level === 'auto', runId);
     return;
   }
 
@@ -861,6 +980,28 @@ function renderResultsInto(container, data) {
       card.appendChild(metaEl);
     }
     container.appendChild(card);
+    return;
+  }
+
+  if ((data.action_type === 'RECIPE_REPLAY_COMPLETE' || data.action_type === 'CHAIN_EXECUTION_FAILED') &&
+      Array.isArray(data.chain_results) && data.chain_results.length > 0) {
+    const card = document.createElement('div');
+    card.className = 'action-card';
+    const headlineEl = document.createElement('p');
+    headlineEl.className = 'action-headline';
+    headlineEl.textContent = data.headline || (data.action_type === 'CHAIN_EXECUTION_FAILED' ? 'Mission needs attention' : 'Mission update');
+    card.appendChild(headlineEl);
+    const resultEl = document.createElement('div');
+    resultEl.className = 'action-rationale';
+    resultEl.style.whiteSpace = 'pre-wrap';
+    resultEl.textContent = truncateForDisplay(data.primary_content || 'Mission update received.');
+    card.appendChild(resultEl);
+    container.appendChild(card);
+    return;
+  }
+
+  if (data.action_type === 'COMPOSE_EMAIL') {
+    renderComposeEmail(container, data);
     return;
   }
 
@@ -1166,6 +1307,45 @@ function renderProductList(container, products) {
 
 // ── Auto-Execute ─────────────────────────────────────────────
 
+function isAuthSensitiveMissionPrompt(prompt = '') {
+  const lower = String(prompt || '').toLowerCase();
+  return (
+    /\b(my|latest|last|recent|current)\b/.test(lower) &&
+    /\b(order|orders|cart|purchase|billing|invoice|usage|rate limit|subscription|plan|account|settings|dashboard|profile|repo|repos)\b/.test(lower)
+  ) || (
+    /\b(check|show|see|view|open|find|access|what(?:'s| is)|tell me)\b/.test(lower) &&
+    /\b(order|orders|cart|purchase|billing|invoice|usage|rate limit|subscription|plan|account|settings|dashboard|profile|repo|repos)\b/.test(lower)
+  );
+}
+
+function isPlainNavigationPrompt(prompt = '') {
+  const lower = String(prompt || '').trim().toLowerCase();
+  return /^(?:please\s+)?(?:go to|open|visit|navigate to)\b/.test(lower) &&
+    !/\b(search|find|check|see|show|view|read|extract|latest|last|order|billing|usage|rate limit|settings|account|profile|dashboard|email|reply|compose)\b/.test(lower);
+}
+
+function getNavigationStatusMeta(prompt = '', data = {}) {
+  if (isPlainNavigationPrompt(prompt)) {
+    return { text: 'Done — page opened.', color: '#34d399' };
+  }
+  if (isAuthSensitiveMissionPrompt(prompt)) {
+    return {
+      text: 'Page opened — still need to verify the requested account data on site.',
+      color: '#fbbf24',
+    };
+  }
+  if (data.action_type === 'SEARCH_SITE') {
+    return {
+      text: 'Search page opened — results still need to be checked on site.',
+      color: '#fbbf24',
+    };
+  }
+  return {
+    text: 'Page opened — the on-site task may still need more steps.',
+    color: '#a5b4fc',
+  };
+}
+
 function renderAutoExecute(container, data) {
   const card = document.createElement('div');
   card.className = 'action-card';
@@ -1203,7 +1383,15 @@ function renderAutoExecute(container, data) {
         currentTabId = res.tabId;
       }
       if (isNavAction) {
-        statusEl.textContent = 'Done \u2014 page opened.';
+        const navStatus = getNavigationStatusMeta(lastUserPrompt, data);
+        statusEl.textContent = navStatus.text;
+        statusEl.style.color = navStatus.color;
+        return;
+      }
+      if (data.action_type === 'COMPOSE_EMAIL') {
+        if (res.tabId) currentTabId = res.tabId;
+        currentTabUrl = 'https://mail.google.com/mail/';
+        statusEl.textContent = 'Draft inserted in Gmail. Review and click Send manually.';
         statusEl.style.color = '#34d399';
         return;
       }
@@ -1239,9 +1427,189 @@ function renderAutoExecute(container, data) {
   });
 }
 
+function parseComposeObject(value) {
+  if (!value) return null;
+  if (typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function firstNonEmptyComposeString(...values) {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function extractFirstEmailAddress(text = '') {
+  const match = String(text || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return match ? match[0] : '';
+}
+
+function extractRecipientCandidate(value = '') {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const explicitEmail = extractFirstEmailAddress(text);
+  if (explicitEmail) return explicitEmail;
+  if (!/[\r\n]/.test(text) && text.length <= 120) return text;
+  return '';
+}
+
+function buildComposeEmailPayload(data) {
+  const composeData = {};
+  const primaryContentObject = parseComposeObject(data.primary_content) ||
+    (data.primary_content && typeof data.primary_content === 'object' && !Array.isArray(data.primary_content)
+      ? data.primary_content
+      : null);
+  const previewObject = parseComposeObject(data.preview?.details) ||
+    (data.preview?.details && typeof data.preview.details === 'object' ? data.preview.details : null);
+
+  for (const step of (data.dom_actions || [])) {
+    const selector = String(step.selector || '').toLowerCase();
+    const description = String(step.description || '');
+    const descriptionLower = description.toLowerCase();
+    const stepValueObject = parseComposeObject(step.value) ||
+      (step.value && typeof step.value === 'object' && !Array.isArray(step.value) ? step.value : null);
+    const rawValue = typeof step.value === 'string' ? step.value : '';
+    const inlineEmail = extractFirstEmailAddress(rawValue || description);
+
+    if (!composeData.to) {
+      if (selector.includes('to') || /recipient|to field|to address|email address/.test(descriptionLower)) {
+        composeData.to = extractRecipientCandidate(rawValue) ||
+          extractRecipientCandidate(stepValueObject?.to) ||
+          extractRecipientCandidate(stepValueObject?.recipient) ||
+          extractRecipientCandidate(stepValueObject?.email) ||
+          inlineEmail;
+      } else if (step.action === 'semantic_fill' && inlineEmail) {
+        composeData.to = inlineEmail;
+      }
+    }
+
+    if (!composeData.subject) {
+      if (selector.includes('subject') || /subject/.test(descriptionLower)) {
+        composeData.subject = firstNonEmptyComposeString(
+          rawValue,
+          stepValueObject?.subject,
+          stepValueObject?.title,
+          step.subject,
+        );
+      }
+    }
+
+    if (!composeData.body) {
+      if (selector.includes('body') || selector.includes('editable') || /body|message|draft|reply/.test(descriptionLower)) {
+        composeData.body = firstNonEmptyComposeString(
+          rawValue,
+          stepValueObject?.body,
+          stepValueObject?.message,
+          stepValueObject?.replyBody,
+          step.body,
+        );
+      }
+    }
+  }
+
+  composeData.to = composeData.to || firstNonEmptyComposeString(
+    extractRecipientCandidate(data.to),
+    extractRecipientCandidate(data.recipient),
+    extractRecipientCandidate(data.email),
+    extractRecipientCandidate(primaryContentObject?.to),
+    extractRecipientCandidate(primaryContentObject?.recipient),
+    extractRecipientCandidate(primaryContentObject?.email),
+    extractRecipientCandidate(previewObject?.to),
+    extractRecipientCandidate(previewObject?.recipient),
+    extractRecipientCandidate(previewObject?.email),
+    extractFirstEmailAddress(data.preview?.summary || ''),
+    extractFirstEmailAddress(data.preview?.details || ''),
+    extractFirstEmailAddress(lastUserPrompt || ''),
+  );
+
+  composeData.subject = composeData.subject || firstNonEmptyComposeString(
+    data.subject,
+    primaryContentObject?.subject,
+    primaryContentObject?.title,
+    previewObject?.subject,
+    previewObject?.title,
+  );
+
+  composeData.body = composeData.body || firstNonEmptyComposeString(
+    primaryContentObject?.body,
+    primaryContentObject?.replyBody,
+    primaryContentObject?.message,
+    typeof data.primary_content === 'string' ? data.primary_content : '',
+    previewObject?.body,
+    previewObject?.replyBody,
+    previewObject?.message,
+    typeof data.preview?.details === 'string' ? data.preview.details : '',
+  );
+
+  return composeData;
+}
+
+function renderComposeEmail(container, data) {
+  const card = document.createElement('div');
+  card.className = 'action-card consent-soft';
+
+  const headline = document.createElement('p');
+  headline.className = 'action-headline';
+  headline.textContent = data.headline || 'Drafting your email in Gmail';
+  card.appendChild(headline);
+
+  if (data.preview?.summary) {
+    const summary = document.createElement('p');
+    summary.className = 'action-summary';
+    summary.textContent = data.preview.summary;
+    card.appendChild(summary);
+  }
+
+  const composeData = buildComposeEmailPayload(data);
+  if (composeData.to || composeData.subject || composeData.body) {
+    const preview = document.createElement('div');
+    preview.className = 'action-preview';
+    const previewParts = [];
+    if (composeData.to) previewParts.push(`To: ${composeData.to}`);
+    if (composeData.subject) previewParts.push(`Subject: ${composeData.subject}`);
+    if (composeData.body) previewParts.push(composeData.body);
+    preview.textContent = previewParts.join('\n\n');
+    card.appendChild(preview);
+  }
+
+  const statusEl = document.createElement('p');
+  statusEl.className = 'action-rationale';
+  statusEl.textContent = 'Opening Gmail and inserting the draft...';
+  card.appendChild(statusEl);
+  container.appendChild(card);
+
+  executeAutoAction(data).then((res) => {
+    if (res?.success) {
+      if (res.tabId) currentTabId = res.tabId;
+      currentTabUrl = 'https://mail.google.com/mail/';
+      statusEl.textContent = 'Draft inserted in Gmail. Review and click Send manually.';
+      statusEl.style.color = '#34d399';
+      return;
+    }
+
+    statusEl.textContent = `Couldn't complete: ${res?.error || 'Action failed.'}`;
+    statusEl.style.color = '#f87171';
+  });
+}
+
 async function executeAutoAction(data) {
   if (data.action_type === 'USE_EXISTING_TAB' && data.target_tab_url) {
     return sendToBackground('switch_tab', { targetTabUrl: data.target_tab_url });
+  }
+  if (data.action_type === 'COMPOSE_EMAIL') {
+    return sendToBackground('gmail_compose', {
+      tabId: currentSite === 'gmail' ? currentTabId : null,
+      data: buildComposeEmailPayload(data),
+    });
   }
   if (data.dom_actions && data.dom_actions.length > 1) {
     return sendToBackground('execute_multi_step', { steps: data.dom_actions, tabId: currentTabId });
@@ -1437,20 +1805,12 @@ async function executeAction(container, btn, data) {
       return;
     }
     res = parseRes || { success: false, error: 'Could not extract tasks from this page.' };
-  } else if (data.action_type === 'COMPOSE_EMAIL' && currentSite === 'gmail') {
-    const composeData = {};
-    for (const step of (data.dom_actions || [])) {
-      if (step.action === 'fill_field') {
-        if (step.selector?.includes('to'))      composeData.to = step.value;
-        if (step.selector?.includes('subject')) composeData.subject = step.value;
-        if (step.selector?.includes('body') || step.selector?.includes('editable')) composeData.body = step.value;
-      }
-    }
-    if (!composeData.body && data.primary_content) {
-      const pc = data.primary_content;
-      composeData.body = typeof pc === 'string' ? pc : (pc.body || pc.replyBody || JSON.stringify(pc));
-    }
-    res = await sendToBackground('gmail_compose', { tabId: currentTabId, data: composeData });
+  } else if (data.action_type === 'COMPOSE_EMAIL') {
+    const composeData = buildComposeEmailPayload(data);
+    res = await sendToBackground('gmail_compose', {
+      tabId: currentSite === 'gmail' ? currentTabId : null,
+      data: composeData,
+    });
   } else if (data.dom_actions && data.dom_actions.length > 1) {
     res = await sendToBackground('execute_multi_step', { steps: data.dom_actions, tabId: currentTabId });
   } else if (data.dom_actions && data.dom_actions.length === 1) {
@@ -1771,7 +2131,7 @@ function renderComparison(container, data) {
 
 // ── EXPLORE ──────────────────────────────────────────────────
 
-function renderExplorePlan(data, autoStart = true) {
+function renderExplorePlan(data, autoStart = true, runId = activeMissionRunId) {
   resultsArea.classList.remove('hidden');
   const wrapper = document.createElement('div');
   wrapper.className = 'msg msg-assistant';
@@ -1827,19 +2187,27 @@ function renderExplorePlan(data, autoStart = true) {
     card.appendChild(statusEl);
     wrapper.appendChild(card);
     resultsArea.appendChild(wrapper);
-    setTimeout(() => { startExploration(plan); }, 800);
+    setTimeout(() => {
+      if (isMissionRunActive(runId)) startExploration(plan, runId);
+    }, 800);
   } else {
     const btnRow = document.createElement('div');
     btnRow.className = 'action-btn-row';
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'btn consent-btn-cancel';
     cancelBtn.textContent = 'Cancel';
-    cancelBtn.addEventListener('click', () => { resultsArea.innerHTML = ''; resultsArea.classList.add('hidden'); });
+    cancelBtn.addEventListener('click', async () => {
+      await cancelActiveMissionUi();
+      resultsArea.innerHTML = '';
+      resultsArea.classList.add('hidden');
+    });
     btnRow.appendChild(cancelBtn);
     const exploreBtn = document.createElement('button');
     exploreBtn.className = 'btn consent-btn-soft';
     exploreBtn.textContent = 'Explore Now';
-    exploreBtn.addEventListener('click', () => { startExploration(plan); });
+    exploreBtn.addEventListener('click', () => {
+      if (isMissionRunActive(runId)) startExploration(plan, runId);
+    });
     btnRow.appendChild(exploreBtn);
     card.appendChild(btnRow);
     wrapper.appendChild(card);
@@ -1847,7 +2215,8 @@ function renderExplorePlan(data, autoStart = true) {
   }
 }
 
-async function startExploration(explorePlan) {
+async function startExploration(explorePlan, runId = activeMissionRunId) {
+  if (!isMissionRunActive(runId)) return;
   const exploreWrapper = document.createElement('div');
   exploreWrapper.className = 'msg msg-assistant';
   const hud = document.createElement('div');
@@ -1878,6 +2247,7 @@ async function startExploration(explorePlan) {
   if (explorationListener) chrome.storage.onChanged.removeListener(explorationListener);
 
   explorationListener = (changes) => {
+    if (!isMissionRunActive(runId)) return;
     if (!changes.explorationProgress) return;
     const progress = changes.explorationProgress.newValue;
     if (!progress) return;
@@ -1912,12 +2282,20 @@ async function startExploration(explorePlan) {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     tabId = tab?.id || null;
   } catch { tabId = null; }
+  if (!isMissionRunActive(runId)) {
+    if (explorationListener) { chrome.storage.onChanged.removeListener(explorationListener); explorationListener = null; }
+    return;
+  }
 
   // Get the user's original prompt for auto-continuation context anchoring
   const lastUserMsg = conversationMessages.filter(m => m.role === 'user').pop();
   const userPrompt = lastUserMsg?.content || explorePlan.goal;
 
   const startRes = await sendToBackground('explore_start', { explorePlan, tabId, userPrompt }, 10000);
+  if (!isMissionRunActive(runId) || isSilentMissionStop(startRes)) {
+    if (explorationListener) { chrome.storage.onChanged.removeListener(explorationListener); explorationListener = null; }
+    return;
+  }
 
   if (!startRes?.success && !startRes?.async) {
     chrome.storage.onChanged.removeListener(explorationListener);
@@ -1929,26 +2307,10 @@ async function startExploration(explorePlan) {
     return;
   }
 
-  const res = await new Promise((resolve) => {
-    const timeout = setTimeout(() => resolve({ success: false, error: 'Exploration timed out after 10 minutes.' }), 600000);
-    const resultListener = (changes, areaName) => {
-      if (areaName !== 'session' || !changes.explorationResult) return;
-      clearTimeout(timeout);
-      chrome.storage.onChanged.removeListener(resultListener);
-      resolve(changes.explorationResult.newValue);
-    };
-    chrome.storage.onChanged.addListener(resultListener);
-    chrome.storage.session.get(['explorationResult']).then(data => {
-      if (data.explorationResult) {
-        clearTimeout(timeout);
-        chrome.storage.onChanged.removeListener(resultListener);
-        chrome.storage.session.remove(['explorationResult']).catch(() => {});
-        resolve(data.explorationResult);
-      }
-    }).catch(() => {});
-  });
+  const res = await waitForExplorationOutcome(runId);
 
   if (explorationListener) { chrome.storage.onChanged.removeListener(explorationListener); explorationListener = null; }
+  if (!isMissionRunActive(runId) || res?.cancelled) return;
 
   if (res?.paused) {
     conversationMessages.push({ role: 'assistant', content: `[Exploration Paused] ${res.pauseReason || 'Login required to continue.'}`, timestamp: Date.now() });
@@ -2565,7 +2927,7 @@ function setLoading(on) {
   if (on) {
     requestAnimationFrame(() => { requestAnimationFrame(() => { chatArea.scrollTop = chatArea.scrollHeight; }); });
   } else {
-    if (!replayActivityState?.active) {
+    if (!agentProgressState?.active && !replayActivityState?.active) {
       setStage('');
     }
   }
@@ -2575,12 +2937,19 @@ function setStage(stage) {
   const label = document.querySelector('.loading-label');
   if (!label) return;
   if (!stage) {
-    label.textContent = replayActivityState?.active
-      ? getReplayActivityLabel(replayActivityState)
+    const liveProgress = agentProgressState?.active ? agentProgressState : replayActivityState;
+    label.textContent = liveProgress?.active
+      ? getReplayActivityLabel(liveProgress)
       : 'Thinking with your memory...';
     return;
   }
-  label.textContent = STAGE_LABELS[stage] || 'Thinking with your memory...';
+  label.textContent = STAGE_LABELS[stage] || stage;
+}
+
+function setLiveLoadingText(text) {
+  const label = document.querySelector('.loading-label');
+  if (!label || !text) return;
+  label.textContent = text;
 }
 
 function clearResults() {
@@ -2588,6 +2957,15 @@ function clearResults() {
   resultsArea.classList.add('hidden');
   mainError.textContent = '';
 }
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.type !== 'chain_progress') return;
+  const { step, total, description, nextStep } = msg.data || {};
+  if (!primaryLoadingActive) return;
+  setLiveLoadingText(
+    `Step ${step || 1}/${total || 1}: ${description || 'Working...'}${nextStep ? `. Next: ${nextStep}` : ''}`
+  );
+});
 
 function showError(msg) {
   const FRIENDLY_HINTS = {
@@ -3552,6 +3930,7 @@ settingsBtn?.addEventListener('click', () => {
 $('#settings-back-btn')?.addEventListener('click', () => showView('#main-view'));
 
 newChatBtn?.addEventListener('click', async () => {
+  await cancelActiveMissionUi();
   const activeThreadConversationKey = threadConvKey();
   conversationMessages = [];
   resultsArea.innerHTML = '';
@@ -3564,9 +3943,6 @@ newChatBtn?.addEventListener('click', async () => {
   if (activeThreadConversationKey) {
     try { await chrome.storage.session.remove(activeThreadConversationKey); } catch {}
   }
-  // Clean up exploration state so it doesn't re-trigger
-  try { await chrome.storage.session.remove(['explorationActive', 'explorationResult', 'explorationProgress']); } catch {}
-  try { chrome.runtime.sendMessage({ type: 'explore_cancel' }).catch(() => {}); } catch {}
   promptInput.focus();
 });
 
@@ -3591,16 +3967,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!taskTitle) { sendResponse({ ok: false }); return true; }
 
     showView('#main-view');
-    const parts = [`Task: ${taskTitle}`];
-    if (taskDescription) parts.push(`Description: ${taskDescription}`);
-    if (dueDate) {
-      try { parts.push(`Due: ${new Date(dueDate).toLocaleDateString()}`); } catch { parts.push(`Due: ${dueDate}`); }
-    }
-    if (priority) parts.push(`Importance: ${priority}`);
-    if (tags && tags.length) parts.push(`Tags: ${Array.isArray(tags) ? tags.join(', ') : tags}`);
-    parts.push('Please help me complete this.');
+    const parts = [];
+    if (taskTitle) parts.push(taskTitle);
+    if (taskDescription) parts.push(taskDescription);
+    if (!parts.length) parts.push('Please help me complete this task.');
 
-    promptInput.value = parts.join(', ');
+    promptInput.value = parts.join('. ');
     submitBtn.disabled = false;
     submitBtn.classList.add('active');
     if (greeting) greeting.style.display = 'none';

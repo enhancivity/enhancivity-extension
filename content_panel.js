@@ -59,10 +59,107 @@
   let currentTabId = null;
   let currentTabUrl = window.location.href;
   let currentSite = detectSite(currentTabUrl);
+  let agentProgressListener = null;
+  let agentProgressState = null;
   let orchestrationListener = null;
   let explorationListener = null;
   let conversationMessages = []; // { role: 'user'|'assistant', content: string, data?: object, timestamp: number }
   let lastUserPrompt = ''; // Track last prompt for clarification re-submission
+  let activeMissionRunId = 0;
+  const missionAbortResolvers = new Set();
+
+  function getAgentProgressLabel(progress) {
+    if (!progress?.active) return '';
+    const stepNumber = Number(progress.stepNumber) || 0;
+    const totalSteps = Number(progress.totalSteps) || 0;
+    const prefix = stepNumber > 0 && totalSteps > 0 ? `Step ${stepNumber}/${totalSteps}: ` : '';
+    const main = progress.description || 'Enhancivity is working...';
+    if (progress.nextStep) {
+      return `${prefix}${main}. Next: ${progress.nextStep}`;
+    }
+    return `${prefix}${main}`;
+  }
+
+  function beginMissionRun() {
+    activeMissionRunId += 1;
+    return activeMissionRunId;
+  }
+
+  function isMissionRunActive(runId) {
+    return runId === activeMissionRunId;
+  }
+
+  function isSilentMissionStop(res) {
+    return Boolean(
+      !res?.success &&
+      res?.silent &&
+      (res?.errorType === 'REQUEST_SUPERSEDED' || res?.errorType === 'REQUEST_CANCELLED')
+    );
+  }
+
+  async function cancelActiveMissionUi() {
+    activeMissionRunId += 1;
+    const resolvers = Array.from(missionAbortResolvers);
+    missionAbortResolvers.clear();
+    for (const resolve of resolvers) {
+      try { resolve({ cancelled: true }); } catch {}
+    }
+    setLoading(false);
+    setStage('');
+    try {
+      await chrome.storage.session.remove(['agentProgress', 'replayActivity', 'explorationActive', 'explorationResult', 'explorationProgress']);
+    } catch {}
+    try {
+      await chrome.runtime.sendMessage({ type: 'explore_cancel' });
+    } catch {}
+  }
+
+  function waitForExplorationOutcome(runId, timeoutMs = 600000) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let timeout = null;
+      let resultListener = null;
+
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        if (timeout) clearTimeout(timeout);
+        if (resultListener) chrome.storage.onChanged.removeListener(resultListener);
+        missionAbortResolvers.delete(abortResolver);
+      };
+
+      const finish = (value) => {
+        cleanup();
+        resolve(value);
+      };
+
+      const abortResolver = () => finish({ cancelled: true });
+      missionAbortResolvers.add(abortResolver);
+
+      timeout = setTimeout(() => finish({ success: false, error: 'Exploration timed out after 10 minutes.' }), timeoutMs);
+
+      resultListener = (changes, areaName) => {
+        if (!isMissionRunActive(runId)) {
+          finish({ cancelled: true });
+          return;
+        }
+        if (areaName !== 'session' || !changes.explorationResult) return;
+        finish(changes.explorationResult.newValue);
+      };
+      chrome.storage.onChanged.addListener(resultListener);
+
+      chrome.storage.session.get(['explorationResult']).then(data => {
+        if (!isMissionRunActive(runId)) {
+          finish({ cancelled: true });
+          return;
+        }
+        if (data.explorationResult) {
+          chrome.storage.session.remove(['explorationResult']).catch(() => {});
+          finish(data.explorationResult);
+        }
+      }).catch(() => {});
+    });
+  }
 
   // ── Conversation Helpers ───────────────────────────────────────
 
@@ -310,6 +407,37 @@
   const byokBadge    = $('#enh-byok-badge');
   const authFallback = $('#enh-auth-fallback');
 
+  async function initAgentProgressListener() {
+    if (agentProgressListener) {
+      chrome.storage.onChanged.removeListener(agentProgressListener);
+    }
+
+    agentProgressListener = (changes, areaName) => {
+      if (areaName !== 'session' || !changes.agentProgress) return;
+      const progress = changes.agentProgress.newValue;
+      agentProgressState = progress?.active ? progress : null;
+      if (agentProgressState?.active) {
+        setLoading(true);
+        setStage(getAgentProgressLabel(agentProgressState));
+      } else {
+        setLoading(false);
+      }
+    };
+
+    chrome.storage.onChanged.addListener(agentProgressListener);
+
+    try {
+      const { agentProgress } = await chrome.storage.session.get(['agentProgress']);
+      agentProgressState = agentProgress?.active ? agentProgress : null;
+      if (agentProgressState?.active) {
+        setLoading(true);
+        setStage(getAgentProgressLabel(agentProgressState));
+      }
+    } catch {
+      agentProgressState = null;
+    }
+  }
+
   // ── Init ─────────────────────────────────────────────────────
 
   async function init() {
@@ -346,6 +474,7 @@
 
     // Restore state if available
     await restoreState();
+    await initAgentProgressListener();
 
     // Ensure panel state is persisted (so navigation re-injection knows panel is open)
     await saveState();
@@ -458,7 +587,7 @@
     saveState();
   }
 
-  function closePanel() {
+  async function closePanel() {
     // Hide immediately — never block the UI on async storage writes
     panel.classList.add('enh-hidden');
     clearResults();
@@ -469,15 +598,12 @@
     submitBtn.classList.remove('active');
     // Clear this tab's conversation only — other tabs are unaffected
     conversationMessages = [];
+    await cancelActiveMissionUi();
     Promise.all([
       saveConversation(),  // writes empty array to enhConversation_<tabId>
       chrome.storage.session.remove(convKey()).catch(() => {}), // clean up the key entirely
-      // Clean up exploration state so it doesn't re-trigger on panel re-injection
-      chrome.storage.session.remove(['explorationActive', 'explorationResult', 'explorationProgress']).catch(() => {}),
       saveState(),
     ]).catch(() => {});
-    // Tell background to cancel any running exploration
-    try { chrome.runtime.sendMessage({ type: 'explore_cancel' }).catch(() => {}); } catch {}
     // Remove exploration storage listener if active
     if (typeof explorationListener !== 'undefined' && explorationListener) {
       chrome.storage.onChanged.removeListener(explorationListener);
@@ -602,6 +728,7 @@
   async function handleSubmit() {
     const userPrompt = promptInput.value.trim();
     if (!userPrompt) return;
+    const runId = beginMissionRun();
     lastUserPrompt = userPrompt;
 
     // Hide greeting on first submit
@@ -633,10 +760,9 @@
       const triageRes = await sendToBackground('GET_TAB_TRIAGE_MAP', {}, 5000);
       if (triageRes?.success) availableTabs = triageRes.tabs;
     } catch { /* proceed without tab context */ }
+    if (!isMissionRunActive(runId)) return;
 
     // Extract site hint from user prompt
-    const siteHint = extractSiteHint(userPrompt);
-
     // STAGE 2: Backend AI Call
     setStage('STAGE_BACKEND');
     const res = await sendToBackground('process_request', {
@@ -645,8 +771,8 @@
       url: currentTabUrl,
       availableTabs,
       conversationHistory: conversationMessages.slice(-10).map(m => ({ role: m.role, content: m.content })),
-      siteHint,
     });
+    if (!isMissionRunActive(runId) || isSilentMissionStop(res)) return;
 
     // STAGE 3: Parse & Validate
     setStage('STAGE_PARSING');
@@ -682,7 +808,7 @@
 
     // EXPLORE: multi-step agentic exploration loop
     if (res.data?.action_type === 'EXPLORE' && res.data?.explore_plan) {
-      renderExplorePlan(res.data, /* autoStart= */ res.data.consent_level === 'auto');
+      renderExplorePlan(res.data, /* autoStart= */ res.data.consent_level === 'auto', runId);
       return;
     }
 
@@ -1782,7 +1908,7 @@
 
   // ── EXPLORE: Render plan card + run exploration loop ────────
 
-  function renderExplorePlan(data, autoStart = true) {
+  function renderExplorePlan(data, autoStart = true, runId = activeMissionRunId) {
     resultsArea.classList.remove('enh-hidden');
 
     const wrapper = document.createElement('div');
@@ -1847,7 +1973,7 @@
       resultsArea.appendChild(wrapper);
 
       setTimeout(() => {
-        startExploration(plan);
+        if (isMissionRunActive(runId)) startExploration(plan, runId);
       }, 800);
     } else {
       const btnRow = document.createElement('div');
@@ -1856,7 +1982,8 @@
       const cancelBtn = document.createElement('button');
       cancelBtn.className = 'enh-btn enh-consent-btn-cancel';
       cancelBtn.textContent = 'Cancel';
-      cancelBtn.addEventListener('click', () => {
+      cancelBtn.addEventListener('click', async () => {
+        await cancelActiveMissionUi();
         resultsArea.innerHTML = '';
         resultsArea.classList.add('enh-hidden');
       });
@@ -1866,7 +1993,7 @@
       exploreBtn.className = 'enh-btn enh-consent-btn-soft';
       exploreBtn.textContent = 'Explore Now';
       exploreBtn.addEventListener('click', () => {
-        startExploration(plan);
+        if (isMissionRunActive(runId)) startExploration(plan, runId);
       });
       btnRow.appendChild(exploreBtn);
 
@@ -1876,7 +2003,8 @@
     }
   }
 
-  async function startExploration(explorePlan) {
+  async function startExploration(explorePlan, runId = activeMissionRunId) {
+    if (!isMissionRunActive(runId)) return;
     // Wrap exploration HUD in an assistant bubble (preserves conversation above)
     const exploreWrapper = document.createElement('div');
     exploreWrapper.className = 'enh-msg enh-msg-assistant';
@@ -1916,6 +2044,7 @@
     }
 
     explorationListener = (changes) => {
+      if (!isMissionRunActive(runId)) return;
       if (!changes.explorationProgress) return;
       const progress = changes.explorationProgress.newValue;
       if (!progress) return;
@@ -1965,6 +2094,13 @@
     } catch {
       tabId = null;
     }
+    if (!isMissionRunActive(runId)) {
+      if (explorationListener) {
+        chrome.storage.onChanged.removeListener(explorationListener);
+        explorationListener = null;
+      }
+      return;
+    }
 
     // Get the user's original prompt for auto-continuation context anchoring
     const lastUserMsg = conversationMessages.filter(m => m.role === 'user').pop();
@@ -1972,6 +2108,13 @@
 
     // Start exploration via background (fire-and-forget — result arrives via chrome.storage)
     const startRes = await sendToBackground('explore_start', { explorePlan, tabId, userPrompt }, 10000);
+    if (!isMissionRunActive(runId) || isSilentMissionStop(startRes)) {
+      if (explorationListener) {
+        chrome.storage.onChanged.removeListener(explorationListener);
+        explorationListener = null;
+      }
+      return;
+    }
 
     if (!startRes?.success && !startRes?.async) {
       // Immediate failure (e.g., no tabId, invalid plan)
@@ -1985,36 +2128,14 @@
     }
 
     // Wait for the final result via chrome.storage.session (set by background when loop finishes)
-    const res = await new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        resolve({ success: false, error: 'Exploration timed out after 10 minutes.' });
-      }, 600000);
-
-      const resultListener = (changes, areaName) => {
-        if (areaName !== 'session' || !changes.explorationResult) return;
-        clearTimeout(timeout);
-        chrome.storage.onChanged.removeListener(resultListener);
-        resolve(changes.explorationResult.newValue);
-      };
-      chrome.storage.onChanged.addListener(resultListener);
-
-      // Also check if result already arrived (race condition guard)
-      chrome.storage.session.get(['explorationResult']).then(data => {
-        if (data.explorationResult) {
-          clearTimeout(timeout);
-          chrome.storage.onChanged.removeListener(resultListener);
-          // Clear it so next exploration starts fresh
-          chrome.storage.session.remove(['explorationResult']).catch(() => {});
-          resolve(data.explorationResult);
-        }
-      }).catch(() => {});
-    });
+    const res = await waitForExplorationOutcome(runId);
 
     // Clean up listener
     if (explorationListener) {
       chrome.storage.onChanged.removeListener(explorationListener);
       explorationListener = null;
     }
+    if (!isMissionRunActive(runId) || res?.cancelled) return;
 
     // If paused for login, show login-required UI and wait for user action
     if (res?.paused) {
@@ -2797,14 +2918,22 @@
         });
       });
     } else {
-      setStage('');
+      if (!agentProgressState?.active) {
+        setStage('');
+      }
     }
   }
 
   function setStage(stage) {
     const label = shadow.querySelector('.enh-loading-label');
     if (label) {
-      label.textContent = STAGE_LABELS[stage] || 'Thinking with your memory...';
+      if (!stage) {
+        label.textContent = agentProgressState?.active
+          ? getAgentProgressLabel(agentProgressState)
+          : 'Thinking with your memory...';
+        return;
+      }
+      label.textContent = STAGE_LABELS[stage] || stage || 'Thinking with your memory...';
     }
   }
 
@@ -2961,16 +3090,12 @@
       }
 
       // Build the auto-fill prompt
-      const parts = [`Task: ${taskTitle}`];
-      if (taskDescription) parts.push(`Description: ${taskDescription}`);
-      if (dueDate) {
-        try { parts.push(`Due: ${new Date(dueDate).toLocaleDateString()}`); } catch { parts.push(`Due: ${dueDate}`); }
-      }
-      if (priority) parts.push(`Importance: ${priority}`);
-      if (tags && tags.length) parts.push(`Tags: ${Array.isArray(tags) ? tags.join(', ') : tags}`);
-      parts.push('Please help me complete this.');
+      const parts = [];
+      if (taskTitle) parts.push(taskTitle);
+      if (taskDescription) parts.push(taskDescription);
+      if (!parts.length) parts.push('Please help me complete this task.');
 
-      promptInput.value = parts.join(', ');
+      promptInput.value = parts.join('. ');
       submitBtn.disabled = false;
       submitBtn.classList.add('active');
 

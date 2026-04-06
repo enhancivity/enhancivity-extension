@@ -1,5 +1,11 @@
 'use strict';
 
+// Prevent double-injection crash — `const` redeclaration throws SyntaxError
+if (window.__enhConsequentialActionsLoaded) {
+  // Already loaded — skip
+} else {
+window.__enhConsequentialActionsLoaded = true;
+
 /**
  * Consequential Action Detection — Shared Constants & Utilities
  *
@@ -603,3 +609,5 @@ if (typeof globalThis !== 'undefined') {
     isOnChatbotSite,
   };
 }
+
+} // end double-injection guard

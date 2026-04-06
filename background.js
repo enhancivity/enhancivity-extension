@@ -2,6 +2,8 @@
 // Enhancivity Background Service Worker — Grand Extension v4.2 (variable-by-default)
 // VERSION MARKER: If you see this in service worker console, the latest code is loaded.
 console.log('[BG] ===== BACKGROUND v4.2 (variable-by-default) LOADED =====');
+importScripts('shared_site_registry.js');
+const SiteGrounding = globalThis.EnhancivitySiteRegistry;
 // Responsibilities:
 //   1. Auth (email/password + Google OAuth)
 //   2. 3-Tier Memory caching (30-min TTL)
@@ -12,7 +14,7 @@ console.log('[BG] ===== BACKGROUND v4.2 (variable-by-default) LOADED =====');
 // ============================================================
 
 // Toggle for deployment: 'https://service.enhancivity.com' for production, 'http://localhost:3001' for local dev
-const API_BASE = 'https://service.enhancivity.com';
+const API_BASE = 'http://localhost:3001';
 const MEMORY_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 // Allow content scripts to access chrome.storage.session (required for conversation persistence + exploration recovery)
@@ -65,8 +67,10 @@ const ALLOWED_DOMAINS = [
 
 function isAllowedUrl(url) {
   try {
-    const host = new URL(url).hostname;
-    return ALLOWED_DOMAINS.some(d => host === d || host.endsWith('.' + d));
+    const host = new URL(url).hostname.toLowerCase();
+    if (!isAllowedForExplore(url)) return false;
+    if (ALLOWED_DOMAINS.some(d => host === d || host.endsWith('.' + d))) return true;
+    return (SiteGrounding?.getAliasesForDomain?.(host) || []).length > 0;
   } catch {
     return false;
   }
@@ -507,9 +511,14 @@ async function refreshMemory(token) {
   if (!userId) return;
 
   try {
-    const res = await fetch(`${API_BASE}/api/teach-agent/${userId}`, {
+    let res = await fetch(`${API_BASE}/api/agent/runtime-memory`, {
       headers: { Authorization: `Bearer ${token}` }
     });
+    if (!res.ok) {
+      res = await fetch(`${API_BASE}/api/teach-agent/${userId}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+    }
     if (!res.ok) return;
     const data = await res.json();
     await chrome.storage.local.set({
@@ -535,6 +544,190 @@ async function getOrRefreshMemory() {
     return updated.userMemory || null;
   }
   return userMemory;
+}
+
+function summarizeThreadTitle(userPrompt) {
+  const text = String(userPrompt || '').replace(/\s+/g, ' ').trim();
+  if (!text) return 'Mission session';
+  return text.slice(0, 120);
+}
+
+const AGENT_MISSION_ENVELOPE_KEY = 'agentMissionEnvelope';
+
+function buildLocalAssistantDisplayText(responseData = {}) {
+  if (typeof responseData?.headline === 'string' && responseData.headline.trim()) {
+    return responseData.headline.trim();
+  }
+  if (typeof responseData?.primary_content === 'string' && responseData.primary_content.trim()) {
+    return responseData.primary_content.trim().split('\n')[0].slice(0, 160);
+  }
+  if (typeof responseData?.action_type === 'string' && responseData.action_type.trim()) {
+    return responseData.action_type.trim();
+  }
+  return 'Completed mission step';
+}
+
+async function ensureAgentThread(token, existingThreadId, userPrompt) {
+  if (existingThreadId) return existingThreadId;
+  if (!token) return null;
+
+  try {
+    const res = await fetch(`${API_BASE}/api/agent/thread/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        title: summarizeThreadTitle(userPrompt),
+        summary: '',
+      }),
+    });
+
+    if (!res.ok) {
+      console.warn(`[BG] Failed to create agent thread (HTTP ${res.status})`);
+      return null;
+    }
+
+    const data = await res.json().catch(() => null);
+    return data?.thread?.id || null;
+  } catch (err) {
+    console.warn('[BG] Failed to create agent thread:', err.message);
+    return null;
+  }
+}
+
+async function appendAgentThreadMessage(token, threadId, payload) {
+  if (!token || !threadId || !payload) return null;
+
+  try {
+    const res = await fetch(`${API_BASE}/api/agent/thread/${encodeURIComponent(threadId)}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const errorPayload = await res.json().catch(() => null);
+      console.warn('[BG] Failed to append thread message:', errorPayload?.error || `HTTP ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json().catch(() => null);
+    return data?.message || null;
+  } catch (err) {
+    console.warn('[BG] Failed to append thread message:', err.message);
+    return null;
+  }
+}
+
+async function persistLocalAgentResult({ token, threadId, missionId, userPrompt, responseData, pageContext }) {
+  if (!token || !threadId || !userPrompt || !responseData) return;
+
+  await appendAgentThreadMessage(token, threadId, {
+    role: 'USER',
+    displayText: String(userPrompt || '').trim().slice(0, 500),
+    missionId: missionId || null,
+    content: {
+      text: userPrompt,
+      pageContext: pageContext || null,
+      source: 'extension_local_execution',
+    },
+  });
+
+  await appendAgentThreadMessage(token, threadId, {
+    role: 'ASSISTANT',
+    displayText: buildLocalAssistantDisplayText(responseData),
+    missionId: missionId || null,
+    content: {
+      ...responseData,
+      source: 'extension_local_execution',
+      pageContext: pageContext || null,
+    },
+  });
+}
+
+async function ensureAgentMission(token, threadId, payload = {}) {
+  if (!token || !threadId) return null;
+
+  try {
+    const res = await fetch(`${API_BASE}/api/agent/thread/${encodeURIComponent(threadId)}/missions/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const errorPayload = await res.json().catch(() => null);
+      console.warn('[BG] Failed to create agent mission:', errorPayload?.error || `HTTP ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json().catch(() => null);
+    return data?.mission || null;
+  } catch (err) {
+    console.warn('[BG] Failed to create agent mission:', err.message);
+    return null;
+  }
+}
+
+async function updateAgentMissionState(token, missionId, payload = {}) {
+  if (!token || !missionId) return null;
+
+  try {
+    const res = await fetch(`${API_BASE}/api/agent/missions/${encodeURIComponent(missionId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const errorPayload = await res.json().catch(() => null);
+      console.warn('[BG] Failed to update agent mission:', errorPayload?.error || `HTTP ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json().catch(() => null);
+    return data?.mission || null;
+  } catch (err) {
+    console.warn('[BG] Failed to update agent mission:', err.message);
+    return null;
+  }
+}
+
+async function upsertAgentMissionStepState(token, missionId, payload = {}) {
+  if (!token || !missionId) return null;
+
+  try {
+    const res = await fetch(`${API_BASE}/api/agent/missions/${encodeURIComponent(missionId)}/steps/upsert`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const errorPayload = await res.json().catch(() => null);
+      console.warn('[BG] Failed to upsert agent mission step:', errorPayload?.error || `HTTP ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json().catch(() => null);
+    return data?.step || null;
+  } catch (err) {
+    console.warn('[BG] Failed to upsert agent mission step:', err.message);
+    return null;
+  }
+}
+
+async function persistAgentMissionEnvelope(envelope) {
+  if (!envelope || typeof envelope !== 'object') return;
+  await chrome.storage.session.set({
+    [AGENT_MISSION_ENVELOPE_KEY]: {
+      ...envelope,
+      updatedAt: Date.now(),
+    },
+  }).catch(() => {});
+}
+
+async function clearAgentMissionEnvelope() {
+  await chrome.storage.session.remove(AGENT_MISSION_ENVELOPE_KEY).catch(() => {});
 }
 
 // Refresh memory on browser startup (service worker wakes up)
@@ -1126,6 +1319,78 @@ function waitForTabLoad(tabId, timeout = 15000, extraDelay = 2000) {
   });
 }
 
+function buildGmailComposeUrl(composeData = {}) {
+  const to = String(composeData?.to || composeData?.recipient || '').trim();
+  const subject = String(composeData?.subject || '').trim();
+  if (!to && !subject) {
+    return 'https://mail.google.com/mail/u/0/#inbox?compose=new';
+  }
+
+  const url = new URL('https://mail.google.com/mail/u/0/');
+  url.searchParams.set('view', 'cm');
+  url.searchParams.set('fs', '1');
+  url.searchParams.set('tf', '1');
+  if (to) url.searchParams.set('to', to);
+  if (subject) url.searchParams.set('su', subject);
+  return url.toString();
+}
+
+async function ensureGmailComposeTab(preferredTabId = null, composeData = {}, deps = {}) {
+  const tabsApi = deps.tabs || chrome.tabs;
+  const scriptingApi = deps.scripting || chrome.scripting;
+  const windowsApi = deps.windows || chrome.windows;
+  const waitForLoad = deps.waitForTabLoad || waitForTabLoad;
+  const composeUrl = buildGmailComposeUrl(composeData);
+
+  let targetTabId = preferredTabId;
+
+  const isGmailTab = async (candidateTabId) => {
+    if (!candidateTabId) return false;
+    try {
+      const tab = await tabsApi.get(candidateTabId);
+      return String(tab?.url || '').includes('mail.google.com');
+    } catch {
+      return false;
+    }
+  };
+
+  if (!(await isGmailTab(targetTabId))) {
+    const existingGmailTabs = await tabsApi.query({ url: ['https://mail.google.com/*'] }).catch(() => []);
+    const reusableGmailTab = existingGmailTabs.find(tab => String(tab?.url || '').includes('mail.google.com')) || null;
+
+    if (reusableGmailTab?.id) {
+      targetTabId = reusableGmailTab.id;
+      await tabsApi.update(targetTabId, { active: true }).catch(() => {});
+      if (reusableGmailTab.windowId) {
+        await windowsApi.update(reusableGmailTab.windowId, { focused: true }).catch(() => {});
+      }
+    } else {
+      const createdTab = await tabsApi.create({
+        url: composeUrl,
+        active: true,
+      });
+      targetTabId = createdTab?.id || null;
+    }
+  }
+
+  if (!targetTabId) {
+    throw new Error('Could not open a Gmail tab for composing.');
+  }
+
+  await tabsApi.update(targetTabId, {
+    url: composeUrl,
+    active: true,
+  }).catch(() => {});
+
+  await waitForLoad(targetTabId, 15000, 1000);
+  await scriptingApi.executeScript({
+    target: { tabId: targetTabId },
+    files: ['content_gmail.js'],
+  }).catch(() => {});
+
+  return targetTabId;
+}
+
 // ── DOM Stability Check ──────────────────────────────────────
 // Polls the content script for a lightweight DOM fingerprint every
 // `intervalMs`. Resolves as soon as two consecutive fingerprints
@@ -1382,6 +1647,16 @@ async function updateOrchestrationProgress(phase, detail) {
   await chrome.storage.local.set({
     orchestrationProgress: { phase, detail, timestamp: Date.now() }
   });
+  await chrome.storage.session.set({
+    agentProgress: {
+      active: !['done', 'error'].includes(String(phase || '').toLowerCase()),
+      source: 'orchestration',
+      status: phase || null,
+      description: detail || `Orchestration: ${phase || 'working'}`,
+      phase: phase || null,
+      timestamp: Date.now(),
+    },
+  }).catch(() => {});
 }
 
 // ── Self-Healing: Homepage Probe ─────────────────────────────
@@ -1856,6 +2131,17 @@ async function updateParallelExploreProgress(phase, tabStates) {
   await chrome.storage.session.set({
     parallelExploreProgress: { phase, tabs, timestamp: Date.now() },
   });
+  await chrome.storage.session.set({
+    agentProgress: {
+      active: String(phase || '').toLowerCase() !== 'done',
+      source: 'parallel_explore',
+      status: phase || null,
+      description: `Parallel explore: ${phase || 'working'}`,
+      phase: phase || null,
+      tabs,
+      timestamp: Date.now(),
+    },
+  }).catch(() => {});
 }
 
 async function updateReplayActivity(activity = {}) {
@@ -1867,6 +2153,14 @@ async function updateReplayActivity(activity = {}) {
       timestamp: Date.now(),
     },
   });
+  await chrome.storage.session.set({
+    agentProgress: {
+      active: true,
+      source: activity?.source || 'recipe_replay',
+      ...activity,
+      timestamp: Date.now(),
+    },
+  }).catch(() => {});
 }
 
 async function clearReplayActivity(status = 'idle') {
@@ -1877,6 +2171,14 @@ async function clearReplayActivity(status = 'idle') {
       timestamp: Date.now(),
     },
   });
+  await chrome.storage.session.set({
+    agentProgress: {
+      active: false,
+      source: 'recipe_replay',
+      status,
+      timestamp: Date.now(),
+    },
+  }).catch(() => {});
 }
 
 // Simple string hash for content comparison (not cryptographic — just for change detection)
@@ -2086,6 +2388,21 @@ async function runParallelExplore(parallelPlan, userPrompt, token) {
               creditsUsed += 0.3;
               currentAction = nextData.nextAction;
               if (nextData.isGoalComplete) break;
+            } else if ((currentStep.outputs || []).length > 0) {
+              const blockingGoalResult =
+                `I got stuck on step ${currentStepIndex + 1}: "${currentStep.goal}". ` +
+                `The required handoff data is still missing: ${describeRequiredHandoffOutputs(currentStep.outputs || [])}.`;
+              console.error(`[Explore] Step ${currentStepIndex + 1} STUCK â€” required handoff outputs missing [${missingOutputs.join(', ')}]. Stopping.`);
+              cleanupLoop();
+              return finishExploration({
+                success: false,
+                error: `Required handoff data is still missing: ${missingOutputs.join(', ')}`,
+                goalResult: blockingGoalResult,
+                stepsUsed: step,
+                creditsUsed,
+                stepLog,
+                ...(isStructuredMode && structuredSteps ? { structuredData } : {}),
+              });
             } else {
               break;
             }
@@ -2319,6 +2636,18 @@ async function updateExplorationProgress(step, total, description, status, phase
   await chrome.storage.local.set({
     explorationProgress: { step, total, description, status, phase, timestamp: Date.now() },
   });
+  await chrome.storage.session.set({
+    agentProgress: {
+      active: !['complete', 'partial', 'error'].includes(String(status || '').toLowerCase()),
+      source: 'explore',
+      status: status || null,
+      stepNumber: step || 0,
+      totalSteps: total || 0,
+      description: description || 'Exploring the page...',
+      phase,
+      timestamp: Date.now(),
+    },
+  }).catch(() => {});
 }
 
 async function takePageSnapshot(tabId) {
@@ -3033,16 +3362,277 @@ async function tryDismissModal(snapshot, tabId, token) {
 
 // ── Structured step helpers (multi-step mode) ──
 
+const MINIMAL_CHAIN_HANDOFF_KEYS = new Set([
+  'meetingLink',
+  'selectedItemUrl',
+  'selectedItemTitle',
+  'selectedItemPrice',
+  'candidateItems',
+]);
+
+const PRODUCT_SELECTION_CHAIN_HANDOFF_KEYS = new Set([
+  'selectedItemUrl',
+  'selectedItemTitle',
+  'selectedItemPrice',
+  'candidateItems',
+]);
+
+const LEGACY_CHAIN_HANDOFF_ALIASES = {
+  selectedItemUrl: ['product_url'],
+  selectedItemTitle: ['product_title'],
+};
+
+function isStrictChainHandoffKey(key) {
+  return MINIMAL_CHAIN_HANDOFF_KEYS.has(String(key || '').trim());
+}
+
+function isProductSelectionChainHandoffKey(key) {
+  return PRODUCT_SELECTION_CHAIN_HANDOFF_KEYS.has(String(key || '').trim());
+}
+
+function hasStructuredValue(value) {
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === 'object') return Object.keys(value).length > 0;
+  return value != null && value !== '';
+}
+
+function looksLikeChainSearchResultsUrl(url) {
+  const value = String(url || '').toLowerCase();
+  return /[?&](k|q|query|search|keyword|field-keywords)=/.test(value) || /\/(s|search|results)\?/.test(value);
+}
+
+function getChainPathname(url) {
+  try {
+    return new URL(String(url || '')).pathname.toLowerCase();
+  } catch {
+    return String(url || '')
+      .replace(/^https?:\/\/[^/]+/i, '')
+      .split(/[?#]/)[0]
+      .toLowerCase();
+  }
+}
+
+function looksLikeNeutralChainSelectionPage(url, title = '', pageType = '') {
+  const normalizedType = String(pageType || '').toLowerCase();
+  if (['homepage', 'search_results', 'checkout', 'account', 'auth'].includes(normalizedType)) {
+    return true;
+  }
+
+  const pathname = getChainPathname(url);
+  if (!pathname || pathname === '/' || pathname === '/index.html' || pathname === '/home') {
+    return true;
+  }
+
+  const lowerTitle = String(title || '').toLowerCase();
+  return /\b(search results|results for|sign in|log in|account|settings|cart|checkout|welcome)\b/.test(lowerTitle);
+}
+
+function looksLikeChainProductDetailPage(url, title = '', pageType = '', pageContent = '') {
+  if (!url || looksLikeChainSearchResultsUrl(url) || looksLikeNeutralChainSelectionPage(url, title, pageType)) {
+    return false;
+  }
+
+  const pathname = getChainPathname(url);
+  if (/\/(product|item|dp|listing|gp\/product|ip)\//i.test(pathname)) return true;
+  if (/\/(p|pd|products)\/[a-z0-9-]+/i.test(pathname)) return true;
+  if (String(pageType || '').toLowerCase() === 'product_detail') return true;
+
+  const lowerContent = String(pageContent || '').toLowerCase();
+  const hasPrice = !!inferChainPriceFromText(pageContent);
+  const hasPurchaseCue = /\b(add to cart|buy now|add to basket|product details|about this item|specifications?)\b/.test(lowerContent);
+  return hasPrice && hasPurchaseCue;
+}
+
+function isChainMeetingLink(value) {
+  return /meet\.google\.com\/[a-z0-9-]+|zoom\.us\/j\/\d+|teams\.microsoft\.com\/.*meetup/i.test(String(value || ''));
+}
+
+function getChainCandidateItems(stepData) {
+  if (Array.isArray(stepData?.candidateItems) && stepData.candidateItems.length > 0) {
+    return stepData.candidateItems.filter(Boolean);
+  }
+
+  const selectedItemUrl = stepData?.selectedItemUrl || stepData?.product_url;
+  const selectedItemTitle = stepData?.selectedItemTitle || stepData?.product_title;
+  const selectedItemPrice = stepData?.selectedItemPrice;
+  if (hasStructuredValue(selectedItemUrl) || hasStructuredValue(selectedItemTitle) || hasStructuredValue(selectedItemPrice)) {
+    return [{
+      url: selectedItemUrl || null,
+      title: selectedItemTitle || null,
+      price: selectedItemPrice || null,
+    }];
+  }
+
+  return [];
+}
+
+function getBestChainCandidateItem(stepData) {
+  const items = getChainCandidateItems(stepData);
+  if (!items.length) return null;
+  return items.find(item => hasStructuredValue(item?.url || item?.link || item?.href)) || items[0];
+}
+
+function getChainCandidateItemUrl(item) {
+  return item?.url || item?.link || item?.href || null;
+}
+
+function getChainCandidateItemTitle(item) {
+  return item?.title || item?.name || item?.label || null;
+}
+
+function getChainCandidateItemPrice(item) {
+  return item?.price || item?.amount || item?.cost || null;
+}
+
+function hasUsableChainCandidateItem(item) {
+  if (!item || typeof item !== 'object') return false;
+  return hasStructuredValue(getChainCandidateItemUrl(item)) &&
+    (hasStructuredValue(getChainCandidateItemTitle(item)) || hasStructuredValue(getChainCandidateItemPrice(item)));
+}
+
+function resolveChainStructuredValue(stepData, key, { allowCompatibilityFallback = true } = {}) {
+  if (!stepData || typeof stepData !== 'object') return undefined;
+
+  if (hasStructuredValue(stepData[key])) {
+    return stepData[key];
+  }
+
+  const legacyKeys = LEGACY_CHAIN_HANDOFF_ALIASES[key] || [];
+  for (const legacyKey of legacyKeys) {
+    if (hasStructuredValue(stepData[legacyKey])) {
+      return stepData[legacyKey];
+    }
+  }
+
+  const bestCandidate = getBestChainCandidateItem(stepData);
+  if (bestCandidate) {
+    if (key === 'selectedItemUrl' && hasStructuredValue(bestCandidate.url || bestCandidate.link || bestCandidate.href)) {
+      return bestCandidate.url || bestCandidate.link || bestCandidate.href;
+    }
+    if (key === 'selectedItemTitle' && hasStructuredValue(bestCandidate.title || bestCandidate.name || bestCandidate.label)) {
+      return bestCandidate.title || bestCandidate.name || bestCandidate.label;
+    }
+    if (key === 'selectedItemPrice' && hasStructuredValue(bestCandidate.price || bestCandidate.amount || bestCandidate.cost)) {
+      return bestCandidate.price || bestCandidate.amount || bestCandidate.cost;
+    }
+  }
+
+  if (key === 'candidateItems') {
+    const items = getChainCandidateItems(stepData);
+    if (items.length > 0) return items;
+  }
+
+  if (!allowCompatibilityFallback) {
+    return undefined;
+  }
+
+  if (key === 'meetingLink' && isChainMeetingLink(stepData.page_url)) {
+    return stepData.page_url;
+  }
+
+  const pageType = stepData?.pageType || stepData?.page_type || '';
+  const pageContent = stepData?.page_content || stepData?.mainContent || '';
+
+  if (key === 'selectedItemUrl' &&
+      stepData.page_url &&
+      looksLikeChainProductDetailPage(stepData.page_url, stepData.page_title, pageType, pageContent)) {
+    return stepData.page_url;
+  }
+
+  if (key === 'selectedItemTitle' &&
+      stepData.page_title &&
+      stepData.page_url &&
+      looksLikeChainProductDetailPage(stepData.page_url, stepData.page_title, pageType, pageContent)) {
+    return stepData.page_title;
+  }
+
+  return undefined;
+}
+
+function hasSatisfiedProductSelectionHandoff(stepData, { allowCompatibilityFallback = true } = {}) {
+  const candidateItems = resolveChainStructuredValue(stepData, 'candidateItems', { allowCompatibilityFallback });
+  if (Array.isArray(candidateItems) && candidateItems.some(item => hasUsableChainCandidateItem(item))) {
+    return true;
+  }
+
+  const selectedItemUrl = resolveChainStructuredValue(stepData, 'selectedItemUrl', { allowCompatibilityFallback });
+  return hasStructuredValue(selectedItemUrl);
+}
+
+function getMissingChainHandoffOutputs(requiredOutputs = [], stepData, { allowCompatibilityFallback = true } = {}) {
+  const uniqueOutputs = [...new Set((requiredOutputs || []).filter(Boolean))];
+  if (!uniqueOutputs.length) return [];
+
+  const missing = [];
+  const productOutputs = uniqueOutputs.filter(isProductSelectionChainHandoffKey);
+  if (productOutputs.length > 0 &&
+      !hasSatisfiedProductSelectionHandoff(stepData, { allowCompatibilityFallback })) {
+    missing.push(...productOutputs);
+  }
+
+  for (const key of uniqueOutputs) {
+    if (isProductSelectionChainHandoffKey(key)) continue;
+    if (!hasStructuredValue(resolveChainStructuredValue(stepData, key, { allowCompatibilityFallback }))) {
+      missing.push(key);
+    }
+  }
+
+  return missing;
+}
+
+function describeRequiredHandoffOutputs(requiredOutputs = []) {
+  const unique = [...new Set(requiredOutputs.filter(Boolean))];
+  const hasProductSelection = unique.some(key => ['selectedItemUrl', 'selectedItemTitle', 'selectedItemPrice', 'candidateItems'].includes(key));
+  const otherKeys = unique.filter(key => !['selectedItemUrl', 'selectedItemTitle', 'selectedItemPrice', 'candidateItems'].includes(key));
+  const descriptions = [];
+
+  if (hasProductSelection) {
+    descriptions.push('selectedItemUrl or candidateItems with a usable item link/title/price');
+  }
+  if (otherKeys.includes('meetingLink')) {
+    descriptions.push('meetingLink');
+  }
+  for (const key of otherKeys) {
+    if (key !== 'meetingLink') descriptions.push(key);
+  }
+
+  return descriptions.join(', ');
+}
+
+function hydrateResolvedChainInputs(subTask, resolvedInputs = {}, outputStore = {}) {
+  const hydrated = { ...resolvedInputs };
+  for (const input of subTask?.inputs || []) {
+    if (input?.source !== 'previous_step') continue;
+    if (hasStructuredValue(hydrated[input.name])) continue;
+    const prevOutput = outputStore?.[input.fromStep];
+    if (!prevOutput) continue;
+
+    const useCompatibilityFallback = !isStrictChainHandoffKey(input.fromOutput) && !isStrictChainHandoffKey(input.name);
+    const directValue = hasStructuredValue(prevOutput[input.fromOutput])
+      ? prevOutput[input.fromOutput]
+      : resolveChainStructuredValue(prevOutput, input.fromOutput, { allowCompatibilityFallback: useCompatibilityFallback });
+
+    if (hasStructuredValue(directValue)) {
+      hydrated[input.name] = directValue;
+    }
+  }
+  return hydrated;
+}
+
 /**
  * Check if all machine-verifiable success signals for a step are satisfied.
  * Returns true if all signals pass (or if no machine signals are defined).
  */
 function checkMachineSignals(step, currentPageState, structuredData) {
   if (!step?.successSignals?.machine?.length) return true; // No signals = vacuous truth
+  const combinedStructuredState = {
+    ...(currentPageState || {}),
+    ...(structuredData || {}),
+  };
   return step.successSignals.machine.every(signal => {
     if (signal.startsWith('extractedData.')) {
       const key = signal.replace('extractedData.', '').split(' ')[0];
-      return structuredData[key] != null && structuredData[key] !== '';
+      return getMissingChainHandoffOutputs([key], combinedStructuredState, { allowCompatibilityFallback: true }).length === 0;
     }
     if (signal.startsWith('URL contains ')) {
       const fragment = signal.replace('URL contains ', '');
@@ -3050,6 +3640,172 @@ function checkMachineSignals(step, currentPageState, structuredData) {
     }
     return false; // Unknown signal type — don't block on it
   });
+}
+
+function inferChainPriceFromText(text = '') {
+  const match = String(text || '').match(/([$€£]\s?\d[\d.,]*|\d[\d.,]*\s?(?:USD|EUR|GBP|€|\$|£))/i);
+  return match ? match[0].trim() : null;
+}
+
+function resolveChainUrlAgainstPage(href = '', pageUrl = '') {
+  if (!href) return null;
+  try {
+    return new URL(String(href), pageUrl || 'https://example.com').toString();
+  } catch {
+    return String(href || '').trim() || null;
+  }
+}
+
+function sanitizeChainItemText(text = '') {
+  return String(text || '')
+    .replace(/\[CURRENT VALUE:[^\]]+\]/gi, ' ')
+    .replace(/\[(?:STATE|MODAL)[^\]]+\]/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function looksLikeChainItemCandidateUrl(url = '') {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    if (/^(mailto:|tel:|javascript:)/i.test(parsed.protocol)) return false;
+    const pathname = parsed.pathname.toLowerCase();
+    if (!pathname || pathname === '/' || pathname === '/index.html') return false;
+    if (/\/(search|results|suche|home|account|cart|checkout)\b/.test(pathname)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function looksLikeNoiseChainItemText(text = '') {
+  const normalized = String(text || '').toLowerCase().trim();
+  if (!normalized || normalized.length < 4) return true;
+  return /^(search|sort|filter|sale|menu|close|home|account|cart|service|brands|wishlist|shopping cart)$/i.test(normalized);
+}
+
+function extractChainCandidateItemsFromPageState(currentPageState, limit = 5) {
+  const pageUrl = String(currentPageState?.url || currentPageState?.page_url || '');
+  const semanticElements = Array.isArray(currentPageState?.semanticElements)
+    ? currentPageState.semanticElements
+    : [];
+  const candidates = [];
+  const seen = new Set();
+
+  for (const element of semanticElements) {
+    const href = resolveChainUrlAgainstPage(element?.attrs?.href || element?.href || '', pageUrl);
+    if (!looksLikeChainItemCandidateUrl(href)) continue;
+
+    const rawText = sanitizeChainItemText(element?.text || '');
+    if (looksLikeNoiseChainItemText(rawText)) continue;
+
+    const combinedText = [rawText, sanitizeChainItemText(element?.context || '')]
+      .filter(Boolean)
+      .join(' ');
+    const price = inferChainPriceFromText(combinedText) || null;
+    const title = sanitizeChainItemText(rawText.replace(String(price || ''), '').trim()) || rawText;
+    if (!title || title.length < 3) continue;
+
+    const dedupeKey = `${href}::${title.toLowerCase()}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    candidates.push({
+      url: href,
+      title,
+      price,
+    });
+
+    if (candidates.length >= limit) break;
+  }
+
+  return candidates.filter(item => hasUsableChainCandidateItem(item));
+}
+
+function extractFirstChainMeetingLink(text = '') {
+  const match = String(text || '').match(/(?:https?:\/\/)?(?:meet\.google\.com\/[a-z0-9-]+|zoom\.us\/j\/\d+|teams\.microsoft\.com\/[^\s)"']+)/i);
+  if (!match) return null;
+  const value = String(match[0] || '').replace(/[),.;]+$/, '').trim();
+  if (!value) return null;
+  return /^https?:\/\//i.test(value) ? value : `https://${value}`;
+}
+
+function extractChainMeetingLinkFromPageState(currentPageState) {
+  const pageUrl = String(currentPageState?.url || currentPageState?.page_url || '');
+  if (isChainMeetingLink(pageUrl)) return pageUrl;
+
+  const semanticElements = Array.isArray(currentPageState?.semanticElements)
+    ? currentPageState.semanticElements
+    : [];
+  for (const element of semanticElements) {
+    const href = resolveChainUrlAgainstPage(element?.attrs?.href || element?.href || '', pageUrl);
+    if (isChainMeetingLink(href)) return href;
+
+    const textLink = extractFirstChainMeetingLink(`${element?.text || ''} ${element?.context || ''}`);
+    if (textLink) return textLink;
+  }
+
+  return extractFirstChainMeetingLink(currentPageState?.mainContent || currentPageState?.page_content || '');
+}
+
+function inferStructuredOutputsFromPageState(step, currentPageState) {
+  const requiredOutputs = new Set(Array.isArray(step?.outputs) ? step.outputs.filter(Boolean) : []);
+  if (!requiredOutputs.size || !currentPageState) return {};
+
+  const pageUrl = String(currentPageState.url || currentPageState.page_url || '');
+  const pageTitle = String(currentPageState.title || currentPageState.page_title || '');
+  const pageContent = String(currentPageState.mainContent || currentPageState.page_content || '');
+  const pageType = String(currentPageState.pageType || currentPageState.page_type || '');
+  const inferred = {};
+
+  if (requiredOutputs.has('meetingLink')) {
+    const inferredMeetingLink = extractChainMeetingLinkFromPageState(currentPageState);
+    if (inferredMeetingLink) {
+      inferred.meetingLink = inferredMeetingLink;
+    }
+  }
+
+  const wantsProductSelection = ['selectedItemUrl', 'selectedItemTitle', 'selectedItemPrice', 'candidateItems']
+    .some(key => requiredOutputs.has(key));
+
+  if (wantsProductSelection &&
+      pageUrl &&
+      looksLikeChainProductDetailPage(pageUrl, pageTitle, pageType, pageContent)) {
+    const inferredItem = {
+      url: pageUrl || null,
+      title: pageTitle || null,
+      price: inferChainPriceFromText(pageContent) || null,
+    };
+
+    if (requiredOutputs.has('selectedItemUrl') && inferredItem.url) {
+      inferred.selectedItemUrl = inferredItem.url;
+    }
+    if (requiredOutputs.has('selectedItemTitle') && inferredItem.title) {
+      inferred.selectedItemTitle = inferredItem.title;
+    }
+    if (requiredOutputs.has('selectedItemPrice') && inferredItem.price) {
+      inferred.selectedItemPrice = inferredItem.price;
+    }
+    if (requiredOutputs.has('candidateItems') &&
+        (inferredItem.url || inferredItem.title || inferredItem.price)) {
+      inferred.candidateItems = [inferredItem];
+    }
+  }
+
+  if (wantsProductSelection && !inferred.candidateItems) {
+    const inferredCandidates = extractChainCandidateItemsFromPageState(currentPageState);
+    if (inferredCandidates.length > 0) {
+      inferred.candidateItems = inferredCandidates;
+      if (inferredCandidates.length === 1) {
+        const bestCandidate = inferredCandidates[0];
+        if (requiredOutputs.has('selectedItemUrl') && bestCandidate.url) inferred.selectedItemUrl = bestCandidate.url;
+        if (requiredOutputs.has('selectedItemTitle') && bestCandidate.title) inferred.selectedItemTitle = bestCandidate.title;
+        if (requiredOutputs.has('selectedItemPrice') && bestCandidate.price) inferred.selectedItemPrice = bestCandidate.price;
+      }
+    }
+  }
+
+  return inferred;
 }
 
 async function runExplorationLoop(explorePlan, tabId, token, resumeState = null, continuationContext = null) {
@@ -3293,11 +4049,13 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
 
             // ── Detect structured mode from planner response ──
             // Source of truth: actual planner output (steps array), NOT the isMultiStep hint.
-            if (planData.steps && Array.isArray(planData.steps) && planData.steps.length > 0) {
+            if (!isStructuredMode && planData.steps && Array.isArray(planData.steps) && planData.steps.length > 0) {
               isStructuredMode = true;
               structuredSteps = planData.steps;
               stepStartTime = Date.now();
               console.log(`[Explore] STRUCTURED MODE activated: ${structuredSteps.length} steps — ${structuredSteps.map(s => `${s.id}:${s.goal.slice(0,40)}`).join(' → ')}`);
+            } else if (isStructuredMode && planData.steps && Array.isArray(planData.steps) && planData.steps.length > 0) {
+              console.log('[Explore] Planner returned refinement steps, but structured mode is already active — preserving the existing step contract.');
             }
 
             if (planData.strategy && planData.strategy.length > 10) {
@@ -3575,6 +4333,17 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
       await updateExplorationProgress(step, maxSteps, siteActionMatch ? '⚡ Replaying known action...' : 'Deciding next action...', 'running');
 
       let decision;
+      const currentStructuredStep = isStructuredMode && structuredSteps ? structuredSteps[currentStepIndex] : null;
+      const hasPendingStructuredOutputs = Boolean(
+        currentStructuredStep?.outputs?.some(name =>
+          !hasStructuredValue(resolveChainStructuredValue(structuredData, name, { allowCompatibilityFallback: false }))
+        )
+      );
+
+      if (siteActionMatch && currentStructuredStep && hasPendingStructuredOutputs) {
+        console.log(`[SiteAction] Structured step ${currentStepIndex + 1} still needs outputs [${(currentStructuredStep.outputs || []).join(', ')}] — bypassing deterministic replay so the agent can verify and capture handoff data.`);
+        siteActionMatch = null;
+      }
 
       // ── DETERMINISTIC PATH: Skip AI call if we have a confident match ──
       if (siteActionMatch && siteActionMatch.confidence >= 0.6 && siteActionMatch.matchedElement?.sid) {
@@ -3642,6 +4411,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
             currentStepIndex,
             totalStructuredSteps: structuredSteps.length,
             nextStepPreview: structuredSteps[currentStepIndex + 1]?.goal || null,
+            structuredData,
             structuredDataKeys: Object.keys(structuredData),
             allSteps: structuredSteps.map((s, i) => ({
               id: s.id, goal: s.goal,
@@ -4135,6 +4905,10 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
 
         const currentStep = structuredSteps[currentStepIndex];
         if (currentStep) {
+          const combinedStructuredState = {
+            ...(snapshot || {}),
+            ...(structuredData || {}),
+          };
           const machineOk = checkMachineSignals(currentStep, snapshot, structuredData);
           const aiDone = decision.stepCompleted === true || decision.stepStatus === 'completed';
           const noAiSignals = !currentStep.successSignals?.ai?.length;
@@ -4144,7 +4918,9 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           // DUAL-SIGNAL: advance only when both agree (or no AI signals defined)
           if (machineOk && (aiDone || noAiSignals)) {
             // POST-CONDITION: verify declared outputs actually exist in structuredData
-            const missingOutputs = (currentStep.outputs || []).filter(k => structuredData[k] == null || structuredData[k] === '');
+            const missingOutputs = getMissingChainHandoffOutputs(currentStep.outputs || [], combinedStructuredState, {
+              allowCompatibilityFallback: true,
+            });
             if (missingOutputs.length > 0) {
               console.warn(`[Explore] Step ${currentStepIndex + 1}: signals pass but outputs missing: [${missingOutputs}] — not advancing`);
               stepAttemptCount++;
@@ -4173,14 +4949,32 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           // Bailout logic: too many attempts on this step
           if (stepAttemptCount >= MAX_ATTEMPTS_PER_STEP && currentStepIndex < structuredSteps.length) {
             // Check if outputs already satisfied despite "failure"
-            const alreadySatisfied = (currentStep.outputs || []).every(k => structuredData[k] != null && structuredData[k] !== '');
+            const missingOutputs = getMissingChainHandoffOutputs(currentStep.outputs || [], combinedStructuredState, {
+              allowCompatibilityFallback: true,
+            });
+            const alreadySatisfied = missingOutputs.length === 0;
             if (alreadySatisfied) {
               console.log(`[Explore] Step ${currentStepIndex + 1}: outputs already satisfied despite attempts — advancing`);
               currentStepIndex++;
               stepAttemptCount = 0;
               stepStartTime = Date.now();
+            } else if ((currentStep.outputs || []).length > 0) {
+              const blockingGoalResult =
+                `I got stuck on step ${currentStepIndex + 1}: "${currentStep.goal}". ` +
+                `The required handoff data is still missing: ${describeRequiredHandoffOutputs(currentStep.outputs || [])}.`;
+              console.error(`[Explore] Step ${currentStepIndex + 1} STUCK - required handoff outputs missing [${missingOutputs.join(', ')}]. Stopping.`);
+              cleanupLoop();
+              return finishExploration({
+                success: false,
+                error: `Required handoff data is still missing: ${missingOutputs.join(', ')}`,
+                goalResult: blockingGoalResult,
+                stepsUsed: step,
+                creditsUsed,
+                stepLog,
+                ...(isStructuredMode && structuredSteps ? { structuredData } : {}),
+              });
             } else {
-              // Dependency-aware skip-or-stop
+              // Dependency-aware skip-or-stop for observational steps with no required outputs
               const futureNeedsThis = structuredSteps.slice(currentStepIndex + 1)
                 .some(s => (s.inputs || []).some(i => (currentStep.outputs || []).includes(i)));
               if (futureNeedsThis) {
@@ -4235,6 +5029,7 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
           stepsUsed: step,
           creditsUsed,
           stepLog,
+          ...(isStructuredMode && structuredSteps ? { structuredData } : {}),
         });
       }
 
@@ -4416,6 +5211,38 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
       // stale SID guard above only checks the OLD snapshot — it cannot catch
       // this race. Discard the stale decision and loop back for a fresh snapshot.
       // navigate/scrape_page/scroll/wait/press_key are exempt — they don't use SIDs.
+      if (decision.nextAction &&
+          snapshot?.semanticElements?.length > 0 &&
+          (snapshot?.hasOpenModal || snapshot.semanticElements.some(el => el.inModal))) {
+        const targetSid = decision.nextAction.target;
+        const targetEl = targetSid ? snapshot.semanticElements.find(el => el.sid === targetSid) : null;
+        const needsModalFirst =
+          ['click_element', 'type_text', 'read_element', 'select_option', 'resolve_element', 'fill_field'].includes(decision.nextAction.type) &&
+          (!targetEl || !targetEl.inModal);
+
+        if (needsModalFirst) {
+          console.log(`[Explore] Step ${step}: MODAL_GUARD — blocking ${decision.nextAction.type}(${targetSid || 'no-target'}) until modal is cleared`);
+          const { dismissed, method } = await tryDismissModal(snapshot, currentTabId, token);
+          stepLog.push({
+            step,
+            action: { type: 'modal_guard', description: `Modal guard intercepted ${decision.nextAction.type}${targetSid ? ` on ${targetSid}` : ''}` },
+            result: { success: dismissed, failureReason: dismissed ? null : 'MODAL_BLOCKING' },
+            observation: dismissed
+              ? `Dismissed blocking modal via ${method}. Re-scanning page.`
+              : 'A blocking modal is still open and prevented interaction with the underlying page.',
+          });
+          decision.nextAction = {
+            type: 'scrape_page',
+            description: `Re-scanning after modal ${dismissed ? 'dismissal' : 'guard break attempt'}`,
+          };
+          decision.revisedStrategy = dismissed
+            ? 'A blocking modal was closed. Continue with the original goal and avoid re-opening the same modal.'
+            : 'A blocking modal is preventing progress. Stay on the modal until it is closed or choose a different path that does not rely on covered elements.';
+          if (!dismissed) consecutiveFailures++;
+          continue;
+        }
+      }
+
       if (sidsStale &&
           decision.nextAction &&
           !['navigate', 'scrape_page', 'scroll', 'wait', 'press_key'].includes(decision.nextAction.type)) {
@@ -4641,6 +5468,13 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
         // The hint is passed to the next AI step call (Layer 1 STOP CHECK amplifies it).
         try {
           const postActionSnapshot = await takePageSnapshot(currentTabId);
+          if (isStructuredMode && structuredSteps) {
+            const inferredStructuredOutput = inferStructuredOutputsFromPageState(structuredSteps[currentStepIndex], postActionSnapshot);
+            if (Object.keys(inferredStructuredOutput).length > 0) {
+              structuredData = { ...structuredData, ...inferredStructuredOutput };
+              console.log(`[Explore] Step ${step}: inferred structured outputs from page state — keys: [${Object.keys(inferredStructuredOutput).join(', ')}]`);
+            }
+          }
           const hint = isStructuredMode ? null : detectGoalCompletionSignals(goal, preActionSnapshot, postActionSnapshot, decision.nextAction);
           if (hint) {
             // Store hint — it will be sent with the next explore-step API call
@@ -4913,12 +5747,18 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
       stepLog,
       partial: true,
       phasesUsed: currentPhase,
+      ...(isStructuredMode && structuredSteps ? { structuredData } : {}),
     });
 
   } catch (err) {
     cleanupLoop();
     console.error('[Explore] Loop error:', err);
-    return finishExploration({ success: false, error: err.message || 'Exploration loop failed.', stepLog });
+    return finishExploration({
+      success: false,
+      error: err.message || 'Exploration loop failed.',
+      stepLog,
+      ...(isStructuredMode && structuredSteps ? { structuredData } : {}),
+    });
   }
 }
 
@@ -4969,12 +5809,20 @@ async function stageAction(tabId, userGoal, category, token) {
   await hudUpdate(tabId, 'analyze', 'processing');
 
   // Fetch Tier 1 memory so the AI knows who to fill the form for.
-  // Converts [{ key, value }] array to a flat { name, email, ... } object.
+  // Prefer the normalized runtime profile shape, but keep legacy fallbacks
+  // so older cached payloads still work during rollout.
   const memory = await getOrRefreshMemory().catch(() => null);
-  const userProfile = {};
-  if (memory?.tier1 && Array.isArray(memory.tier1)) {
+  const userProfile = memory?.profile && typeof memory.profile === 'object'
+    ? { ...memory.profile }
+    : {};
+  if (Object.keys(userProfile).length === 0 && memory?.tier1 && Array.isArray(memory.tier1)) {
     for (const fact of memory.tier1) {
       if (fact.key && fact.value != null) userProfile[fact.key] = fact.value;
+    }
+  }
+  if (Object.keys(userProfile).length === 0 && memory?.tier1?.data && typeof memory.tier1.data === 'object') {
+    for (const [key, fact] of Object.entries(memory.tier1.data)) {
+      if (fact?.value != null) userProfile[key] = fact.value;
     }
   }
 
@@ -6279,7 +7127,7 @@ async function handleMessage(request, sender) {
   // now that recipe selection is automatic (no user choice UI).
   if (request.type === 'process_request' || request.type === 'process_request_skip_recipe') {
     const skipRecipeCheck = request.type === 'process_request_skip_recipe';
-    const { userPrompt, tabId, url, availableTabs, conversationHistory, siteHint, threadId } = request.data;
+    const { userPrompt, tabId, url, availableTabs, conversationHistory, siteHint: providedSiteHint, threadId } = request.data;
     // Capture generation number before any awaits. If a newer request arrives
     // while this one is awaiting (memory fetch, chain plan, etc.), the counter
     // advances and the old chain detects the mismatch and aborts.
@@ -6298,6 +7146,8 @@ async function handleMessage(request, sender) {
     }
 
     // Build page context by detecting site and optionally scraping
+    let activeThreadId = await ensureAgentThread(token, threadId, userPrompt);
+
     const pageContext = { url, site: 'general' };
 
     // Zero-Token Triage: attach lightweight tab map for spatial awareness
@@ -6367,20 +7217,15 @@ async function handleMessage(request, sender) {
     // ── Multi-site detection: skip single-recipe replay for chained requests ──
     // If the prompt references multiple sites (e.g., "search Amazon then email"),
     // the chain system should handle it, not a single recipe replay.
+    const effectiveSiteHint = SiteGrounding?.mergeExplicitSiteHint
+      ? SiteGrounding.mergeExplicitSiteHint(providedSiteHint || null, userPrompt)
+      : (providedSiteHint || null);
+
     const isMultiSitePrompt = (() => {
       const lower = (userPrompt || '').toLowerCase();
-      const SITE_KEYWORDS = ['amazon', 'ebay', 'walmart', 'etsy', 'gmail', 'outlook', 'yahoo',
-        'linkedin', 'twitter', 'reddit', 'facebook', 'instagram', 'youtube', 'google',
-        'slack', 'discord', 'zillow', 'airbnb', 'indeed',
-        'chatgpt', 'gemini', 'claude', 'notion', 'trello', 'github', 'stackoverflow', 'figma'];
-      let siteCount = 0;
-      const found = new Set();
-      for (const kw of SITE_KEYWORDS) {
-        if (new RegExp(`\\b${kw}\\b`, 'i').test(lower) && !found.has(kw)) {
-          found.add(kw);
-          siteCount++;
-        }
-      }
+      const siteCount = SiteGrounding?.countMentionedSiteTargets
+        ? SiteGrounding.countMentionedSiteTargets(userPrompt)
+        : 0;
       if (siteCount >= 2) return true;
       // Chain verbs: "search X and/then email Y"
       if (/\b(search|find|look)\b.*\b(and|then)\b.*\b(email|send|post|share|message|forward)\b/i.test(lower)) return true;
@@ -6535,6 +7380,16 @@ async function handleMessage(request, sender) {
                   // Skip the chain's first sub-task (already done via recipe) by marking it
                   // The chain system will see this and handle remaining sub-tasks
                 } else {
+                  const responseData = {
+                    action_type: 'RECIPE_REPLAY_COMPLETE',
+                    headline: `Done! Used workflow "${recipe.autoDescription || recipe.workflowName}"`,
+                    primary_content: `Completed ${replayResult.completedSteps}/${replayResult.totalSteps} steps in ${((replayResult.durationMs || 0) / 1000).toFixed(1)}s â€” 0 credits used.`,
+                    recipe_used: { id: recipe.id, name: recipe.autoDescription || recipe.workflowName, confidence: recipe.confidence },
+                    consent_level: 'none',
+                    threadId: activeThreadId || null,
+                  };
+                  responseData.primary_content = `Completed ${replayResult.completedSteps}/${replayResult.totalSteps} steps in ${((replayResult.durationMs || 0) / 1000).toFixed(1)}s - 0 credits used.`;
+                  await persistLocalAgentResult({ token, threadId: activeThreadId, userPrompt, responseData, pageContext });
                   return {
                     success: true,
                     data: {
@@ -6543,6 +7398,7 @@ async function handleMessage(request, sender) {
                       primary_content: `Completed ${replayResult.completedSteps}/${replayResult.totalSteps} steps in ${((replayResult.durationMs || 0) / 1000).toFixed(1)}s — 0 credits used.`,
                       recipe_used: { id: recipe.id, name: recipe.autoDescription || recipe.workflowName, confidence: recipe.confidence },
                       consent_level: 'none',
+                      threadId: activeThreadId || null,
                     },
                   };
                 }
@@ -6588,6 +7444,15 @@ async function handleMessage(request, sender) {
                     if (isMultiSitePrompt) {
                       console.log('[BG] Recipe search done — continuing to chain system for remaining sub-tasks');
                     } else {
+                      const responseData = {
+                        action_type: 'RECIPE_REPLAY_COMPLETE',
+                        headline: `Done! Searched "${recipe.autoDescription || recipe.workflowName}"`,
+                        primary_content: `Search completed (${partialSteps} steps) - results are showing. 0 credits used.`,
+                        recipe_used: { id: recipe.id, name: recipe.autoDescription || recipe.workflowName, confidence: recipe.confidence },
+                        consent_level: 'none',
+                        threadId: activeThreadId || null,
+                      };
+                      await persistLocalAgentResult({ token, threadId: activeThreadId, userPrompt, responseData, pageContext });
                       return {
                         success: true,
                         data: {
@@ -6596,6 +7461,7 @@ async function handleMessage(request, sender) {
                           primary_content: `Search completed (${partialSteps} steps) — results are showing. 0 credits used.`,
                           recipe_used: { id: recipe.id, name: recipe.autoDescription || recipe.workflowName, confidence: recipe.confidence },
                           consent_level: 'none',
+                          threadId: activeThreadId || null,
                         },
                       };
                     }
@@ -6645,9 +7511,20 @@ async function handleMessage(request, sender) {
       const chainPlan = await chainPlanRes.json();
 
       // Ghost-chain guard (pre-loop): if a newer request arrived while we were
-      // waiting for the chain plan, this request is stale — skip its chain entirely.
-      if (chainPlan?.success && chainPlan?.isChain && chainPlan.subTasks?.length > 1 &&
-          thisRequestGeneration === currentRequestGeneration) {
+      // waiting for the chain plan, this request is stale — do not let it
+      // fall through into the generic agent path.
+      if (chainPlan?.success && chainPlan?.isChain && chainPlan.subTasks?.length > 1) {
+        if (thisRequestGeneration !== currentRequestGeneration) {
+          console.log('[BG] Chain plan ignored — request was superseded before execution started');
+          chrome.storage.session.remove('replayActivity').catch(() => {});
+          return {
+            success: false,
+            errorType: 'REQUEST_SUPERSEDED',
+            error: 'A newer request replaced this mission before it started.',
+            silent: true,
+          };
+        }
+
         // Sort sub-tasks by order to guarantee correct execution sequence
         // (backend may return them out of order in edge cases)
         chainPlan.subTasks.sort((a, b) => a.order - b.order);
@@ -6656,8 +7533,484 @@ async function handleMessage(request, sender) {
         const chainResults = [];
         const outputStore = {};
         let chainSuccess = true;
+        let chainCancelledByUser = false;
+        let chainSuperseded = false;
         let composeOpened = false; // Guard: track if email compose was already opened
         const totalSubTasks = chainPlan.subTasks.length;
+        let chainTabId = request.data?.tabId || sender?.tab?.id || null;
+        const chainStartedAt = new Date();
+        let activeMissionId = null;
+        let activeMissionEnvelope = null;
+
+        async function getChainTab({ allowActiveFallback = true } = {}) {
+          if (chainTabId) {
+            const knownTab = await chrome.tabs.get(chainTabId).catch(() => null);
+            if (knownTab) return knownTab;
+          }
+
+          if (!allowActiveFallback) return null;
+
+          const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+          if (activeTab?.id) {
+            chainTabId = activeTab.id;
+          }
+          return activeTab || null;
+        }
+
+        async function focusChainTab() {
+          const currentTab = await getChainTab();
+          if (!currentTab?.id) return null;
+          try {
+            await chrome.tabs.update(currentTab.id, { active: true });
+          } catch {}
+          return await chrome.tabs.get(currentTab.id).catch(() => currentTab);
+        }
+
+        function getSubTaskOutputNames(subTask) {
+          return Array.isArray(subTask?.outputs)
+            ? subTask.outputs.map(output => (typeof output === 'string' ? output : output?.name)).filter(Boolean)
+            : [];
+        }
+
+        function getRequiredSubTaskOutputs(subTask) {
+          const declaredOutputs = getSubTaskOutputNames(subTask);
+          if (declaredOutputs.length === 0) return [];
+
+          const downstreamInputs = chainPlan.subTasks
+            .filter(candidate => Number(candidate?.order) > Number(subTask?.order))
+            .flatMap(candidate => (candidate?.inputs || [])
+              .filter(input => input?.source === 'previous_step' && Number(input.fromStep) === Number(subTask?.order))
+              .map(input => input.fromOutput || input.name))
+            .filter(Boolean);
+
+          return [...new Set(downstreamInputs.filter(name => declaredOutputs.includes(name)))];
+        }
+
+        function getMissionStepDependencies(subTask) {
+          return [...new Set((subTask?.inputs || [])
+            .filter(input => input?.source === 'previous_step' && Number.isFinite(Number(input.fromStep)))
+            .map(input => Number(input.fromStep))
+            .filter(Number.isFinite))];
+        }
+
+        function buildMissionStepSeed(subTask) {
+          return {
+            stepOrder: Number(subTask?.order) || 0,
+            goal: String(subTask?.intent || `Mission step ${subTask?.order || '?'}`).trim(),
+            targetDomain: subTask?.domain || null,
+            status: 'PENDING',
+            dependsOn: getMissionStepDependencies(subTask),
+            inputs: {
+              declaredInputs: (subTask?.inputs || []).map(input => ({
+                name: input?.name || null,
+                source: input?.source || null,
+                fromStep: Number.isFinite(Number(input?.fromStep)) ? Number(input.fromStep) : null,
+                fromOutput: input?.fromOutput || null,
+              })),
+              resolvedInputs: subTask?.resolvedInputs || {},
+            },
+            outputs: {
+              declaredOutputs: getSubTaskOutputNames(subTask),
+            },
+            runtimeData: {
+              executionMethod: subTask?.executionMethod || null,
+              category: subTask?.category || null,
+            },
+            successSignals: getRequiredSubTaskOutputs(subTask).map(name => `extractedData.${name} exists`),
+          };
+        }
+
+        async function syncMissionEnvelope() {
+          if (activeMissionEnvelope) {
+            await persistAgentMissionEnvelope(activeMissionEnvelope);
+          }
+        }
+
+        async function setMissionRuntimeState(status, extra = {}) {
+          if (activeMissionEnvelope) {
+            activeMissionEnvelope = {
+              ...activeMissionEnvelope,
+              status: status || activeMissionEnvelope.status,
+              currentStepOrder: Number.isFinite(extra.currentStepOrder) ? extra.currentStepOrder : activeMissionEnvelope.currentStepOrder,
+              currentStepLabel: extra.currentStepLabel !== undefined ? extra.currentStepLabel : activeMissionEnvelope.currentStepLabel,
+              nextStepLabel: extra.nextStepLabel !== undefined ? extra.nextStepLabel : activeMissionEnvelope.nextStepLabel,
+              lastError: extra.lastError !== undefined ? extra.lastError : activeMissionEnvelope.lastError,
+              structuredOutputs: extra.structuredOutputs !== undefined ? extra.structuredOutputs : activeMissionEnvelope.structuredOutputs,
+              lastKnownContext: extra.lastKnownContext !== undefined ? extra.lastKnownContext : activeMissionEnvelope.lastKnownContext,
+              completedAt: extra.completedAt !== undefined ? extra.completedAt : activeMissionEnvelope.completedAt,
+            };
+            await syncMissionEnvelope();
+          }
+
+          if (activeMissionId) {
+            await updateAgentMissionState(token, activeMissionId, {
+              status,
+              currentStepOrder: Number.isFinite(extra.currentStepOrder) ? extra.currentStepOrder : undefined,
+              structuredOutputs: extra.structuredOutputs,
+              lastKnownContext: extra.lastKnownContext,
+              completedAt: extra.completedAt,
+            });
+          }
+        }
+
+        async function setMissionStepState(subTask, status, extra = {}) {
+          const currentStepOrder = Number(subTask?.order) || 0;
+          const stepIndex = activeMissionEnvelope?.steps?.findIndex(step => Number(step?.stepOrder) === currentStepOrder) ?? -1;
+
+          if (activeMissionEnvelope && stepIndex >= 0) {
+            const existingStep = activeMissionEnvelope.steps[stepIndex];
+            activeMissionEnvelope.steps[stepIndex] = {
+              ...existingStep,
+              status,
+              inputs: extra.inputs !== undefined ? extra.inputs : existingStep.inputs,
+              outputs: extra.outputs !== undefined ? extra.outputs : existingStep.outputs,
+              runtimeData: extra.runtimeData !== undefined ? extra.runtimeData : existingStep.runtimeData,
+              lastError: extra.lastError !== undefined ? extra.lastError : existingStep.lastError,
+              startedAt: extra.startedAt !== undefined ? extra.startedAt : existingStep.startedAt,
+              completedAt: extra.completedAt !== undefined ? extra.completedAt : existingStep.completedAt,
+              verifiedAt: extra.verifiedAt !== undefined ? extra.verifiedAt : existingStep.verifiedAt,
+            };
+          }
+
+          await setMissionRuntimeState(extra.missionStatus || 'RUNNING', {
+            currentStepOrder,
+            currentStepLabel: extra.currentStepLabel,
+            nextStepLabel: extra.nextStepLabel,
+            lastError: extra.lastError,
+            structuredOutputs: extra.structuredOutputs,
+            lastKnownContext: extra.lastKnownContext,
+          });
+
+          if (activeMissionId) {
+            await upsertAgentMissionStepState(token, activeMissionId, {
+              stepOrder: currentStepOrder,
+              goal: subTask?.intent || `Mission step ${currentStepOrder}`,
+              targetDomain: subTask?.domain || null,
+              targetUrl: extra.targetUrl || null,
+              status,
+              dependsOn: getMissionStepDependencies(subTask),
+              inputs: extra.inputs,
+              outputs: extra.outputs,
+              runtimeData: extra.runtimeData,
+              lastError: extra.lastError,
+              startedAt: extra.startedAt,
+              completedAt: extra.completedAt,
+              verifiedAt: extra.verifiedAt,
+            });
+          }
+        }
+
+        function getMissingPreviousStepInputs(subTask, resolvedInputs) {
+          return (subTask?.inputs || [])
+            .filter(input => input?.source === 'previous_step')
+            .map(input => input.name)
+            .filter(name => !hasStructuredValue(resolvedInputs?.[name]));
+        }
+
+        function getMissingRequiredSubTaskOutputs(subTask, outputData) {
+          return getMissingChainHandoffOutputs(getRequiredSubTaskOutputs(subTask), outputData, {
+            allowCompatibilityFallback: true,
+          });
+        }
+
+        function formatChainStructuredValue(key, value) {
+          if (Array.isArray(value)) {
+            if (key === 'candidateItems') {
+              const preview = value.slice(0, 3).map(item => {
+                if (!item || typeof item !== 'object') return String(item || '').slice(0, 120);
+                return [
+                  item.title || item.name || item.label || 'Untitled item',
+                  item.price || item.amount || item.cost || null,
+                  item.url || item.link || item.href || null,
+                ].filter(Boolean).join(' | ');
+              }).filter(Boolean).join(' || ');
+              return preview ? `${preview}${value.length > 3 ? ` || (+${value.length - 3} more)` : ''}` : null;
+            }
+            return value.slice(0, 3).map(v => String(v)).join(', ');
+          }
+          if (value && typeof value === 'object') {
+            try {
+              return JSON.stringify(value).slice(0, 240);
+            } catch {
+              return '[object]';
+            }
+          }
+          if (!hasStructuredValue(value)) return null;
+          return String(value).slice(0, 240);
+        }
+
+        function summarizeChainOutputData(stepOrder, data) {
+          const parts = [];
+          for (const key of MINIMAL_CHAIN_HANDOFF_KEYS) {
+            const formattedValue = formatChainStructuredValue(
+              key,
+              resolveChainStructuredValue(data, key, { allowCompatibilityFallback: false })
+            );
+            if (formattedValue) {
+              parts.push(`Step ${stepOrder} ${key}: ${formattedValue}`);
+            }
+          }
+          if (data?.page_title) parts.push(`Step ${stepOrder} title: ${String(data.page_title).slice(0, 140)}`);
+          if (data?.page_url) parts.push(`Step ${stepOrder} URL: ${String(data.page_url).slice(0, 220)}`);
+          if (data?.page_content) parts.push(`Step ${stepOrder} content: ${String(data.page_content).slice(0, 500)}`);
+          return parts.join(' | ');
+        }
+
+        async function captureChainOutputSnapshot(stepResult = null, subTask = null) {
+          let capturedOutput = {};
+          try {
+            const activeTab = await getChainTab();
+            capturedOutput = {
+              page_url: activeTab?.url || '',
+              page_title: activeTab?.title || '',
+            };
+
+            if (activeTab?.id) {
+              try {
+                const snapshot = await takePageSnapshot(activeTab.id);
+                capturedOutput = {
+                  ...capturedOutput,
+                  page_url: snapshot?.url || activeTab?.url || '',
+                  page_title: snapshot?.title || activeTab?.title || '',
+                  page_content: snapshot?.mainContent || '',
+                  page_type: snapshot?.pageType || snapshot?.page_type || '',
+                };
+
+                const requiredOutputs = getRequiredSubTaskOutputs(subTask);
+                if (requiredOutputs.length > 0) {
+                  const inferredOutput = inferStructuredOutputsFromPageState({ outputs: requiredOutputs }, snapshot);
+                  if (Object.keys(inferredOutput).length > 0) {
+                    capturedOutput = { ...capturedOutput, ...inferredOutput };
+                  }
+                }
+              } catch { /* page may block injection — continue without content */ }
+            }
+          } catch { /* fall through with whatever structured output exists */ }
+
+          const structuredPayload = stepResult?.structuredData && typeof stepResult.structuredData === 'object'
+            ? stepResult.structuredData
+            : stepResult?.structuredOutput && typeof stepResult.structuredOutput === 'object'
+              ? stepResult.structuredOutput
+              : null;
+
+          return structuredPayload ? { ...capturedOutput, ...structuredPayload } : capturedOutput;
+        }
+
+        function buildChainStructuredStep(subTask, resolvedInputs) {
+          const requiredOutputs = getRequiredSubTaskOutputs(subTask);
+          const resolvedLines = Object.entries(resolvedInputs || {})
+            .filter(([, value]) => hasStructuredValue(value))
+            .map(([key, value]) => {
+              const formatted = formatChainStructuredValue(key, value);
+              return formatted ? `${key}: ${formatted}` : null;
+            })
+            .filter(Boolean);
+          const goalParts = [
+            subTask?.intent || 'Complete this mission step.',
+          ];
+
+          if (requiredOutputs.length > 0) {
+            goalParts.push(`This step is NOT complete until the required handoff data exists: ${describeRequiredHandoffOutputs(requiredOutputs)}.`);
+          }
+          if (resolvedLines.length > 0) {
+            goalParts.push(`Use these resolved inputs exactly when relevant: ${resolvedLines.join('; ')}.`);
+          }
+
+          return {
+            id: Number(subTask?.order) || 1,
+            goal: goalParts.join(' '),
+            inputs: (subTask?.inputs || [])
+              .filter(input => input?.source === 'previous_step')
+              .map(input => input.name)
+              .filter(Boolean),
+            outputs: requiredOutputs,
+            successSignals: {
+              machine: requiredOutputs.map(name => `extractedData.${name} exists`),
+              ai: ['current step goal achieved'],
+            },
+          };
+        }
+
+        function formatChainSite(domain = '') {
+          const normalized = String(domain || '').toLowerCase().replace(/^www\./, '');
+          if (!normalized) return 'the current site';
+          if (/mail\.google\.com/.test(normalized)) return 'Gmail';
+          if (/meet\.google\.com/.test(normalized)) return 'Google Meet';
+          if (/amazon\./.test(normalized)) return 'Amazon';
+          if (/outlook/.test(normalized)) return 'Outlook';
+          const readable = normalized
+            .replace(/^mail\./, '')
+            .replace(/\.com$/, '')
+            .replace(/\./g, ' ');
+          return readable.replace(/\b\w/g, ch => ch.toUpperCase());
+        }
+
+        function describeChainStep(subTask, status = 'working') {
+          const siteLabel = formatChainSite(subTask?.domain);
+          const intentLower = String(subTask?.intent || '').toLowerCase();
+          let actionLabel = subTask?.intent || `Work in ${siteLabel}`;
+
+          if (subTask?.category === 'compose') {
+            actionLabel = `prepare the draft in ${siteLabel}`;
+          } else if (subTask?.category === 'search') {
+            actionLabel = `find the right result on ${siteLabel}`;
+          } else if (/\bmeet|meeting|video call|video\b/.test(intentLower) || /meet\.google\.com/i.test(subTask?.domain || '')) {
+            actionLabel = `create the meeting in ${siteLabel}`;
+          } else if (subTask?.category === 'navigate') {
+            actionLabel = `work in ${siteLabel}`;
+          }
+
+          if (status === 'done') return `Completed ${actionLabel}`;
+          if (status === 'failed') return `Failed ${actionLabel}`;
+          return actionLabel.charAt(0).toUpperCase() + actionLabel.slice(1);
+        }
+
+        function shouldUseDeterministicCompose(subTask, resolvedInputs, currentUrl) {
+          return Boolean(
+            subTask?.category === 'compose' &&
+            /mail\.google\.com/i.test(subTask?.domain || '') &&
+            /mail\.google\.com/i.test(currentUrl || '') &&
+            (resolvedInputs?.recipient || resolvedInputs?.to) &&
+            (resolvedInputs?.body || resolvedInputs?.message || resolvedInputs?.replyBody)
+          );
+        }
+
+        function buildChainExplorePlan(subTask, resolvedInputs, previousOutputs) {
+          const siteLabel = formatChainSite(subTask?.domain);
+          const inputLines = Object.entries(resolvedInputs || {})
+            .filter(([, value]) => hasStructuredValue(value))
+            .map(([key, value]) => {
+              const formatted = formatChainStructuredValue(key, value);
+              return formatted ? `${key}: ${formatted}` : null;
+            })
+            .filter(Boolean);
+          const requiredOutputs = getRequiredSubTaskOutputs(subTask);
+          const previousLines = Object.entries(previousOutputs || {})
+            .map(([stepOrder, data]) => summarizeChainOutputData(stepOrder, data))
+            .filter(Boolean);
+
+          const goalParts = [
+            subTask?.intent || `Complete this step on ${siteLabel}.`,
+            `Stay on ${subTask?.domain || siteLabel}.`,
+          ];
+          if (subTask?.category === 'search') {
+            goalParts.push('If results are visible, open the best matching result before stopping.');
+          }
+          if (/meet\.google\.com/i.test(subTask?.domain || '')) {
+            goalParts.push('If a meeting link appears, keep it visible so the next step can reuse it.');
+          }
+          if (requiredOutputs.length > 0) {
+            goalParts.push(`This mission step is only complete after this handoff data exists: ${describeRequiredHandoffOutputs(requiredOutputs)}.`);
+          }
+          if (inputLines.length > 0) {
+            goalParts.push(`Use these resolved inputs: ${inputLines.join('; ')}.`);
+          }
+          if (previousLines.length > 0) {
+            goalParts.push(`Reuse outputs from earlier steps: ${previousLines.join(' || ')}.`);
+          }
+
+          return {
+            goal: goalParts.join(' '),
+            strategy: `This is ordered mission step ${subTask?.order || 1} of ${totalSubTasks}. Complete only this step on ${siteLabel}. Do not restart earlier steps, do not switch to unrelated sites, and stop as soon as this step is complete so the next mission step can continue.`,
+            maxSteps: 15,
+            creditBudget: 15,
+            startAction: {
+              type: 'scrape_page',
+              description: `Observe the current ${siteLabel} page for this mission step`,
+            },
+          };
+        }
+
+        async function executeScopedChainFallback(subTask, resolvedInputs) {
+          if (composeOpened && /compose|email|send|write/i.test(subTask.category || subTask.intent || '')) {
+            console.log(`[BG] Chain sub-task ${subTask.order}: skipping — compose already opened`);
+            return { success: true, durationMs: 0, skippedDuplicate: true, executionMethodUsed: 'compose_skip' };
+          }
+
+          console.log(`[BG] Chain sub-task ${subTask.order} ("${subTask.intent}") switching to scoped execution fallback`);
+
+          const inputContext = Object.entries(resolvedInputs || {})
+            .map(([key, value]) => {
+              const formatted = formatChainStructuredValue(key, value);
+              return formatted ? `${key}: ${formatted}` : null;
+            })
+            .filter(Boolean)
+            .join(', ');
+          const prevStepData = Object.entries(outputStore)
+            .map(([stepOrder, data]) => summarizeChainOutputData(stepOrder, data))
+            .join('\n');
+          const contextParts = [`Current task: ${subTask.intent}`];
+          contextParts.push(`Original request: ${userPrompt}`);
+          if (inputContext) contextParts.push(`Inputs: ${inputContext}`);
+          if (prevStepData) contextParts.push(`Data from previous steps:\n${prevStepData}`);
+          const focusedPrompt = contextParts.join('\n');
+
+          try {
+            const currentTab = await focusChainTab();
+            const currentUrl = currentTab?.url || `https://${subTask.domain}`;
+
+            if (shouldUseDeterministicCompose(subTask, resolvedInputs, currentUrl) && currentTab?.id) {
+              console.log(`[BG] Chain sub-task ${subTask.order}: using deterministic Gmail compose`);
+              const composeResult = await handleMessage({
+                type: 'gmail_compose',
+                data: {
+                  tabId: currentTab.id,
+                  data: {
+                    to: resolvedInputs.recipient || resolvedInputs.to,
+                    subject: resolvedInputs.subject || '',
+                    body: resolvedInputs.body || resolvedInputs.message || resolvedInputs.replyBody || '',
+                  },
+                },
+              }, {});
+
+              return {
+                success: !!composeResult?.success,
+                durationMs: 0,
+                error: composeResult?.error || null,
+                executionMethodUsed: 'gmail_compose',
+              };
+            }
+
+            if (!currentTab?.id) {
+              return {
+                success: false,
+                error: 'No active tab available for chain exploration.',
+                executionMethodUsed: 'structured_explore',
+              };
+            }
+
+            console.log(`[BG] Chain sub-task ${subTask.order}: running scoped exploration fallback on ${subTask.domain || 'current site'}`);
+            const exploreResult = await runExplorationLoop(
+              buildChainExplorePlan(subTask, resolvedInputs, outputStore),
+              currentTab.id,
+              token,
+              null,
+              {
+                originalPrompt: focusedPrompt,
+                phase: 1,
+                previousPhases: [],
+                totalSteps: 0,
+                dataBuffer: '',
+                remainingSteps: [buildChainStructuredStep(subTask, resolvedInputs)],
+                structuredData: {},
+              }
+            );
+            return {
+              success: exploreResult.success,
+              durationMs: 0,
+              error: exploreResult.error || exploreResult.goalResult || 'Scoped exploration could not complete the step.',
+              exploreGoalResult: exploreResult.goalResult || null,
+              structuredData: exploreResult.structuredData || null,
+              executionMethodUsed: 'structured_explore',
+            };
+          } catch (fallbackErr) {
+            return {
+              success: false,
+              error: `Scoped fallback failed: ${fallbackErr.message}`,
+              executionMethodUsed: 'structured_explore',
+            };
+          }
+        }
 
         // Broadcast chain progress to all UI surfaces (panel, sidepanel, popup)
         function broadcastChainProgress(step, total, description, nextStep) {
@@ -6668,7 +8021,18 @@ async function handleMessage(request, sender) {
               stepNumber: step,
               totalSteps: total,
               description,
+              nextStep,
               source: 'chain',
+            },
+            agentProgress: {
+              active: true,
+              source: 'chain',
+              stepNumber: step,
+              totalSteps: total,
+              description,
+              nextStep,
+              status: 'running',
+              timestamp: Date.now(),
             },
           }).catch(() => {});
           // Reach popup + sidepanel
@@ -6679,14 +8043,65 @@ async function handleMessage(request, sender) {
           }).catch(() => {});
         }
 
+        const initialCurrentStepLabel = describeChainStep(chainPlan.subTasks[0], 'working');
+        const initialNextStepLabel = chainPlan.subTasks[1] ? describeChainStep(chainPlan.subTasks[1], 'working') : 'Finishing up...';
+        const initialMissionSteps = chainPlan.subTasks.map(buildMissionStepSeed);
+        activeMissionEnvelope = {
+          active: true,
+          missionId: null,
+          threadId: activeThreadId || null,
+          executionMode: 'CHAIN',
+          status: 'RUNNING',
+          originalPrompt: userPrompt,
+          currentStepOrder: 1,
+          totalSteps: totalSubTasks,
+          currentStepLabel: initialCurrentStepLabel,
+          nextStepLabel: initialNextStepLabel,
+          lastError: null,
+          startedAt: chainStartedAt.toISOString(),
+          completedAt: null,
+          structuredOutputs: {},
+          lastKnownContext: {
+            pageUrl: url || null,
+            siteHint: effectiveSiteHint || null,
+          },
+          steps: initialMissionSteps,
+        };
+
+        const createdMission = await ensureAgentMission(token, activeThreadId, {
+          title: summarizeThreadTitle(userPrompt),
+          originalPrompt: userPrompt,
+          status: 'RUNNING',
+          executionMode: 'CHAIN',
+          plannerVersion: 'chain_v1',
+          currentStepOrder: 1,
+          scratchpad: {
+            totalSubTasks,
+            recipeCount: chainPlan.recipeCount || 0,
+            aiCount: chainPlan.aiCount || 0,
+          },
+          structuredOutputs: {},
+          lastKnownContext: activeMissionEnvelope.lastKnownContext,
+          startedAt: chainStartedAt.toISOString(),
+          steps: initialMissionSteps,
+        });
+        activeMissionId = createdMission?.id || null;
+        activeMissionEnvelope.missionId = activeMissionId;
+        await syncMissionEnvelope();
+
         for (const subTask of chainPlan.subTasks) {
           // ── CANCELLATION CHECK: user clicked X/Cancel OR a newer request arrived ──
           if (explorationAborted || thisRequestGeneration !== currentRequestGeneration) {
             const reason = explorationAborted ? 'user cancelled' : 'superseded by newer request';
             console.log(`[BG] Chain: aborting at sub-task ${subTask.order} — ${reason}`);
+            chainCancelledByUser = explorationAborted;
+            chainSuperseded = thisRequestGeneration !== currentRequestGeneration;
             chainSuccess = false;
             break;
           }
+
+          let forceScopedFallback = false;
+          let capturedStepOutput = null;
 
           // ── Skip sub-task 1 if the search is already done ──
           // Detect TWO scenarios:
@@ -6713,7 +8128,7 @@ async function handleMessage(request, sender) {
             // Scenario B: current page is already showing search results on the target domain
             if (!shouldSkip) {
               try {
-                const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                const activeTab = await getChainTab();
                 const tabUrl = activeTab?.url || '';
                 const tabHost = tabUrl ? new URL(tabUrl).hostname.toLowerCase() : '';
                 const subTaskDomain = (subTask.domain || '').toLowerCase();
@@ -6755,45 +8170,61 @@ async function handleMessage(request, sender) {
             }
 
             if (shouldSkip) {
-              console.log(`[BG] Chain: skipping sub-task 1 — ${skipReason}`);
-              try {
-                const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-                outputStore[subTask.order] = {
-                  page_url: activeTab?.url || recipePartialContext?.pageUrl || '',
-                  page_title: activeTab?.title || recipePartialContext?.pageTitle || '',
-                };
-                if (activeTab?.id) {
-                  const [scraped] = await chrome.scripting.executeScript({
-                    target: { tabId: activeTab.id },
-                    func: () => (document.body?.innerText || '').slice(0, 3000),
-                  });
-                  if (scraped?.result) outputStore[subTask.order].page_content = scraped.result;
-                }
-              } catch { /* page may block injection */ }
-              chainResults.push({
-                order: subTask.order,
-                intent: subTask.intent,
-                domain: subTask.domain,
-                method: recipePartialContext ? 'recipe_partial' : 'page_detected',
-                success: true,
-                duration: 0,
-                error: null,
-              });
-              broadcastChainProgress(
-                subTask.order, totalSubTasks,
-                `Done: ${subTask.intent}`,
-                chainPlan.subTasks[1]?.intent || 'Finishing up...'
-              );
-              continue; // Skip to sub-task 2
+              capturedStepOutput = await captureChainOutputSnapshot(null, subTask);
+              const missingSkipOutputs = getMissingRequiredSubTaskOutputs(subTask, capturedStepOutput);
+
+              if (missingSkipOutputs.length === 0) {
+                console.log(`[BG] Chain: skipping sub-task 1 — ${skipReason}`);
+                outputStore[subTask.order] = capturedStepOutput;
+                chainResults.push({
+                  order: subTask.order,
+                  intent: subTask.intent,
+                  domain: subTask.domain,
+                  method: recipePartialContext ? 'recipe_partial' : 'page_detected',
+                  success: true,
+                  duration: 0,
+                  error: null,
+                });
+                broadcastChainProgress(
+                  subTask.order, totalSubTasks,
+                  describeChainStep(subTask, 'done'),
+                  chainPlan.subTasks[1] ? describeChainStep(chainPlan.subTasks[1], 'working') : 'Finishing up...'
+                );
+                await setMissionStepState(subTask, 'COMPLETED', {
+                  missionStatus: 'RUNNING',
+                  currentStepLabel: describeChainStep(subTask, 'done'),
+                  nextStepLabel: chainPlan.subTasks[1] ? describeChainStep(chainPlan.subTasks[1], 'working') : 'Finishing up...',
+                  outputs: capturedStepOutput,
+                  runtimeData: {
+                    executionMethod: recipePartialContext ? 'recipe_partial' : 'page_detected',
+                    skippedReason: skipReason,
+                    skippedExecution: true,
+                  },
+                  completedAt: new Date().toISOString(),
+                  verifiedAt: new Date().toISOString(),
+                  structuredOutputs: outputStore,
+                  lastKnownContext: {
+                    pageUrl: capturedStepOutput?.page_url || url || null,
+                    pageTitle: capturedStepOutput?.page_title || null,
+                    tabId: chainTabId || null,
+                  },
+                });
+                continue; // Skip to sub-task 2
+              }
+
+              forceScopedFallback = true;
+              console.log(`[BG] Chain: current page matches sub-task 1 but still needs handoff outputs [${missingSkipOutputs.join(', ')}] — continuing with scoped exploration`);
             }
           }
 
           // Notify UI about current sub-task
           const nextSubTask = chainPlan.subTasks.find(st => st.order === subTask.order + 1);
+          const currentStepLabel = describeChainStep(subTask, 'working');
+          const nextStepLabel = nextSubTask ? describeChainStep(nextSubTask, 'working') : 'Finishing up...';
           broadcastChainProgress(
             subTask.order, totalSubTasks,
-            `Working on: ${subTask.intent}`,
-            nextSubTask ? nextSubTask.intent : 'Finishing up...'
+            currentStepLabel,
+            nextStepLabel
           );
 
           // Resolve pending inputs (previous_step references + AI-generated content)
@@ -6815,21 +8246,58 @@ async function handleMessage(request, sender) {
             if (subTask.pendingInputs?.some(i => i.name === 'subject')) {
               const subj = resolvedInputs.subject;
               if (!subj || /^__UNRESOLVED__/.test(subj) || subj.length < 3) {
-                const fallbackTitle = outputStore[1]?.page_title || subTask.intent || 'Your request';
+                const fallbackTitle = outputStore[1]?.selectedItemTitle || outputStore[1]?.page_title || subTask.intent || 'Your request';
                 resolvedInputs.subject = `Re: ${fallbackTitle}`.slice(0, 80);
                 console.log(`[BG] Chain subject fallback applied: "${resolvedInputs.subject}"`);
               }
             }
           }
+          resolvedInputs = hydrateResolvedChainInputs(subTask, resolvedInputs, outputStore);
+
+          const missionTabSnapshot = await getChainTab().catch(() => null);
+          await setMissionStepState(subTask, 'RUNNING', {
+            missionStatus: 'RUNNING',
+            currentStepLabel,
+            nextStepLabel,
+            inputs: {
+              declaredInputs: (subTask.inputs || []).map(input => ({
+                name: input?.name || null,
+                source: input?.source || null,
+                fromStep: Number.isFinite(Number(input?.fromStep)) ? Number(input.fromStep) : null,
+                fromOutput: input?.fromOutput || null,
+              })),
+              resolvedInputs,
+            },
+            runtimeData: {
+              executionMethod: subTask.executionMethod || null,
+              category: subTask.category || null,
+              phase: 'running',
+            },
+            startedAt: new Date().toISOString(),
+            lastKnownContext: {
+              pageUrl: missionTabSnapshot?.url || url || null,
+              pageTitle: missionTabSnapshot?.title || null,
+              tabId: missionTabSnapshot?.id || chainTabId || null,
+              domain: subTask.domain || null,
+            },
+          });
 
           let stepResult;
+          const missingPreviousStepInputs = getMissingPreviousStepInputs(subTask, resolvedInputs);
+          if (missingPreviousStepInputs.length > 0) {
+            stepResult = {
+              success: false,
+              error: `This step is still waiting on required handoff data: ${missingPreviousStepInputs.join(', ')}`,
+              executionMethodUsed: 'dependency_gate',
+            };
+          }
 
           // ── Navigate to the target domain if not already there ──
           // Chain sub-tasks span different sites (Amazon → Gmail).
           // Before executing EACH sub-task (including #1), ensure we're on the right domain.
           if (subTask.domain) {
             try {
-              let [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+              let currentTab = await focusChainTab();
               const currentHost = currentTab?.url ? new URL(currentTab.url).hostname.toLowerCase() : '';
               const targetDomain = subTask.domain.toLowerCase();
 
@@ -6850,7 +8318,10 @@ async function handleMessage(request, sender) {
                   try {
                     const tUrl = new URL(t.url);
                     const host = tUrl.hostname.toLowerCase();
-                    const domainMatch = host.includes(targetDomain) || targetDomain.includes(host.split('.').slice(-2, -1)[0]);
+                    const domainMatch =
+                      host === targetDomain ||
+                      host.endsWith(`.${targetDomain}`) ||
+                      targetDomain.endsWith(`.${host}`);
                     if (!domainMatch) return false;
 
                     // For search sub-tasks: verify the tab's search query matches
@@ -6878,6 +8349,7 @@ async function handleMessage(request, sender) {
                   // Switch to existing tab
                   await chrome.tabs.update(existingTab.id, { active: true });
                   await new Promise(r => setTimeout(r, settleTimeMs)); // Let tab re-activate and re-render
+                  chainTabId = existingTab.id;
                   console.log(`[BG] Chain: switched to existing tab on ${targetDomain} (settled ${settleTimeMs}ms)`);
                 } else {
                   // Open a NEW tab for the target domain — never overwrite the user's current tab
@@ -6899,6 +8371,7 @@ async function handleMessage(request, sender) {
                   await new Promise(r => setTimeout(r, settleTimeMs)); // Extra settle time for JS apps
                   // Update currentTab reference so subsequent chain steps target the new tab
                   currentTab = newTab;
+                  chainTabId = newTab.id;
                   console.log(`[BG] Chain: opened new tab for ${targetUrl} (tab ${newTab.id}, settled ${settleTimeMs}ms)`);
                 }
               }
@@ -6908,7 +8381,9 @@ async function handleMessage(request, sender) {
             }
           }
 
-          if (subTask.executionMethod === 'recipe_replay' && subTask.recipe) {
+          if (!stepResult && forceScopedFallback) {
+            stepResult = await executeScopedChainFallback(subTask, resolvedInputs);
+          } else if (!stepResult && subTask.executionMethod === 'recipe_replay' && subTask.recipe) {
             // RECIPE REPLAY — free, deterministic
             // Map resolved inputs to recipe variable names (decomposer uses names like
             // 'search_query' but recipe variables may have different names set by user)
@@ -6987,12 +8462,8 @@ async function handleMessage(request, sender) {
               // 4. Data from previous steps (URLs, page content, etc.)
               if (Object.keys(outputStore).length > 0) {
                 const prevStepSummaries = Object.entries(outputStore)
-                  .map(([stepOrder, data]) => {
-                    const parts = [`Step ${stepOrder}: ${data.page_title || 'completed'}`];
-                    if (data.page_url) parts.push(`URL: ${data.page_url}`);
-                    if (data.page_content) parts.push(`Content:\n${data.page_content.slice(0, 2000)}`);
-                    return parts.join('\n');
-                  })
+                  .map(([stepOrder, data]) => summarizeChainOutputData(stepOrder, data))
+                  .filter(Boolean)
                   .join('\n\n');
                 contextParts.push(`Data from previous steps:\n${prevStepSummaries}`);
               }
@@ -7028,12 +8499,40 @@ async function handleMessage(request, sender) {
                   });
                   // Capture page outputs for downstream steps before continuing
                   try {
-                    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                    const activeTab = await getChainTab();
                     outputStore[subTask.order] = {
                       page_url: activeTab?.url || '',
                       page_title: activeTab?.title || '',
                     };
                   } catch { outputStore[subTask.order] = {}; }
+                  await setMissionStepState(subTask, 'COMPLETED', {
+                    missionStatus: 'RUNNING',
+                    currentStepLabel: describeChainStep(subTask, 'done'),
+                    nextStepLabel: nextSubTask ? describeChainStep(nextSubTask, 'working') : 'Finishing up...',
+                    inputs: {
+                      declaredInputs: (subTask.inputs || []).map(input => ({
+                        name: input?.name || null,
+                        source: input?.source || null,
+                        fromStep: Number.isFinite(Number(input?.fromStep)) ? Number(input.fromStep) : null,
+                        fromOutput: input?.fromOutput || null,
+                      })),
+                      resolvedInputs,
+                    },
+                    outputs: outputStore[subTask.order],
+                    runtimeData: {
+                      executionMethod: subTask.executionMethod,
+                      awaitingUserAction: true,
+                      consequentialStep: stepResult.consequentialStep,
+                    },
+                    completedAt: new Date().toISOString(),
+                    verifiedAt: new Date().toISOString(),
+                    structuredOutputs: outputStore,
+                    lastKnownContext: {
+                      pageUrl: outputStore[subTask.order]?.page_url || null,
+                      pageTitle: outputStore[subTask.order]?.page_title || null,
+                      tabId: chainTabId || null,
+                    },
+                  });
                   continue; // Move to next sub-task — user will click the button manually
                 }
                 // Record success
@@ -7045,7 +8544,8 @@ async function handleMessage(request, sender) {
                   });
                 } catch { /* non-critical */ }
               } else {
-                // Recipe failed — mark for AI fallback reporting
+                // Recipe failed at runtime — fall back to scoped execution for this
+                // specific mission step instead of restarting the whole request.
                 stepResult = { success: false, error: stepResult?.error || 'Recipe replay failed' };
                 // Report failure to backend so confidence updates (mirrors auto-replay at line ~6055)
                 try {
@@ -7065,10 +8565,15 @@ async function handleMessage(request, sender) {
                 });
               } catch { /* non-critical */ }
             }
-          } else {
+          } else if (!stepResult) {
             // LAST-CHANCE RECIPE CHECK: The chain planner may have mislabeled the category.
             // Try a domain-only recipe lookup before falling to expensive AI reasoning.
-            if (subTask.domain) {
+            const hasRuntimeResolvedInputs = Array.isArray(subTask.pendingInputs) && subTask.pendingInputs.length > 0;
+            const forceStructuredExplore = subTask.executionMethod === 'structured_explore' || subTask.executionMethod === 'ai_reasoning';
+            if (hasRuntimeResolvedInputs || forceStructuredExplore) {
+              console.log(`[BG] Chain sub-task ${subTask.order}: skipping last-chance recipe because this step is locked to scoped exploration`);
+            }
+            if (subTask.domain && !hasRuntimeResolvedInputs && !forceStructuredExplore) {
               try {
                 const lastChanceRes = await fetch(
                   `${API_BASE}/api/recipes/match?siteDomain=${encodeURIComponent(subTask.domain)}&task=${encodeURIComponent(subTask.intent || userPrompt)}`,
@@ -7122,142 +8627,46 @@ async function handleMessage(request, sender) {
                 }
               } catch { /* last-chance lookup failed — continue to AI */ }
             }
+          }
 
-            // AI REASONING — no recipe available, use the full AI agent for this sub-task
-            if (!stepResult || !stepResult.success) {
-            // Compose guard: if email compose was already opened by a prior sub-task or recipe,
-            // skip this sub-task to avoid duplicate compose windows
-            if (composeOpened && /compose|email|send|write/i.test(subTask.category || subTask.intent || '')) {
-              console.log(`[BG] Chain sub-task ${subTask.order}: skipping — compose already opened`);
-              stepResult = { success: true, durationMs: 0, skippedDuplicate: true };
-            } else {
-            console.log(`[BG] Chain sub-task ${subTask.order} ("${subTask.intent}") has no recipe — falling through to AI`);
-            // Build a focused prompt for just this sub-task, incorporating resolved inputs + previous step data
-            const inputContext = Object.entries(resolvedInputs)
-              .map(([k, v]) => `${k}: ${v}`)
-              .join(', ');
-            // Include previous step outputs so AI knows what was found (e.g., product details for email)
-            const prevStepData = Object.entries(outputStore)
-              .map(([stepOrder, data]) => {
-                const parts = [`Step ${stepOrder}: ${data.page_title || 'completed'}`];
-                if (data.page_url) parts.push(`URL: ${data.page_url}`);
-                if (data.page_content) parts.push(data.page_content.slice(0, 1500));
-                return parts.join(' | ');
-              })
-              .join('\n');
-            const contextParts = [`Current task: ${subTask.intent}`];
-            contextParts.push(`Original request: ${userPrompt}`);
-            if (inputContext) contextParts.push(`Inputs: ${inputContext}`);
-            if (prevStepData) contextParts.push(`Data from previous steps:\n${prevStepData}`);
-            const focusedPrompt = contextParts.join('\n');
-
-            try {
-              // Get current tab context for the AI
-              const [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-              const currentUrl = currentTab?.url || `https://${subTask.domain}`;
-
-              // Deterministic compose path: if this chain step already resolved the
-              // recipient/body/subject and we're on Gmail, use the native compose
-              // helper instead of re-parsing the whole prompt through /agent/process.
-              if (
-                subTask.category === 'compose' &&
-                /mail\.google\.com/i.test(subTask.domain || '') &&
-                currentTab?.id &&
-                /mail\.google\.com/i.test(currentUrl) &&
-                (resolvedInputs.recipient || resolvedInputs.to) &&
-                (resolvedInputs.body || resolvedInputs.message || resolvedInputs.replyBody)
-              ) {
-                const composeResult = await handleMessage({
-                  type: 'gmail_compose',
-                  data: {
-                    tabId: currentTab.id,
-                    data: {
-                      to: resolvedInputs.recipient || resolvedInputs.to,
-                      subject: resolvedInputs.subject || '',
-                      body: resolvedInputs.body || resolvedInputs.message || resolvedInputs.replyBody || '',
-                    },
-                  },
-                }, {});
-
-                stepResult = {
-                  success: !!composeResult?.success,
-                  durationMs: 0,
-                  error: composeResult?.error || null,
-                };
-              } else {
-
-              // Scrape page context for AI
-              let aiPageContext = { url: currentUrl, siteHint: null };
-              try {
-                const [scraped] = await chrome.scripting.executeScript({
-                  target: { tabId: currentTab.id },
-                  func: () => ({
-                    title: document.title,
-                    text: document.body?.innerText?.slice(0, 3000) || '',
-                  }),
-                });
-                if (scraped?.result) {
-                  aiPageContext.title = scraped.result.title;
-                  aiPageContext.visibleText = scraped.result.text;
-                }
-              } catch { /* page may block injection */ }
-
-              const aiRes = await fetch(`${API_BASE}/api/agent/process`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                body: JSON.stringify({
-                  userPrompt: focusedPrompt,
-                  pageContext: aiPageContext,
-                  userMemory: userMemory || null,
-                  conversationHistory: [],
-                }),
-              });
-              if (aiRes.ok) {
-                const aiData = await aiRes.json();
-
-                // If AI returned EXPLORE, run a mini exploration for this chain sub-task
-                if (aiData.action_type === 'EXPLORE' && aiData.explore_plan) {
-                  console.log(`[BG] Chain sub-task ${subTask.order}: AI returned EXPLORE — running mini exploration`);
-                  try {
-                    const exploreResult = await runExplorationLoop(
-                      aiData.explore_plan,
-                      currentTab.id,
-                      token,
-                      null, // no resume state
-                      { originalPrompt: userPrompt, phase: 1, previousPhases: [], totalSteps: 0, dataBuffer: '' }
-                    );
-                    stepResult = {
-                      success: exploreResult.success,
-                      durationMs: 0,
-                      error: exploreResult.error || null,
-                      exploreGoalResult: exploreResult.goalResult || null,
-                    };
-                  } catch (exploreErr) {
-                    console.warn(`[BG] Chain sub-task ${subTask.order}: mini-exploration failed:`, exploreErr.message);
-                    stepResult = { success: false, error: `Exploration failed: ${exploreErr.message}` };
-                  }
-                } else if (aiData.action_type === 'NAVIGATE' && aiData.navigate_url) {
-                  // Simple navigation — execute it
-                  try {
-                    await chrome.tabs.update(currentTab.id, { url: aiData.navigate_url });
-                    await new Promise(r => setTimeout(r, 3000)); // Wait for page load
-                    stepResult = { success: true, aiAction: aiData, durationMs: 0 };
-                  } catch (navErr) {
-                    stepResult = { success: false, error: `Navigation failed: ${navErr.message}` };
-                  }
-                } else {
-                  // Other action types (RECOMMENDATION, etc.) — mark as success, capture outputs
-                  stepResult = { success: true, aiAction: aiData, durationMs: 0 };
-                }
-              } else {
-                stepResult = { success: false, error: 'AI reasoning failed for chain sub-task' };
-              }
-              }
-            } catch (aiErr) {
-              stepResult = { success: false, error: `AI fallback error: ${aiErr.message}` };
+          // Once a chain step has started, never bounce the entire original prompt
+          // back through generic /agent/process. Keep recovery local to this step.
+          if ((!stepResult || !stepResult.success) &&
+              missingPreviousStepInputs.length === 0 &&
+              !(explorationAborted || thisRequestGeneration !== currentRequestGeneration)) {
+            if (subTask.executionMethod === 'recipe_replay' && stepResult?.error) {
+              console.warn(`[BG] Chain sub-task ${subTask.order}: recipe path failed, switching to scoped fallback: ${stepResult.error}`);
             }
-            } // end else (compose guard)
-            } // end if (!stepResult || !stepResult.success) — last-chance recipe may have succeeded
+            stepResult = await executeScopedChainFallback(subTask, resolvedInputs);
+          }
+
+          if (stepResult?.success) {
+            capturedStepOutput = await captureChainOutputSnapshot(stepResult, subTask);
+            let missingRequiredOutputs = getMissingRequiredSubTaskOutputs(subTask, capturedStepOutput);
+
+            if (missingRequiredOutputs.length > 0) {
+              const canRetryWithScopedFallback =
+                stepResult?.executionMethodUsed !== 'structured_explore' &&
+                stepResult?.executionMethodUsed !== 'compose_skip';
+
+              if (canRetryWithScopedFallback &&
+                  !(explorationAborted || thisRequestGeneration !== currentRequestGeneration)) {
+                console.warn(`[BG] Chain sub-task ${subTask.order}: step succeeded but required handoff outputs are missing [${missingRequiredOutputs.join(', ')}] — continuing with scoped fallback`);
+                stepResult = await executeScopedChainFallback(subTask, resolvedInputs);
+                if (stepResult?.success) {
+                  capturedStepOutput = await captureChainOutputSnapshot(stepResult, subTask);
+                  missingRequiredOutputs = getMissingRequiredSubTaskOutputs(subTask, capturedStepOutput);
+                }
+              }
+
+              if (missingRequiredOutputs.length > 0) {
+                stepResult = {
+                  success: false,
+                  error: `Step did not produce required handoff outputs: ${missingRequiredOutputs.join(', ')}`,
+                  executionMethodUsed: stepResult?.executionMethodUsed || subTask.executionMethod,
+                };
+              }
+            }
           }
 
           // Track compose opens to prevent duplicate compose windows
@@ -7269,7 +8678,7 @@ async function handleMessage(request, sender) {
           // The visible content is critical for cross-step context (e.g., search results → email body)
           if (stepResult?.success) {
             try {
-              const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+              const activeTab = await getChainTab();
               const capturedOutput = {
                 page_url: activeTab?.url || '',
                 page_title: activeTab?.title || '',
@@ -7291,31 +8700,63 @@ async function handleMessage(request, sender) {
                 }
               } catch { /* page may block injection — continue without content */ }
 
-              outputStore[subTask.order] = capturedOutput;
+              outputStore[subTask.order] = capturedStepOutput || capturedOutput;
             } catch {
-              outputStore[subTask.order] = {};
+              outputStore[subTask.order] = capturedStepOutput || {};
             }
+          } else {
+            delete outputStore[subTask.order];
           }
 
           chainResults.push({
             order: subTask.order,
             intent: subTask.intent,
             domain: subTask.domain,
-            method: subTask.executionMethod,
+            method: stepResult?.executionMethodUsed || subTask.executionMethod,
             recipeName: subTask.recipe?.autoDescription || subTask.recipe?.workflowName || null,
             success: !!stepResult?.success,
             duration: stepResult?.durationMs || 0,
-            error: stepResult?.error || null,
+            error: stepResult?.error || stepResult?.exploreGoalResult || null,
           });
 
           // Notify UI that this sub-task completed
           broadcastChainProgress(
             subTask.order, totalSubTasks,
             stepResult?.success
-              ? `Done: ${subTask.intent}`
-              : `Failed: ${subTask.intent}`,
-            nextSubTask ? `Next: ${nextSubTask.intent}` : 'Finishing up...'
+              ? describeChainStep(subTask, 'done')
+              : describeChainStep(subTask, 'failed'),
+            nextSubTask ? describeChainStep(nextSubTask, 'working') : 'Finishing up...'
           );
+
+          await setMissionStepState(subTask, stepResult?.success ? 'COMPLETED' : 'FAILED', {
+            missionStatus: stepResult?.success ? 'RUNNING' : 'FAILED',
+            currentStepLabel: stepResult?.success ? describeChainStep(subTask, 'done') : describeChainStep(subTask, 'failed'),
+            nextStepLabel: nextSubTask ? describeChainStep(nextSubTask, 'working') : 'Finishing up...',
+            inputs: {
+              declaredInputs: (subTask.inputs || []).map(input => ({
+                name: input?.name || null,
+                source: input?.source || null,
+                fromStep: Number.isFinite(Number(input?.fromStep)) ? Number(input.fromStep) : null,
+                fromOutput: input?.fromOutput || null,
+              })),
+              resolvedInputs,
+            },
+            outputs: outputStore[subTask.order] || capturedStepOutput || null,
+            runtimeData: {
+              executionMethod: stepResult?.executionMethodUsed || subTask.executionMethod,
+              category: subTask.category || null,
+              exploreGoalResult: stepResult?.exploreGoalResult || null,
+            },
+            lastError: stepResult?.success ? null : (stepResult?.error || stepResult?.exploreGoalResult || 'Unknown error'),
+            completedAt: new Date().toISOString(),
+            verifiedAt: stepResult?.success ? new Date().toISOString() : undefined,
+            structuredOutputs: outputStore,
+            lastKnownContext: {
+              pageUrl: outputStore[subTask.order]?.page_url || capturedStepOutput?.page_url || url || null,
+              pageTitle: outputStore[subTask.order]?.page_title || capturedStepOutput?.page_title || null,
+              tabId: chainTabId || null,
+            },
+          });
 
           // If a critical sub-task failed, stop the chain
           if (!stepResult?.success) {
@@ -7324,15 +8765,59 @@ async function handleMessage(request, sender) {
           }
         }
 
-        // If all recipe sub-tasks succeeded, return the chain result
+        // If all chain sub-tasks succeeded, return the chain result
         if (chainSuccess) {
           chrome.storage.session.remove('replayActivity').catch(() => {});
+          chrome.storage.session.set({
+            agentProgress: {
+              active: false,
+              source: 'chain',
+              status: 'done',
+              description: 'Mission complete',
+              timestamp: Date.now(),
+            },
+          }).catch(() => {});
+          const terminalContext = await getChainTab().catch(() => null);
+          await setMissionRuntimeState('COMPLETED', {
+            currentStepOrder: totalSubTasks,
+            currentStepLabel: 'Mission complete',
+            nextStepLabel: '',
+            structuredOutputs: outputStore,
+            lastKnownContext: {
+              pageUrl: terminalContext?.url || url || null,
+              pageTitle: terminalContext?.title || null,
+              tabId: terminalContext?.id || chainTabId || null,
+            },
+            completedAt: new Date().toISOString(),
+          });
           const totalDuration = chainResults.reduce((sum, r) => sum + (r.duration || 0), 0);
           const recipesUsed = chainResults.filter(r => r.method === 'recipe_replay' && r.success).length;
           const awaitingActions = chainResults.filter(r => r.awaitingUserAction);
           const headline = awaitingActions.length > 0
             ? `Chain complete! ${chainResults.length} tasks done — ${awaitingActions.length} awaiting your click`
             : `Chain complete! ${chainResults.length} tasks done`;
+          const responseData = {
+            action_type: 'RECIPE_REPLAY_COMPLETE',
+            headline,
+            primary_content: chainResults.map(r => {
+              const status = r.awaitingUserAction
+                ? `Awaiting your click on "${r.consequentialStep}"`
+                : r.success ? 'Done' : 'Failed';
+              return `${r.order}. ${r.intent} (${r.domain}) â€” ${status}${r.recipeName ? ' via "' + r.recipeName + '"' : ''}`;
+            }).join('\n'),
+            chain_results: chainResults,
+            consent_level: 'none',
+            missionId: activeMissionId || null,
+            threadId: activeThreadId || null,
+          };
+          responseData.primary_content = chainResults.map(r => {
+            const status = r.awaitingUserAction
+              ? `Awaiting your click on "${r.consequentialStep}"`
+              : r.success ? 'Done' : 'Failed';
+            return `${r.order}. ${r.intent} (${r.domain}) - ${status}${r.recipeName ? ' via "' + r.recipeName + '"' : ''}`;
+          }).join('\n');
+          await persistLocalAgentResult({ token, threadId: activeThreadId, missionId: activeMissionId, userPrompt, responseData, pageContext });
+          await clearAgentMissionEnvelope();
           return {
             success: true,
             data: {
@@ -7346,16 +8831,98 @@ async function handleMessage(request, sender) {
               }).join('\n'),
               chain_results: chainResults,
               consent_level: 'none',
+              missionId: activeMissionId || null,
+              threadId: activeThreadId || null,
             },
           };
         }
-        // If chain failed partway, fall through to AI for the remaining request
+        // A chain failure should surface as a chain failure, not restart the
+        // whole mission via generic /agent/process from the wrong page.
         chrome.storage.session.remove('replayActivity').catch(() => {});
-        console.log('[BG] Chain execution incomplete, falling through to AI');
+        chrome.storage.session.set({
+          agentProgress: {
+            active: false,
+            source: 'chain',
+            status: chainSuperseded ? 'superseded' : chainCancelledByUser ? 'cancelled' : 'failed',
+            description: chainSuperseded ? 'Mission superseded' : chainCancelledByUser ? 'Mission stopped' : 'Mission failed',
+            timestamp: Date.now(),
+          },
+        }).catch(() => {});
+        const terminalContext = await getChainTab().catch(() => null);
+        await setMissionRuntimeState(chainSuperseded || chainCancelledByUser ? 'CANCELED' : 'FAILED', {
+          currentStepOrder: chainResults.length > 0 ? chainResults[chainResults.length - 1].order : 0,
+          currentStepLabel: chainSuperseded ? 'Mission superseded' : chainCancelledByUser ? 'Mission stopped' : 'Mission failed',
+          nextStepLabel: '',
+          lastError: chainSuperseded
+            ? 'A newer request replaced this mission while it was running.'
+            : chainCancelledByUser
+              ? 'Mission stopped by user.'
+              : (chainResults.find(r => !r.success)?.error || 'A mission step could not be completed.'),
+          structuredOutputs: outputStore,
+          lastKnownContext: {
+            pageUrl: terminalContext?.url || url || null,
+            pageTitle: terminalContext?.title || null,
+            tabId: terminalContext?.id || chainTabId || null,
+          },
+          completedAt: new Date().toISOString(),
+        });
+        await clearAgentMissionEnvelope();
+        if (chainSuperseded) {
+          return {
+            success: false,
+            errorType: 'REQUEST_SUPERSEDED',
+            error: 'A newer request replaced this mission while it was running.',
+            silent: true,
+          };
+        }
+        if (chainCancelledByUser) {
+          return {
+            success: false,
+            errorType: 'REQUEST_CANCELLED',
+            error: 'Mission stopped by user.',
+            silent: true,
+          };
+        }
+        const failedStep = chainResults.find(r => !r.success) || null;
+        const failureReason = explorationAborted
+          ? 'Stopped by user request.'
+          : (failedStep?.error || 'A mission step could not be completed.');
+        const failureHeadline = explorationAborted
+          ? 'Mission stopped'
+          : failedStep
+            ? `Still working on ${describeChainStep(failedStep, 'working').toLowerCase()}`
+            : 'Mission needs attention';
+        const responseData = {
+          action_type: 'CHAIN_EXECUTION_FAILED',
+          headline: failureHeadline,
+          primary_content: chainResults.length > 0
+            ? [
+              failureReason,
+              '',
+              ...chainResults.map(r => `${r.order}. ${r.intent} (${r.domain}) - ${r.success ? 'Done' : `Failed: ${r.error || 'Unknown error'}`}`),
+            ].join('\n')
+            : failureReason,
+          chain_results: chainResults,
+          consent_level: 'none',
+          missionId: activeMissionId || null,
+          threadId: activeThreadId || null,
+        };
+        await persistLocalAgentResult({ token, threadId: activeThreadId, missionId: activeMissionId, userPrompt, responseData, pageContext });
+        return { success: true, data: responseData };
       }
     } catch (chainErr) {
       // Non-critical — fall through to normal AI flow
       chrome.storage.session.remove('replayActivity').catch(() => {});
+      chrome.storage.session.set({
+        agentProgress: {
+          active: false,
+          source: 'chain',
+          status: 'error',
+          description: 'Chain execution fell back to the general agent',
+          timestamp: Date.now(),
+        },
+      }).catch(() => {});
+      await clearAgentMissionEnvelope();
       console.warn('[BG] Chain execution check failed (non-fatal):', chainErr.message);
     }
 
@@ -7366,7 +8933,7 @@ async function handleMessage(request, sender) {
       res = await fetch(`${API_BASE}/api/agent/process`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ userPrompt, pageContext: { ...pageContext, siteHint: siteHint || null }, userMemory, conversationHistory: conversationHistory || [], threadId: threadId || null, ...byokPayload(byokConfig) })
+        body: JSON.stringify({ userPrompt, pageContext: { ...pageContext, siteHint: effectiveSiteHint || null }, userMemory, conversationHistory: conversationHistory || [], threadId: activeThreadId || null, ...byokPayload(byokConfig) })
       });
     } catch (fetchErr) {
       return { success: false, errorType: 'NETWORK_ERROR', error: `Cannot reach server: ${fetchErr.message}` };
@@ -7397,10 +8964,16 @@ async function handleMessage(request, sender) {
     // is synchronous in terms of initiating the request, so the URL is captured
     // by any fetch interceptor (e.g. tests) before this function returns.
     if (containsPersonalInfo(userPrompt)) {
-      fetch(`${API_BASE}/api/memory/harvest`, {
+      fetch(`${API_BASE}/api/memory/signal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ source: 'chat', text: userPrompt }),
+        body: JSON.stringify({
+          signalType: 'custom',
+          data: {
+            content: `Chat message: ${userPrompt}`,
+            context: 'chat_personal_info',
+          },
+        }),
       }).catch(() => {});
     }
 
@@ -7594,9 +9167,10 @@ async function handleMessage(request, sender) {
   if (request.type === 'explore_cancel') {
     console.log('[BG] Exploration cancel requested by user');
     explorationAborted = true;
+    currentRequestGeneration += 1;
     // Clean up storage immediately so panel recovery doesn't re-trigger
     try {
-      await chrome.storage.session.remove(['explorationActive', 'explorationResult', 'explorationProgress']);
+      await chrome.storage.session.remove(['explorationActive', 'explorationResult', 'explorationProgress', 'replayActivity']);
     } catch {}
     return { success: true, cancelled: true };
   }
@@ -7877,13 +9451,16 @@ async function handleMessage(request, sender) {
   if (request.type === 'gmail_compose') {
     const { tabId, data } = request.data;
     try {
-      const result = await chrome.tabs.sendMessage(tabId, {
+      const targetTabId = await ensureGmailComposeTab(tabId, data);
+      await new Promise(r => setTimeout(r, 400));
+
+      const result = await chrome.tabs.sendMessage(targetTabId, {
         type: 'gmail_compose',
         data,
       });
-      return result;
+      return { ...(result || {}), tabId: targetTabId };
     } catch {
-      return { success: false, error: 'Gmail content script not ready. Please reload Gmail.' };
+      return { success: false, error: 'Gmail could not be opened for composing right now. Please reload Gmail and try again.' };
     }
   }
 
@@ -9127,11 +10704,24 @@ async function handleMessage(request, sender) {
   // ── LEARNING MODE: Forward replay progress to side panel ──
   if (request.type === 'replay_progress') {
     try {
-      await updateReplayActivity({
-        mode: 'recipe_replay',
-        ...(request.data || {}),
-        phase: request.data?.isLlmStep ? 'generating' : 'running_step',
-      });
+      const { replayActivity } = await chrome.storage.session.get(['replayActivity']);
+      if (replayActivity?.active && replayActivity.source === 'chain') {
+        await chrome.storage.session.set({
+          replayActivity: {
+            ...replayActivity,
+            nestedStepNumber: request.data?.stepNumber || replayActivity.nestedStepNumber || 0,
+            nestedTotalSteps: request.data?.totalSteps || replayActivity.nestedTotalSteps || 0,
+            nestedDescription: request.data?.description || replayActivity.nestedDescription || '',
+            timestamp: Date.now(),
+          },
+        });
+      } else {
+        await updateReplayActivity({
+          mode: 'recipe_replay',
+          ...(request.data || {}),
+          phase: request.data?.isLlmStep ? 'generating' : 'running_step',
+        });
+      }
       await chrome.runtime.sendMessage({
         type: 'replay_progress',
         data: request.data,
