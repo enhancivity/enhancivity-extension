@@ -1478,6 +1478,7 @@ function buildComposeEmailPayload(data) {
     const stepValueObject = parseComposeObject(step.value) ||
       (step.value && typeof step.value === 'object' && !Array.isArray(step.value) ? step.value : null);
     const rawValue = typeof step.value === 'string' ? step.value : '';
+    const rawValueLooksLikeInstruction = step.action === 'semantic_fill' && !stepValueObject;
     const inlineEmail = extractFirstEmailAddress(rawValue || description);
 
     if (!composeData.to) {
@@ -1495,10 +1496,10 @@ function buildComposeEmailPayload(data) {
     if (!composeData.subject) {
       if (selector.includes('subject') || /subject/.test(descriptionLower)) {
         composeData.subject = firstNonEmptyComposeString(
-          rawValue,
           stepValueObject?.subject,
           stepValueObject?.title,
           step.subject,
+          rawValueLooksLikeInstruction ? '' : rawValue,
         );
       }
     }
@@ -1506,11 +1507,11 @@ function buildComposeEmailPayload(data) {
     if (!composeData.body) {
       if (selector.includes('body') || selector.includes('editable') || /body|message|draft|reply/.test(descriptionLower)) {
         composeData.body = firstNonEmptyComposeString(
-          rawValue,
           stepValueObject?.body,
           stepValueObject?.message,
           stepValueObject?.replyBody,
           step.body,
+          rawValueLooksLikeInstruction ? '' : rawValue,
         );
       }
     }

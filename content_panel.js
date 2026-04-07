@@ -255,6 +255,7 @@
 
   const host = document.createElement('div');
   host.id = 'enh-panel-host';
+  host.setAttribute('data-enhancivity-owned', 'true');
   host.style.cssText = 'all:initial;position:fixed;z-index:2147483647;top:0;left:0;width:0;height:0;pointer-events:none;';
 
   const shadow = host.attachShadow({ mode: 'closed' });

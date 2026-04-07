@@ -21,6 +21,35 @@
 
   const MAX_SESSION_ACTION_HISTORY = 20;
   let sessionActionHistory = [];
+  const ENHANCIVITY_OWNED_ROOT_SELECTOR = [
+    '[data-enhancivity-owned="true"]',
+    '#enh-agent-hud',
+    '#enh-consent-overlay',
+    '#enh-panel-host',
+  ].join(', ');
+
+  function isEnhancivityOwnedNode(node) {
+    let current = node?.nodeType === Node.ELEMENT_NODE
+      ? node
+      : node?.parentElement || null;
+
+    while (current) {
+      try {
+        if (current.matches?.(ENHANCIVITY_OWNED_ROOT_SELECTOR)) {
+          return true;
+        }
+      } catch {}
+
+      const root = current.getRootNode?.();
+      if (root?.host && root.host !== current) {
+        current = root.host;
+        continue;
+      }
+      current = current.parentElement || null;
+    }
+
+    return false;
+  }
 
   function normalizeSessionActionHistoryEntry(entry = {}) {
     return {
@@ -2345,6 +2374,7 @@
           acceptNode(node) {
             const parent = node.parentElement;
             if (!parent) return NodeFilter.FILTER_REJECT;
+            if (isEnhancivityOwnedNode(parent)) return NodeFilter.FILTER_REJECT;
             if (SKIP_TAGS.has(parent.tagName)) return NodeFilter.FILTER_REJECT;
             if (parent.offsetWidth === 0 && parent.offsetHeight === 0) return NodeFilter.FILTER_REJECT;
             const text = node.textContent.trim();
@@ -2880,6 +2910,7 @@
         const seen = new Set();
         function maybeAddModal(el) {
           if (!el || seen.has(el)) return;
+          if (isEnhancivityOwnedNode(el)) return;
           const rect = el.getBoundingClientRect();
           // Dropdown menus can be narrow — use smaller thresholds
           if (rect.width < 40 || rect.height < 30) return;
@@ -3302,6 +3333,7 @@
           if (elements.length >= MAX_ELEMENTS) return;
           if (!node || !node.tagName) return;
           if (SKIP.has(node.tagName)) return;
+          if (isEnhancivityOwnedNode(node)) return;
 
           const type = classifyElement(node);
           const text = getElementText(node);
@@ -3337,6 +3369,7 @@
           if (!node || !node.tagName) return;
           if (SKIP.has(node.tagName)) return;
           if (modalSet.has(node)) return;
+          if (isEnhancivityOwnedNode(node)) return;
 
           const type = classifyElement(node);
           const text = getElementText(node);

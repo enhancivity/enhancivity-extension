@@ -1319,6 +1319,39 @@ function waitForTabLoad(tabId, timeout = 15000, extraDelay = 2000) {
   });
 }
 
+// Redeclared immediately after the legacy version so the service worker uses
+// the hardened implementation below. This catches tabs that are already in
+// "complete" state before the onUpdated listener attaches.
+function waitForTabLoad(tabId, timeout = 15000, extraDelay = 2000) {
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    };
+
+    const finishAfterDelay = () => setTimeout(finish, extraDelay);
+    const timer = setTimeout(finish, timeout);
+
+    function listener(id, info) {
+      if (id === tabId && info.status === 'complete') {
+        finishAfterDelay();
+      }
+    }
+
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.get(tabId).then((tab) => {
+      if (tab?.status === 'complete') {
+        finishAfterDelay();
+      }
+    }).catch(() => {});
+  });
+}
+
 function buildGmailComposeUrl(composeData = {}) {
   const to = String(composeData?.to || composeData?.recipient || '').trim();
   const subject = String(composeData?.subject || '').trim();
@@ -1341,6 +1374,9 @@ async function ensureGmailComposeTab(preferredTabId = null, composeData = {}, de
   const windowsApi = deps.windows || chrome.windows;
   const waitForLoad = deps.waitForTabLoad || waitForTabLoad;
   const composeUrl = buildGmailComposeUrl(composeData);
+  const sendTabMessage = typeof tabsApi.sendMessage === 'function'
+    ? tabsApi.sendMessage.bind(tabsApi)
+    : chrome.tabs.sendMessage.bind(chrome.tabs);
 
   let targetTabId = preferredTabId;
 
@@ -1354,9 +1390,48 @@ async function ensureGmailComposeTab(preferredTabId = null, composeData = {}, de
     }
   };
 
+  const getComposeSurfaceState = async (candidateTabId) => {
+    if (!(await isGmailTab(candidateTabId))) {
+      return { alive: false, composeReady: false };
+    }
+
+    await scriptingApi.executeScript({
+      target: { tabId: candidateTabId },
+      files: ['content_gmail.js'],
+    }).catch(() => {});
+
+    try {
+      const pong = await sendTabMessage(candidateTabId, { type: 'gmail_ping' });
+      return {
+        alive: !!pong?.alive,
+        composeReady: !!pong?.composeReady,
+      };
+    } catch {
+      return { alive: false, composeReady: false };
+    }
+  };
+
+  const preferredComposeState = await getComposeSurfaceState(targetTabId);
+  if (preferredComposeState.composeReady) {
+    await tabsApi.update(targetTabId, { active: true }).catch(() => {});
+    const focusedTab = await tabsApi.get(targetTabId).catch(() => null);
+    if (focusedTab?.windowId) {
+      await windowsApi.update(focusedTab.windowId, { focused: true }).catch(() => {});
+    }
+    return targetTabId;
+  }
+
   if (!(await isGmailTab(targetTabId))) {
     const existingGmailTabs = await tabsApi.query({ url: ['https://mail.google.com/*'] }).catch(() => []);
-    const reusableGmailTab = existingGmailTabs.find(tab => String(tab?.url || '').includes('mail.google.com')) || null;
+    let reusableGmailTab = null;
+
+    for (const candidateTab of existingGmailTabs) {
+      if (!candidateTab?.id) continue;
+      const composeState = await getComposeSurfaceState(candidateTab.id);
+      if (composeState.composeReady) continue; // never hijack a live draft in another Gmail tab
+      reusableGmailTab = candidateTab;
+      break;
+    }
 
     if (reusableGmailTab?.id) {
       targetTabId = reusableGmailTab.id;
@@ -1389,6 +1464,164 @@ async function ensureGmailComposeTab(preferredTabId = null, composeData = {}, de
   }).catch(() => {});
 
   return targetTabId;
+}
+
+function normalizeGmailDraftText(text, maxLength = 4000) {
+  return String(text || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\r/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function getActiveGmailDraftContext(pageContext = {}) {
+  const activeDraft = pageContext?.activeDraft && typeof pageContext.activeDraft === 'object'
+    ? pageContext.activeDraft
+    : {};
+
+  const recipients = Array.isArray(activeDraft.recipients)
+    ? activeDraft.recipients
+      .map(value => normalizeGmailDraftText(value, 200))
+      .filter(Boolean)
+      .slice(0, 10)
+    : [];
+
+  const subject = normalizeGmailDraftText(activeDraft.subject || '', 250);
+  const body = normalizeGmailDraftText(activeDraft.body || '');
+  const mode = normalizeGmailDraftText(activeDraft.mode || '', 50);
+  const kind = normalizeGmailDraftText(activeDraft.kind || '', 50);
+  const composeReady = !!activeDraft.composeReady || !!mode || !!body || !!subject || recipients.length > 0;
+
+  return {
+    composeReady,
+    hasTypedContent: !!(body || subject || recipients.length),
+    recipients,
+    subject,
+    body,
+    mode,
+    kind,
+  };
+}
+
+function isInlineGmailDraftRequest(userPrompt = '', pageContext = {}) {
+  if (pageContext?.site !== 'gmail') return false;
+
+  const draft = getActiveGmailDraftContext(pageContext);
+  if (!draft.composeReady) return false;
+
+  const lower = String(userPrompt || '').trim().toLowerCase();
+  if (!lower) return false;
+
+  if (/[^\s@]+@[^\s@]+\.[^\s@]+/.test(lower)) return false;
+  if (/\b(search|find|look\s*for|open|visit|go to|navigate|switch to|show me|check inbox|search inbox|latest)\b/i.test(lower)) return false;
+  if (/\b(new email|new message|open compose|compose new|start a new email)\b/i.test(lower)) return false;
+  if (/\b(send email to|reply to)\b/i.test(lower)) return false;
+
+  const mentionsDraft = /\b(email|mail|reply|response|draft|message)\b/i.test(lower);
+  const deicticReference = /\b(this|here|current|above|below)\b/i.test(lower);
+  const editVerb = /\b(rewrite|re-write|reword|rephrase|refine|polish|improve|edit|articulate|clarify|tighten|fix|proofread)\b/i.test(lower);
+  const styleRequest = /\b(more articulate|more professional|more polite|more concise|clearer|more clear|better worded|more formal|more natural)\b/i.test(lower);
+  const writeHere = /\b(write|draft|compose|generate)\b/i.test(lower) && (mentionsDraft || deicticReference);
+
+  if (editVerb && (mentionsDraft || deicticReference)) return true;
+  if (styleRequest && (mentionsDraft || deicticReference)) return true;
+  if (writeHere && (draft.hasTypedContent || /\breply\b/i.test(lower))) return true;
+  return false;
+}
+
+function buildInlineGmailDraftPrompt(userPrompt = '', pageContext = {}) {
+  const draft = getActiveGmailDraftContext(pageContext);
+
+  return [
+    userPrompt,
+    '',
+    'IMPORTANT CONTEXT:',
+    `The user is already editing a Gmail ${draft.kind || 'draft'} on the current page${draft.mode ? ` (${draft.mode})` : ''}.`,
+    'Treat company or product names mentioned in the thread or draft, including AWS, as email content and not as websites to open.',
+    'Do NOT search the inbox.',
+    'Do NOT navigate, switch tabs, or open another website.',
+    'Do NOT open a new compose window.',
+    'Revise the existing draft so it can be inserted into the current Gmail editor.',
+    'Return the improved draft body. Only provide a subject rewrite if the user explicitly asked for one.',
+    pageContext?.sender ? `Thread sender: ${pageContext.sender}` : '',
+    pageContext?.subject ? `Thread subject: ${pageContext.subject}` : '',
+    draft.recipients.length ? `Current draft recipients: ${draft.recipients.join(', ')}` : '',
+    draft.subject ? `Current draft subject: ${draft.subject}` : '',
+    draft.body ? `Current draft body:\n${draft.body}` : 'Current draft body: (empty)',
+  ].filter(Boolean).join('\n');
+}
+
+function extractInlineGmailDraftPayload(data = {}) {
+  const primaryContent = data?.primary_content;
+  const payload = primaryContent && typeof primaryContent === 'object' && !Array.isArray(primaryContent)
+    ? primaryContent
+    : {};
+
+  return {
+    subject: normalizeGmailDraftText(payload.subject || '', 250),
+    body: normalizeGmailDraftText(
+      payload.replyBody ||
+      payload.body ||
+      payload.message ||
+      payload.text ||
+      (typeof primaryContent === 'string' ? primaryContent : ''),
+      6000
+    ),
+  };
+}
+
+function normalizeInlineGmailDraftResponse(data = {}, pageContext = {}) {
+  if (!data || typeof data !== 'object') return data;
+
+  const { subject, body } = extractInlineGmailDraftPayload(data);
+  if (data.action_type === 'COMPOSE_EMAIL') {
+    if (!subject && !body) return data;
+
+    const primaryContent = data.primary_content && typeof data.primary_content === 'object' && !Array.isArray(data.primary_content)
+      ? { ...data.primary_content }
+      : {};
+
+    if (!primaryContent.subject && subject) primaryContent.subject = subject;
+    if (!primaryContent.body && !primaryContent.replyBody && body) primaryContent.body = body;
+
+    return {
+      ...data,
+      consent_level: data.consent_level === 'auto' ? 'soft' : (data.consent_level || 'soft'),
+      preview: data.preview || { summary: 'Updating the draft in your current Gmail editor.' },
+      primary_content: primaryContent,
+    };
+  }
+
+  if (data.action_type === 'FIND_AND_REPLY' && body) {
+    return {
+      ...data,
+      action_type: 'COMPOSE_EMAIL',
+      consent_level: 'soft',
+      headline: data.headline || 'Updating your Gmail draft',
+      preview: data.preview || { summary: 'Rewriting the draft in your current Gmail editor.' },
+      primary_content: {
+        ...(subject ? { subject } : {}),
+        body,
+      },
+    };
+  }
+
+  if (['NAVIGATE', 'SEARCH_SITE', 'USE_EXISTING_TAB'].includes(data.action_type) && body) {
+    return {
+      ...data,
+      action_type: 'COMPOSE_EMAIL',
+      consent_level: 'soft',
+      headline: data.headline || 'Updating your Gmail draft',
+      preview: { summary: 'Rewriting the draft in your current Gmail editor.' },
+      primary_content: {
+        ...(subject ? { subject } : {}),
+        body,
+      },
+    };
+  }
+
+  return data;
 }
 
 // ── DOM Stability Check ──────────────────────────────────────
@@ -1484,12 +1717,24 @@ async function sendWithTimeout(tabId, message, timeoutMs = RESPONSE_TIMEOUT_MS) 
 // the content script confirms { alive: true } or maxWaitMs expires.
 // On stable sites (Facebook), first ping returns instantly (faster than 400ms).
 // On aggressive SPAs (Reddit), waits up to 3s for React hydration.
-async function waitForPing(tabId, maxWaitMs = 3000, intervalMs = 100) {
+const DEFAULT_PING_CONFIG = Object.freeze({
+  message: { type: 'explore_ping' },
+  isAlive: (pong) => !!pong?.alive,
+});
+
+const GMAIL_PING_CONFIG = Object.freeze({
+  message: { type: 'gmail_ping' },
+  isAlive: (pong) => !!pong?.alive,
+});
+
+async function waitForPing(tabId, maxWaitMs = 3000, intervalMs = 100, pingConfig = DEFAULT_PING_CONFIG) {
   const start = Date.now();
+  const pingMessage = pingConfig?.message || DEFAULT_PING_CONFIG.message;
+  const isAlive = pingConfig?.isAlive || DEFAULT_PING_CONFIG.isAlive;
   while (Date.now() - start < maxWaitMs) {
     try {
-      const pong = await chrome.tabs.sendMessage(tabId, { type: 'explore_ping' });
-      if (pong?.alive) return true;
+      const pong = await chrome.tabs.sendMessage(tabId, pingMessage);
+      if (isAlive(pong)) return true;
     } catch {
       // Script not ready yet — keep polling
     }
@@ -1508,8 +1753,9 @@ const _pendingInjections = new Map(); // tabId → Promise<boolean>
 // When injecting these, we inject the dependency first.
 const _CONSEQUENTIAL_DEPENDENTS = new Set(['content_explore.js', 'content_replay.js', 'content_learning.js']);
 
-async function injectAndConfirm(tabId, scriptFile = 'content_explore.js') {
-  const existing = _pendingInjections.get(tabId);
+async function injectAndConfirm(tabId, scriptFile = 'content_explore.js', pingConfig = DEFAULT_PING_CONFIG) {
+  const injectionKey = `${tabId}:${scriptFile}`;
+  const existing = _pendingInjections.get(injectionKey);
   if (existing) {
     console.log(`[safeSendMessage] Injection already in-flight for tab ${tabId}, awaiting...`);
     return existing;
@@ -1541,18 +1787,18 @@ async function injectAndConfirm(tabId, scriptFile = 'content_explore.js') {
       console.warn(`[safeSendMessage] Cannot inject ${scriptFile} into tab ${tabId}: ${injectErr.message}`);
       return false;
     }
-    const ready = await waitForPing(tabId, 3000, 100);
+    const ready = await waitForPing(tabId, 3000, 100, pingConfig);
     if (!ready) {
       console.warn(`[safeSendMessage] ${scriptFile} injected but never responded to ping on tab ${tabId}`);
     }
     return ready;
   })();
 
-  _pendingInjections.set(tabId, injectionPromise);
+  _pendingInjections.set(injectionKey, injectionPromise);
   try {
     return await injectionPromise;
   } finally {
-    _pendingInjections.delete(tabId);
+    _pendingInjections.delete(injectionKey);
   }
 }
 
@@ -1561,7 +1807,7 @@ async function injectAndConfirm(tabId, scriptFile = 'content_explore.js') {
 // re-injection via injectAndConfirm (ping-confirmed readiness), and retry.
 // If the content script's async handler dies mid-execution (orphaned promise),
 // the timeout fires, triggers re-injection, and re-dispatches the same action.
-async function safeSendMessage(tabId, message, scriptFile = 'content_explore.js') {
+async function safeSendMessage(tabId, message, scriptFile = 'content_explore.js', pingConfig = DEFAULT_PING_CONFIG) {
   const CHANNEL_DEAD_ERRORS = [
     'Could not establish connection',
     'Receiving end does not exist',
@@ -1595,7 +1841,7 @@ async function safeSendMessage(tabId, message, scriptFile = 'content_explore.js'
   }
 
   // Re-inject with ping-confirmed readiness (replaces fixed 400ms wait)
-  const ready = await injectAndConfirm(tabId, scriptFile);
+  const ready = await injectAndConfirm(tabId, scriptFile, pingConfig);
   if (!ready) {
     return {
       success: false,
@@ -3443,8 +3689,29 @@ function looksLikeChainProductDetailPage(url, title = '', pageType = '', pageCon
   return hasPrice && hasPurchaseCue;
 }
 
+const GOOGLE_MEET_JOIN_PATH_RE = /^\/[a-z]{3}-[a-z]{4}-[a-z]{3}$/i;
+
+function extractCanonicalGoogleMeetLink(value = '') {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+
+  const match = raw.match(/(?:https?:\/\/)?meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}(?=$|[/?#\s)"',.;])/i);
+  if (!match) return null;
+
+  const candidate = /^https?:\/\//i.test(match[0]) ? match[0] : `https://${match[0]}`;
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.hostname.toLowerCase() !== 'meet.google.com') return null;
+    if (!GOOGLE_MEET_JOIN_PATH_RE.test(parsed.pathname)) return null;
+    return `https://meet.google.com${parsed.pathname.toLowerCase()}`;
+  } catch {
+    return null;
+  }
+}
+
 function isChainMeetingLink(value) {
-  return /meet\.google\.com\/[a-z0-9-]+|zoom\.us\/j\/\d+|teams\.microsoft\.com\/.*meetup/i.test(String(value || ''));
+  return !!extractCanonicalGoogleMeetLink(value) ||
+    /zoom\.us\/j\/\d+|teams\.microsoft\.com\/.*meetup/i.test(String(value || ''));
 }
 
 function getChainCandidateItems(stepData) {
@@ -3527,7 +3794,7 @@ function resolveChainStructuredValue(stepData, key, { allowCompatibilityFallback
   }
 
   if (key === 'meetingLink' && isChainMeetingLink(stepData.page_url)) {
-    return stepData.page_url;
+    return extractFirstChainMeetingLink(stepData.page_url) || stepData.page_url;
   }
 
   const pageType = stepData?.pageType || stepData?.page_type || '';
@@ -3549,46 +3816,22 @@ function resolveChainStructuredValue(stepData, key, { allowCompatibilityFallback
   return undefined;
 }
 
-function hasSatisfiedProductSelectionHandoff(stepData, { allowCompatibilityFallback = true } = {}) {
-  const candidateItems = resolveChainStructuredValue(stepData, 'candidateItems', { allowCompatibilityFallback });
-  if (Array.isArray(candidateItems) && candidateItems.some(item => hasUsableChainCandidateItem(item))) {
-    return true;
-  }
-
-  const selectedItemUrl = resolveChainStructuredValue(stepData, 'selectedItemUrl', { allowCompatibilityFallback });
-  return hasStructuredValue(selectedItemUrl);
-}
-
 function getMissingChainHandoffOutputs(requiredOutputs = [], stepData, { allowCompatibilityFallback = true } = {}) {
   const uniqueOutputs = [...new Set((requiredOutputs || []).filter(Boolean))];
   if (!uniqueOutputs.length) return [];
 
-  const missing = [];
-  const productOutputs = uniqueOutputs.filter(isProductSelectionChainHandoffKey);
-  if (productOutputs.length > 0 &&
-      !hasSatisfiedProductSelectionHandoff(stepData, { allowCompatibilityFallback })) {
-    missing.push(...productOutputs);
-  }
-
-  for (const key of uniqueOutputs) {
-    if (isProductSelectionChainHandoffKey(key)) continue;
-    if (!hasStructuredValue(resolveChainStructuredValue(stepData, key, { allowCompatibilityFallback }))) {
-      missing.push(key);
-    }
-  }
-
-  return missing;
+  return uniqueOutputs.filter(key =>
+    !hasStructuredValue(resolveChainStructuredValue(stepData, key, { allowCompatibilityFallback }))
+  );
 }
 
 function describeRequiredHandoffOutputs(requiredOutputs = []) {
   const unique = [...new Set(requiredOutputs.filter(Boolean))];
-  const hasProductSelection = unique.some(key => ['selectedItemUrl', 'selectedItemTitle', 'selectedItemPrice', 'candidateItems'].includes(key));
+  const productKeys = unique.filter(key => ['selectedItemUrl', 'selectedItemTitle', 'selectedItemPrice', 'candidateItems'].includes(key));
   const otherKeys = unique.filter(key => !['selectedItemUrl', 'selectedItemTitle', 'selectedItemPrice', 'candidateItems'].includes(key));
   const descriptions = [];
 
-  if (hasProductSelection) {
-    descriptions.push('selectedItemUrl or candidateItems with a usable item link/title/price');
-  }
+  if (productKeys.length > 0) descriptions.push(...productKeys);
   if (otherKeys.includes('meetingLink')) {
     descriptions.push('meetingLink');
   }
@@ -3723,7 +3966,10 @@ function extractChainCandidateItemsFromPageState(currentPageState, limit = 5) {
 }
 
 function extractFirstChainMeetingLink(text = '') {
-  const match = String(text || '').match(/(?:https?:\/\/)?(?:meet\.google\.com\/[a-z0-9-]+|zoom\.us\/j\/\d+|teams\.microsoft\.com\/[^\s)"']+)/i);
+  const googleMeetLink = extractCanonicalGoogleMeetLink(text);
+  if (googleMeetLink) return googleMeetLink;
+
+  const match = String(text || '').match(/(?:https?:\/\/)?(?:zoom\.us\/j\/\d+|teams\.microsoft\.com\/[^\s)"']+)/i);
   if (!match) return null;
   const value = String(match[0] || '').replace(/[),.;]+$/, '').trim();
   if (!value) return null;
@@ -3732,14 +3978,14 @@ function extractFirstChainMeetingLink(text = '') {
 
 function extractChainMeetingLinkFromPageState(currentPageState) {
   const pageUrl = String(currentPageState?.url || currentPageState?.page_url || '');
-  if (isChainMeetingLink(pageUrl)) return pageUrl;
+  if (isChainMeetingLink(pageUrl)) return extractFirstChainMeetingLink(pageUrl) || pageUrl;
 
   const semanticElements = Array.isArray(currentPageState?.semanticElements)
     ? currentPageState.semanticElements
     : [];
   for (const element of semanticElements) {
     const href = resolveChainUrlAgainstPage(element?.attrs?.href || element?.href || '', pageUrl);
-    if (isChainMeetingLink(href)) return href;
+    if (isChainMeetingLink(href)) return extractFirstChainMeetingLink(href) || href;
 
     const textLink = extractFirstChainMeetingLink(`${element?.text || ''} ${element?.context || ''}`);
     if (textLink) return textLink;
@@ -3806,6 +4052,250 @@ function inferStructuredOutputsFromPageState(step, currentPageState) {
   }
 
   return inferred;
+}
+
+function normalizeChainUiText(text = '') {
+  return sanitizeChainItemText(text).toLowerCase();
+}
+
+function normalizeGoogleMeetMeetingMode(value = '') {
+  const normalized = normalizeChainUiText(value);
+  if (!normalized) return '';
+
+  if (/\b(instant|immediately|right now|right away|start now|now|asap)\b/i.test(normalized)) {
+    return 'instant';
+  }
+
+  if (/\b(for later|later|schedule in google calendar|google calendar|calendar)\b/i.test(normalized)) {
+    return 'later';
+  }
+
+  return '';
+}
+
+function getChainSemanticElementSearchText(element) {
+  return normalizeChainUiText([
+    element?.text || '',
+    element?.attrs?.ariaLabel || '',
+    element?.attrs?.title || '',
+    element?.attrs?.dataTooltip || '',
+    element?.context || '',
+    element?.section || '',
+  ].filter(Boolean).join(' '));
+}
+
+function findChainSemanticElementByPatterns(snapshot, patterns = [], {
+  preferredTypes = ['button', 'menuitem', 'link'],
+} = {}) {
+  const normalizedPatterns = (patterns || [])
+    .map(pattern => normalizeChainUiText(pattern))
+    .filter(Boolean);
+  if (normalizedPatterns.length === 0) return null;
+
+  const candidates = (Array.isArray(snapshot?.semanticElements) ? snapshot.semanticElements : [])
+    .map(element => {
+      const haystack = getChainSemanticElementSearchText(element);
+      if (!haystack) return null;
+
+      let score = 0;
+      for (const pattern of normalizedPatterns) {
+        if (haystack === pattern) score = Math.max(score, 5);
+        else if (haystack.startsWith(pattern)) score = Math.max(score, 4);
+        else if (haystack.includes(pattern)) score = Math.max(score, 3);
+      }
+      if (score === 0) return null;
+
+      const type = String(element?.type || '').toLowerCase();
+      if (preferredTypes.includes(type)) score += 1.5;
+      if (element?.inModal) score += 1;
+      if (/top|middle/.test(String(element?.pos || '').toLowerCase())) score += 0.2;
+
+      return { element, score };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+
+  return candidates[0]?.element || null;
+}
+
+async function waitForChainMeetingLinkCapture(tabId, { attempts = 6, pauseMs = 900 } = {}) {
+  let lastSnapshot = null;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) {
+      try { await waitForDomStable(tabId, 1500, 250); } catch {}
+      await new Promise(r => setTimeout(r, pauseMs));
+    }
+
+    lastSnapshot = await takePageSnapshot(tabId);
+    const inferred = inferStructuredOutputsFromPageState({ outputs: ['meetingLink'] }, lastSnapshot);
+    if (hasStructuredValue(inferred?.meetingLink)) {
+      return {
+        success: true,
+        meetingLink: inferred.meetingLink,
+        structuredData: inferred,
+        snapshot: lastSnapshot,
+      };
+    }
+  }
+
+  return {
+    success: false,
+    meetingLink: null,
+    structuredData: {},
+    snapshot: lastSnapshot,
+  };
+}
+
+async function runDeterministicGoogleMeetMeetingCapture(tabId, token, {
+  userPrompt = '',
+  goal = '',
+  meetingMode = '',
+  requiredOutputs = [],
+} = {}) {
+  if (!(requiredOutputs || []).includes('meetingLink')) return null;
+
+  const startedAt = Date.now();
+  const inferredMeetingMode = normalizeGoogleMeetMeetingMode(meetingMode)
+    || normalizeGoogleMeetMeetingMode(`${userPrompt} ${goal}`);
+  const prefersInstantMeeting = inferredMeetingMode === 'instant';
+
+  const directCapture = await waitForChainMeetingLinkCapture(tabId, { attempts: 1, pauseMs: 0 });
+  if (directCapture.success) {
+    return {
+      success: true,
+      durationMs: Date.now() - startedAt,
+      structuredData: directCapture.structuredData,
+      goalResult: `Captured the Google Meet link: ${directCapture.meetingLink}`,
+      executionMethodUsed: 'deterministic_google_meet',
+    };
+  }
+
+  const clickMatchingElement = async (snapshot, patterns, description, preferredTypes) => {
+    const target = findChainSemanticElementByPatterns(snapshot, patterns, { preferredTypes });
+    if (!target?.sid) {
+      return { success: false, error: `Could not find element for: ${patterns.join(' / ')}` };
+    }
+    return executeExploreAction(tabId, {
+      type: 'click_element',
+      target: target.sid,
+      description,
+    }, token);
+  };
+
+  const openNewMeetingMenu = async () => {
+    const snapshot = await takePageSnapshot(tabId);
+    const newMeetingButton = findChainSemanticElementByPatterns(snapshot, ['new meeting'], {
+      preferredTypes: ['button', 'link'],
+    });
+    if (!newMeetingButton?.sid) {
+      return { success: false, snapshot, error: 'New meeting button not visible.' };
+    }
+
+    const clickResult = await executeExploreAction(tabId, {
+      type: 'click_element',
+      target: newMeetingButton.sid,
+      description: 'Open the Google Meet New meeting menu',
+    }, token);
+    if (!clickResult?.success) {
+      return { success: false, snapshot, error: clickResult?.error || 'Could not open New meeting menu.' };
+    }
+
+    await new Promise(r => setTimeout(r, 500));
+    return {
+      success: true,
+      snapshot: await takePageSnapshot(tabId),
+    };
+  };
+
+  let snapshot = directCapture.snapshot;
+  const looksLikeMeetSurface = Boolean(
+    findChainSemanticElementByPatterns(snapshot, ['new meeting'], { preferredTypes: ['button', 'link'] }) ||
+    normalizeChainUiText(`${snapshot?.title || ''} ${snapshot?.mainContent || ''}`).includes('google meet')
+  );
+  if (!looksLikeMeetSurface) return null;
+
+  const menuState = await openNewMeetingMenu();
+  if (!menuState.success) {
+    console.warn('[BG] Deterministic Meet helper: could not open New meeting menu:', menuState.error);
+    return null;
+  }
+  snapshot = menuState.snapshot;
+
+  const postMenuCapture = await waitForChainMeetingLinkCapture(tabId, { attempts: 2, pauseMs: 500 });
+  if (postMenuCapture.success) {
+    return {
+      success: true,
+      durationMs: Date.now() - startedAt,
+      structuredData: postMenuCapture.structuredData,
+      goalResult: `Captured the Google Meet link: ${postMenuCapture.meetingLink}`,
+      executionMethodUsed: 'deterministic_google_meet',
+    };
+  }
+  snapshot = postMenuCapture.snapshot || snapshot;
+
+  const optionGroups = prefersInstantMeeting
+    ? [
+      {
+        patterns: ['start an instant meeting', 'instant meeting'],
+        description: 'Start a Google Meet instant meeting',
+      },
+      {
+        patterns: ['create a meeting for later', 'meeting for later'],
+        description: 'Create a Google Meet meeting for later',
+      },
+    ]
+    : [
+      {
+        patterns: ['create a meeting for later', 'meeting for later'],
+        description: 'Create a Google Meet meeting for later',
+      },
+      {
+        patterns: ['start an instant meeting', 'instant meeting'],
+        description: 'Start a Google Meet instant meeting',
+      },
+    ];
+
+  for (const option of optionGroups) {
+    let optionSnapshot = snapshot;
+    let clickResult = await clickMatchingElement(
+      optionSnapshot,
+      option.patterns,
+      option.description,
+      ['menuitem', 'button', 'link']
+    );
+
+    if (!clickResult.success) {
+      const reopened = await openNewMeetingMenu();
+      if (!reopened.success) continue;
+      optionSnapshot = reopened.snapshot;
+      clickResult = await clickMatchingElement(
+        optionSnapshot,
+        option.patterns,
+        option.description,
+        ['menuitem', 'button', 'link']
+      );
+    }
+
+    if (!clickResult.success) continue;
+
+    try { await waitForTabLoad(tabId, 12000, 600); } catch {}
+    const capture = await waitForChainMeetingLinkCapture(tabId, { attempts: 6, pauseMs: 900 });
+    if (capture.success) {
+      return {
+        success: true,
+        durationMs: Date.now() - startedAt,
+        structuredData: capture.structuredData,
+        goalResult: `Created the Google Meet and captured the meeting link: ${capture.meetingLink}`,
+        executionMethodUsed: 'deterministic_google_meet',
+      };
+    }
+
+    snapshot = capture.snapshot || optionSnapshot;
+  }
+
+  console.warn('[BG] Deterministic Meet helper: no meeting link captured after New meeting flow.');
+  return null;
 }
 
 async function runExplorationLoop(explorePlan, tabId, token, resumeState = null, continuationContext = null) {
@@ -5704,6 +6194,34 @@ async function runExplorationLoop(explorePlan, tabId, token, resumeState = null,
       return runExplorationLoop(continuationPlan, currentTabId, token, null, newContinuationContext);
     }
 
+    const pendingStructuredStep = isStructuredMode && structuredSteps && currentStepIndex < structuredSteps.length
+      ? structuredSteps[currentStepIndex]
+      : null;
+    if (pendingStructuredStep) {
+      const missingOutputs = getMissingChainHandoffOutputs(pendingStructuredStep.outputs || [], structuredData, {
+        allowCompatibilityFallback: true,
+      });
+      if ((pendingStructuredStep.outputs || []).length > 0 && missingOutputs.length > 0) {
+        const blockingGoalResult =
+          `I got stuck on step ${currentStepIndex + 1}: "${pendingStructuredStep.goal}". ` +
+          `The required handoff data is still missing: ${describeRequiredHandoffOutputs(pendingStructuredStep.outputs || [])}.`;
+
+        await updateExplorationProgress(maxSteps, maxSteps, 'Blocked waiting for required handoff data', 'error');
+
+        return finishExploration({
+          success: false,
+          error: `Required handoff data is still missing: ${missingOutputs.join(', ')}`,
+          goalResult: blockingGoalResult,
+          stepsUsed: totalStepsAcrossPhases + stepLog.length,
+          creditsUsed,
+          stepLog,
+          partial: true,
+          phasesUsed: currentPhase,
+          ...(isStructuredMode && structuredSteps ? { structuredData } : {}),
+        });
+      }
+    }
+
     // ── No more phases or stopped due to failures — build final result ──
     const successObservations = stepLog
       .filter(s => s.observation && s.result?.success)
@@ -7166,6 +7684,9 @@ async function handleMessage(request, sender) {
           pageContext.emailBody = scraped.emailBody;
           pageContext.subject = scraped.subject;
           pageContext.sender = scraped.sender;
+          if (scraped.activeDraft && typeof scraped.activeDraft === 'object') {
+            pageContext.activeDraft = scraped.activeDraft;
+          }
         }
       } catch { /* Content script not ready — proceed without scrape */ }
       // Fallback: if Gmail scraper returned empty body, use universal scraper
@@ -7214,12 +7735,19 @@ async function handleMessage(request, sender) {
       } catch { /* Some pages block injection — proceed without */ }
     }
 
+    const inlineGmailDraftRequest = isInlineGmailDraftRequest(userPrompt, pageContext);
+    const promptForAgent = inlineGmailDraftRequest
+      ? buildInlineGmailDraftPrompt(userPrompt, pageContext)
+      : userPrompt;
+
     // ── Multi-site detection: skip single-recipe replay for chained requests ──
     // If the prompt references multiple sites (e.g., "search Amazon then email"),
     // the chain system should handle it, not a single recipe replay.
-    const effectiveSiteHint = SiteGrounding?.mergeExplicitSiteHint
-      ? SiteGrounding.mergeExplicitSiteHint(providedSiteHint || null, userPrompt)
-      : (providedSiteHint || null);
+    const effectiveSiteHint = inlineGmailDraftRequest
+      ? 'gmail'
+      : (SiteGrounding?.mergeExplicitSiteHint
+        ? SiteGrounding.mergeExplicitSiteHint(providedSiteHint || null, userPrompt)
+        : (providedSiteHint || null));
 
     const isMultiSitePrompt = (() => {
       const lower = (userPrompt || '').toLowerCase();
@@ -7269,7 +7797,7 @@ async function handleMessage(request, sender) {
     // Skip pre-chain recipe match and let the chain system handle everything in order.
     const _siteDomainForGuard = url ? new URL(url).hostname : '';
     const _isMailDomain = /mail\.google\.com|outlook\.live\.com|mail\.yahoo\.com/i.test(_siteDomainForGuard);
-    if (!skipRecipeCheck && !(isMultiSitePrompt && _isMailDomain)) try {
+    if (!skipRecipeCheck && !inlineGmailDraftRequest && !(isMultiSitePrompt && _isMailDomain)) try {
       const siteDomain = _siteDomainForGuard;
       if (siteDomain && userPrompt) {
         const recipeRes = await fetch(
@@ -7498,7 +8026,7 @@ async function handleMessage(request, sender) {
     // ── CHAIN EXECUTION: Multi-site request decomposition ──
     // If the user's request involves multiple sites (e.g., "search Amazon and email the link"),
     // ask the backend to decompose it and execute sub-tasks sequentially.
-    if (!skipRecipeCheck) try {
+    if (!skipRecipeCheck && !inlineGmailDraftRequest) try {
       const chainAbort = new AbortController();
       const chainTimeout = setTimeout(() => chainAbort.abort(), 20000); // 20s safety net
       const chainPlanRes = await fetch(`${API_BASE}/api/agent/chain/plan`, {
@@ -7977,6 +8505,20 @@ async function handleMessage(request, sender) {
                 error: 'No active tab available for chain exploration.',
                 executionMethodUsed: 'structured_explore',
               };
+            }
+
+            const requiredOutputs = getRequiredSubTaskOutputs(subTask);
+            if (/meet\.google\.com/i.test(subTask?.domain || '') && requiredOutputs.includes('meetingLink')) {
+              const meetResult = await runDeterministicGoogleMeetMeetingCapture(currentTab.id, token, {
+                userPrompt,
+                goal: subTask?.intent || focusedPrompt,
+                meetingMode: resolvedInputs?.meetingMode || resolvedInputs?.meeting_mode || '',
+                requiredOutputs,
+              });
+              if (meetResult?.success) {
+                console.log(`[BG] Chain sub-task ${subTask.order}: deterministic Google Meet capture succeeded`);
+                return meetResult;
+              }
             }
 
             console.log(`[BG] Chain sub-task ${subTask.order}: running scoped exploration fallback on ${subTask.domain || 'current site'}`);
@@ -8933,7 +9475,7 @@ async function handleMessage(request, sender) {
       res = await fetch(`${API_BASE}/api/agent/process`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ userPrompt, pageContext: { ...pageContext, siteHint: effectiveSiteHint || null }, userMemory, conversationHistory: conversationHistory || [], threadId: activeThreadId || null, ...byokPayload(byokConfig) })
+        body: JSON.stringify({ userPrompt: promptForAgent, pageContext: { ...pageContext, siteHint: effectiveSiteHint || null }, userMemory, conversationHistory: conversationHistory || [], threadId: activeThreadId || null, ...byokPayload(byokConfig) })
       });
     } catch (fetchErr) {
       return { success: false, errorType: 'NETWORK_ERROR', error: `Cannot reach server: ${fetchErr.message}` };
@@ -8957,6 +9499,10 @@ async function handleMessage(request, sender) {
       data = await res.json();
     } catch (parseErr) {
       return { success: false, errorType: 'PARSE_ERROR', error: 'Server returned invalid JSON.' };
+    }
+
+    if (inlineGmailDraftRequest) {
+      data = normalizeInlineGmailDraftResponse(data, pageContext);
     }
 
     // ── Chat-to-memory: harvest personal info from chat messages ─────────────
@@ -9452,12 +9998,10 @@ async function handleMessage(request, sender) {
     const { tabId, data } = request.data;
     try {
       const targetTabId = await ensureGmailComposeTab(tabId, data);
-      await new Promise(r => setTimeout(r, 400));
-
-      const result = await chrome.tabs.sendMessage(targetTabId, {
+      const result = await safeSendMessage(targetTabId, {
         type: 'gmail_compose',
         data,
-      });
+      }, 'content_gmail.js', GMAIL_PING_CONFIG);
       return { ...(result || {}), tabId: targetTabId };
     } catch {
       return { success: false, error: 'Gmail could not be opened for composing right now. Please reload Gmail and try again.' };
@@ -9468,10 +10012,10 @@ async function handleMessage(request, sender) {
   if (request.type === 'gmail_reply') {
     const { tabId, data } = request.data;
     try {
-      const result = await chrome.tabs.sendMessage(tabId, {
+      const result = await safeSendMessage(tabId, {
         type: 'gmail_reply',
         data,
-      });
+      }, 'content_gmail.js', GMAIL_PING_CONFIG);
       return result;
     } catch {
       return { success: false, error: 'Gmail content script not ready. Please reload Gmail.' };

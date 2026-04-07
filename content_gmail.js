@@ -18,7 +18,10 @@ function wait(ms) {
 }
 
 function isVisible(el) {
-  return !!(el && el.offsetParent !== null);
+  if (!el) return false;
+  const style = window.getComputedStyle(el);
+  if (style.display === 'none' || style.visibility === 'hidden') return false;
+  return el.getClientRects().length > 0;
 }
 
 async function waitForElement(getter, timeoutMs = 6000, intervalMs = 100) {
@@ -72,6 +75,15 @@ function dispatchKeySequence(target, keyInfo) {
   target.dispatchEvent(new KeyboardEvent('keyup', eventInit));
 }
 
+function getFirstVisible(root, selectors) {
+  if (!root) return null;
+  for (const selector of selectors) {
+    const field = Array.from(root.querySelectorAll(selector)).find(isVisible);
+    if (field) return field;
+  }
+  return null;
+}
+
 async function commitRecipientField(field) {
   if (!field) return;
   field.focus();
@@ -79,11 +91,23 @@ async function commitRecipientField(field) {
   await wait(150);
 }
 
+function getSubjectField(root = document) {
+  return getFirstVisible(root, ['input[name="subjectbox"]']);
+}
+
+function getBodyField(root = document) {
+  return getFirstVisible(root, [
+    'div[aria-label="Message Body"]',
+    '.Am.Al.editable[role="textbox"]',
+    '[role="textbox"][contenteditable="true"]',
+  ]);
+}
+
 function getComposeDialog() {
   const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'))
     .filter(dialog => isVisible(dialog) && (
-      dialog.querySelector('input[name="subjectbox"]') ||
-      dialog.querySelector('div[aria-label="Message Body"], .Am.Al.editable[role="textbox"]')
+      getSubjectField(dialog) ||
+      getBodyField(dialog)
     ));
   return dialogs[dialogs.length - 1] || null;
 }
@@ -102,7 +126,7 @@ function getComposeButton() {
   return null;
 }
 
-function getToField(dialog) {
+function getToField(root = document) {
   const selectors = [
     'input[aria-label*="To recipients" i]',
     'textarea[aria-label*="To recipients" i]',
@@ -113,14 +137,96 @@ function getToField(dialog) {
     'input[name="to"]',
     'textarea[name="to"]',
   ];
-  for (const selector of selectors) {
-    const field = Array.from(dialog.querySelectorAll(selector)).find(isVisible);
-    if (field) return field;
+  return getFirstVisible(root, selectors);
+}
+
+function getComposeSurface() {
+  const dialog = getComposeDialog();
+  if (dialog) {
+    return { mode: 'dialog', root: dialog };
   }
+
+  const subjectField = getSubjectField(document);
+  const bodyField = getBodyField(document);
+  if (subjectField || bodyField) {
+    return { mode: 'page', root: document };
+  }
+
   return null;
 }
 
+function normalizeGmailText(text, maxLength = 4000) {
+  return String(text || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\r/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function extractDraftBody(field) {
+  if (!field) return '';
+
+  const clone = field.cloneNode(true);
+  clone.querySelectorAll('.gmail_quote, .gmail_attr, [data-smartmail="gmail_quote"]').forEach(node => node.remove());
+  return normalizeGmailText(clone.innerText || clone.textContent || '');
+}
+
+function extractDraftRecipients(root = document) {
+  const toField = getToField(root);
+  const raw = typeof toField?.value === 'string'
+    ? toField.value
+    : (toField?.textContent || '');
+
+  return raw
+    .split(/[;,]/)
+    .map(value => normalizeGmailText(value, 200))
+    .filter(Boolean)
+    .slice(0, 10);
+}
+
+function getDraftKind(root = document) {
+  if (getSubjectField(root)) return 'compose';
+  if (document.querySelector('h2.hP') || document.querySelector('.gD')) return 'reply';
+  return 'draft';
+}
+
+function scrapeActiveDraft() {
+  const composeSurface = getComposeSurface();
+  if (!composeSurface?.root) {
+    return {
+      composeReady: false,
+      hasActiveDraft: false,
+      mode: null,
+      kind: null,
+      recipients: [],
+      subject: '',
+      body: '',
+    };
+  }
+
+  const subjectField = getSubjectField(composeSurface.root);
+  const bodyField = getBodyField(composeSurface.root);
+  const recipients = extractDraftRecipients(composeSurface.root);
+  const subject = normalizeGmailText(subjectField?.value || '', 250);
+  const body = extractDraftBody(bodyField);
+
+  return {
+    composeReady: true,
+    hasActiveDraft: !!(body || subject || recipients.length),
+    mode: composeSurface.mode,
+    kind: getDraftKind(composeSurface.root),
+    recipients,
+    subject,
+    body,
+  };
+}
+
 chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
+  if (request.type === 'gmail_ping') {
+    sendResponse({ alive: true, composeReady: !!getComposeSurface() });
+    return;
+  }
 
   // ── Gmail Compose: Fill compose window with AI draft ─────
   if (request.type === 'gmail_compose') {
@@ -151,6 +257,8 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
   if (request.type !== 'scrape_email') return;
 
   try {
+    const activeDraft = scrapeActiveDraft();
+
     // Gmail renders the open email in a focused message pane.
     // These selectors target the current open/expanded email thread.
 
@@ -177,10 +285,23 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
         .slice(0, 3000); // cap at 3000 chars to keep payload lean
     }
 
-    sendResponse({ subject, sender, emailBody });
+    sendResponse({ subject, sender, emailBody, activeDraft });
   } catch (e) {
     console.warn('Enhancivity: Gmail scrape failed', e.message);
-    sendResponse({ subject: '', sender: '', emailBody: '' });
+    sendResponse({
+      subject: '',
+      sender: '',
+      emailBody: '',
+      activeDraft: {
+        composeReady: false,
+        hasActiveDraft: false,
+        mode: null,
+        kind: null,
+        recipients: [],
+        subject: '',
+        body: '',
+      },
+    });
   }
 
   return true;
@@ -193,23 +314,25 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
 async function handleGmailCompose(data) {
   const { to, subject, body } = data || {};
 
-  let composeDialog = getComposeDialog();
-  const composeBtn = composeDialog ? null : getComposeButton();
-  if (!composeBtn) {
-    if (!composeDialog) {
+  let composeSurface = await waitForElement(() => getComposeSurface(), 1500, 100);
+
+  if (!composeSurface) {
+    const composeBtn = getComposeButton();
+    if (!composeBtn) {
       return { success: false, error: 'Compose button not found. Are you on Gmail?' };
     }
-  } else {
     composeBtn.click();
+    composeSurface = await waitForElement(() => getComposeSurface(), 8000, 100);
   }
-  composeDialog = composeDialog || await waitForElement(() => getComposeDialog());
-  if (!composeDialog) {
+
+  if (!composeSurface?.root) {
     return { success: false, error: 'Compose window did not open in Gmail.' };
   }
+  const composeRoot = composeSurface.root;
 
   // Fill To field
   if (to) {
-    const toField = await waitForElement(() => getToField(composeDialog), 4000, 100);
+    const toField = await waitForElement(() => getToField(composeRoot), 4000, 100);
     if (toField) {
       toField.focus();
       setNativeValue(toField, to);
@@ -224,7 +347,7 @@ async function handleGmailCompose(data) {
   // Fill Subject
   if (subject) {
     const subjectField = await waitForElement(
-      () => Array.from(composeDialog.querySelectorAll('input[name="subjectbox"]')).find(isVisible),
+      () => getSubjectField(composeRoot),
       4000,
       100
     );
@@ -237,9 +360,7 @@ async function handleGmailCompose(data) {
   // Fill Body (contenteditable div)
   if (body) {
     const bodyField = await waitForElement(
-      () => Array.from(composeDialog.querySelectorAll(
-        'div[aria-label="Message Body"], .Am.Al.editable[role="textbox"], [role="textbox"][contenteditable="true"]'
-      )).find(isVisible),
+      () => getBodyField(composeRoot),
       4000,
       100
     );
@@ -248,7 +369,11 @@ async function handleGmailCompose(data) {
     }
   }
 
-  return { success: true, filled: { to: !!to, subject: !!subject, body: !!body } };
+  return {
+    success: true,
+    filled: { to: !!to, subject: !!subject, body: !!body },
+    composeSurface: composeSurface.mode,
+  };
 }
 
 // ── Gmail Reply Handler ──────────────────────────────────────

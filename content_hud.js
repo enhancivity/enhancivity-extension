@@ -281,6 +281,7 @@
 
   const hud = document.createElement('div');
   hud.id = 'enh-agent-hud';
+  hud.setAttribute('data-enhancivity-owned', 'true');
   hud.innerHTML = `
     <div class="enh-hud-header">
       <div class="enh-hud-dot" id="enh-hud-dot"></div>
@@ -303,6 +304,7 @@
   // Consent Overlay
   const overlay = document.createElement('div');
   overlay.id = 'enh-consent-overlay';
+  overlay.setAttribute('data-enhancivity-owned', 'true');
   overlay.innerHTML = `
     <div class="enh-consent-card">
       <div class="enh-consent-icon" id="enh-consent-icon"></div>
