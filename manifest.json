@@ -1,51 +1,71 @@
 {
   "manifest_version": 3,
-  "name": "Enhancivity",
-  "version": "1.0",
-  "description": "Log in to your Enhancivity account.",
+  "name": "Enhancivity Memory Layer",
+  "version": "2.0",
+  "description": "Project memory for AI and work tools. Review context before inserting or saving.",
   "permissions": [
-    "storage",
     "activeTab",
-    "cookies",
-    "identity"
+    "storage",
+    "identity",
+    "scripting",
+    "tabs",
+    "sidePanel"
   ],
-  "oauth2": {
-    "client_id": "409104365095-beonfvn8d6cdtnmgcjqk42bav4uk5amc.apps.googleusercontent.com",
-    "scopes": ["email", "profile"]
-  },
   "host_permissions": [
+    "<all_urls>",
     "https://api.enhancivity.com/*",
     "https://enhancivity.com/*",
-    "http://localhost/*",
-    "<all_urls>"
+    "http://localhost:3001/*",
+    "http://localhost:3099/*"
   ],
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "all_frames": true
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "memory_layer_extractors.js",
+        "memory_layer_content.js",
+        "memory_layer_picker.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true
     }
   ],
   "action": {
-    "default_popup": "popup/popup.html",
     "default_icon": {
       "16": "images/icon16.png",
       "48": "images/icon48.png",
       "128": "images/icon128.png"
     }
   },
+  "side_panel": {
+    "default_path": "memory_layer_sidepanel.html"
+  },
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "memory_layer_background.js"
   },
   "icons": {
     "16": "images/icon16.png",
     "48": "images/icon48.png",
     "128": "images/icon128.png"
   },
+  "oauth2": {
+    "client_id": "409104365095-ccqdpq1t2kl7raa6ft4l18tck5op7ft1.apps.googleusercontent.com",
+    "scopes": [
+      "email",
+      "profile"
+    ]
+  },
   "web_accessible_resources": [
     {
-      "resources": ["images/*.png"],
-      "matches": ["<all_urls>"]
+      "resources": [
+        "images/*.png"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ]
 }

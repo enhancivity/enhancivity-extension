@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Enhancivity Memory Layer</title>
+  <link rel="stylesheet" href="memory_layer_sidepanel.css">
+</head>
+<body>
+  <main class="memory-shell">
+    <header class="memory-header">
+      <div>
+        <p class="eyebrow">Enhancivity</p>
+        <h1>Project Memory</h1>
+      </div>
+      <div class="header-actions">
+        <button id="settings-btn" class="icon-btn hidden" type="button" aria-label="Settings" title="Settings">&#9881;</button>
+        <button id="profile-btn" class="icon-btn" type="button" aria-label="Profile" title="Profile" aria-expanded="false">&#128100;</button>
+        <span id="wake-state" class="state-pill">Sleeping</span>
+        <div id="profile-panel" class="profile-panel hidden" aria-label="Profile menu">
+          <section id="profile-account-card" class="profile-section hidden">
+            <p class="account-label">Signed in</p>
+            <strong id="signed-in-email">Enhancivity account</strong>
+            <button id="logout-btn" class="ghost-btn compact-btn full" type="button">Log out</button>
+          </section>
+
+          <section id="auth-card" class="profile-section hidden">
+            <div class="auth-heading">
+              <h2 id="auth-title">Sign in</h2>
+              <p>Use reviewed project memory with the AI tools and work pages you already have open.</p>
+            </div>
+            <div class="auth-tabs" role="group" aria-label="Authentication mode">
+              <button id="auth-login-tab" class="auth-tab active" type="button">Log in</button>
+              <button id="auth-signup-tab" class="auth-tab" type="button">Sign up</button>
+            </div>
+            <form id="auth-form" class="auth-form">
+              <label id="auth-name-label" class="hidden" for="auth-name">Name</label>
+              <input id="auth-name" class="hidden" name="name" autocomplete="name" placeholder="Name">
+              <label for="auth-email">Email</label>
+              <input id="auth-email" name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
+              <label for="auth-password">Password</label>
+              <input id="auth-password" name="password" type="password" autocomplete="current-password" placeholder="Password" required>
+              <label id="auth-confirm-password-label" class="hidden" for="auth-confirm-password">Confirm password</label>
+              <input id="auth-confirm-password" class="hidden" name="confirmPassword" type="password" autocomplete="new-password" placeholder="Repeat password">
+              <button id="auth-submit" class="primary-btn full" type="submit">Log in</button>
+            </form>
+            <div class="auth-divider"><span>or</span></div>
+            <button id="auth-google-btn" class="google-btn full" type="button">
+              <span class="google-mark" aria-hidden="true">G</span>
+              Continue with Google
+            </button>
+            <p id="auth-status" class="status-line">Connects to the memory-layer backend.</p>
+          </section>
+        </div>
+      </div>
+    </header>
+
+    <section id="memory-app" class="memory-stack hidden">
+      <section id="compute-settings-panel" class="settings-panel hidden" aria-label="Memory layer settings">
+        <div class="settings-header">
+          <h2>Settings</h2>
+          <button id="close-settings-btn" class="icon-btn" type="button" aria-label="Close settings" title="Close">&#215;</button>
+        </div>
+        <form id="provider-key-form" class="provider-key-form">
+          <h3>AI compute</h3>
+          <p id="compute-current" class="settings-current">Current: Enhancivity</p>
+          <label for="provider-select">Provider</label>
+          <select id="provider-select" name="provider">
+            <option value="enhancivity">Enhancivity</option>
+            <option value="openai">OpenAI</option>
+            <option value="anthropic">Anthropic</option>
+          </select>
+          <div id="provider-key-field" class="provider-key-field hidden">
+            <label for="provider-key-input">API key</label>
+            <input id="provider-key-input" name="providerKey" type="password" autocomplete="off" placeholder="Paste key to save">
+          </div>
+          <div class="button-row">
+            <button id="save-provider-key-btn" class="primary-btn" type="submit">Save</button>
+            <button id="remove-provider-key-btn" class="ghost-btn" type="button">Remove key</button>
+          </div>
+        </form>
+        <p id="provider-key-status" class="status-line">Enhancivity is selected by default.</p>
+        <div class="settings-checkbox-block hidden">
+          <label class="settings-checkbox-row" for="dev-primary-ai-writer">
+            <input id="dev-primary-ai-writer" type="checkbox" />
+            <span>Primary AI writer on Prepare (dev). Sends <code>primaryAiWriter</code> so the API can run the LLM path when supported.</span>
+          </label>
+        </div>
+        <div class="settings-history">
+          <h3>Session history</h3>
+          <div id="event-history" class="event-list"></div>
+        </div>
+      </section>
+
+      <div id="workflow-panel" class="memory-stack">
+        <section class="panel-card">
+          <label for="project-select">Project memory</label>
+          <select id="project-select"></select>
+          <label for="memory-scope-select" class="hidden">Optional memory scope</label>
+          <select id="memory-scope-select" class="memory-scope-select hidden"></select>
+          <div id="no-project-onboarding" class="empty-state hidden">
+            <h2>No project memory spaces yet</h2>
+            <p>Create and manage project memory in the web dashboard. Then return here and sync projects to select one.</p>
+            <button id="open-dashboard-btn" class="primary-btn full" type="button">Open dashboard</button>
+          </div>
+          <div class="button-row">
+            <button id="wake-btn" class="primary-btn" type="button">Wake Enhancivity</button>
+            <button id="refresh-btn" class="ghost-btn" type="button">Sync Projects</button>
+          </div>
+          <p id="tool-status" class="status-line">Wake Enhancivity when you want to insert context or capture memory from this tab.</p>
+        </section>
+
+        <section class="panel-card">
+          <div class="section-heading">
+            <h2>Prepare Context</h2>
+            <span id="context-count" class="mini-pill">0 memories used</span>
+          </div>
+          <label for="insert-instruction">Context goal</label>
+          <textarea
+            id="insert-instruction"
+            class="insert-instruction"
+            rows="3"
+            placeholder="Example: Brief Claude on the launch plan using this project memory."
+          ></textarea>
+          <div class="button-row">
+            <button id="prepare-context-btn" class="primary-btn" type="button">Prepare Context</button>
+            <button id="add-context-btn" class="ghost-btn" type="button">Use More Memory</button>
+          </div>
+          <div id="insert-progress" class="insert-progress hidden" aria-live="polite">
+            <div class="progress-message">
+              <span class="progress-star" aria-hidden="true">✦</span>
+              <p id="insert-progress-label">Preparing context...</p>
+            </div>
+            <div class="progress-track" aria-hidden="true"><span id="insert-progress-bar"></span></div>
+          </div>
+          <p id="insert-diagnostics" class="status-line hidden"></p>
+          <div id="insert-review" class="review-block hidden">
+            <div id="insert-review-notice"></div>
+            <div class="review-header">
+              <label id="insert-review-label" for="context-review">Review before inserting</label>
+              <button id="expand-review-btn" class="ghost-btn review-expand-btn" type="button" aria-expanded="false">Expand</button>
+            </div>
+            <textarea id="context-review" rows="8"></textarea>
+            <button id="insert-reviewed-btn" class="primary-btn full" type="button">Insert Reviewed Context</button>
+          </div>
+        </section>
+
+        <section class="panel-card">
+          <h2>Capture Memory</h2>
+          <label for="capture-note">Capture note</label>
+          <textarea id="capture-note" rows="3" placeholder="Example: Save the decision and the reasoning from this page."></textarea>
+          <button id="capture-btn" class="primary-btn full" type="button">Capture Memory</button>
+          <button id="capture-design-btn" class="ghost-btn full" type="button">Capture This Design</button>
+          <div id="capture-review" class="proposal-list"></div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <script src="memory_layer_sidepanel.js"></script>
+</body>
+</html>

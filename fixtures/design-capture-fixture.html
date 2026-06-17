@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Design Capture Fixture — six classification surfaces</title>
+<style>
+  /* Known ground-truth values for the whole fixture:
+     primary #6c2bd9 · background #ffffff · accent #14b8a6 · dark #1a1a2e · button #0066ff
+     fonts: Georgia headlines / Arial body · radius 8px */
+  body { background:#ffffff; color:#1a1a2e; font-family: Arial, sans-serif; margin:0; padding:24px; }
+  h1, h2 { font-family: Georgia, serif; }
+  section { margin: 0 0 40px; }
+  .label { font-size: 13px; color: #555; margin: 4px 0 10px; }
+  .swatch-note { font-size: 12px; color: #777; }
+</style>
+</head>
+<body>
+  <h1>Design-capture fixture</h1>
+  <p class="label">Each section is one picker target. Expected results per surface are listed in
+     <code>enhancivity-main/docs/DESIGN_CAPTURE_PHASE_D_TEST_MATRIX.md</code>.</p>
+
+  <!-- 1. Portfolio image: <img> → pixel-subject; palette must recover the four
+       exact quadrant colors. SVG data URL renders with exact fills. -->
+  <section id="s1">
+    <h2>1 — Portfolio image (img → pixel-subject)</h2>
+    <p class="label">Expected sampled palette: #6c2bd9, #ffffff, #14b8a6, #1a1a2e (~25% each)</p>
+    <img id="portfolio-img" width="320" height="320" alt="Quadrant artwork"
+      src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='320' height='320'%3E%3Crect width='160' height='160' fill='%236c2bd9'/%3E%3Crect x='160' width='160' height='160' fill='%23ffffff'/%3E%3Crect y='160' width='160' height='160' fill='%2314b8a6'/%3E%3Crect x='160' y='160' width='160' height='160' fill='%231a1a2e'/%3E%3C/svg%3E">
+  </section>
+
+  <!-- 2. Canvas artwork: WebGL/2D canvas → pixel-subject; DOM text extraction sees
+       nothing here, so this also exercises the no-page-text capture path. -->
+  <section id="s2">
+    <h2>2 — Canvas artwork (canvas → pixel-subject)</h2>
+    <p class="label">Expected sampled palette: #0066ff dominant area, #ff3b30 small accent, #ffffff ring/background</p>
+    <canvas id="art-canvas" width="320" height="200"></canvas>
+    <script>
+      (function () {
+        const ctx = document.getElementById('art-canvas').getContext('2d');
+        ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, 320, 200);
+        ctx.fillStyle = '#0066ff'; ctx.fillRect(20, 20, 280, 160);
+        ctx.fillStyle = '#ff3b30'; ctx.fillRect(40, 40, 48, 32); // small accent
+      })();
+    </script>
+  </section>
+
+  <!-- 3. Background-image hero with no real text → pixel-subject via the
+       background-image rule (childless div, bg image, <12 text chars). -->
+  <section id="s3">
+    <h2>3 — Background-image hero (div → pixel-subject)</h2>
+    <p class="label">Expected: classified pixel-subject despite being a plain div</p>
+    <div id="bg-hero" style="width:480px;height:180px;background-image:url(&quot;data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='480' height='180'%3E%3Crect width='480' height='180' fill='%2314b8a6'/%3E%3Ccircle cx='120' cy='90' r='50' fill='%236c2bd9'/%3E%3C/svg%3E&quot;);background-size:cover;border-radius:8px;"></div>
+  </section>
+
+  <!-- 4. Full-bleed wrapped image: clicking the WRAPPER must re-anchor to the img
+       (descendant covers >=90% of the selection). -->
+  <section id="s4">
+    <h2>4 — Full-bleed wrapper (div&gt;img → pixel-subject, re-anchored)</h2>
+    <p class="label">Click the bordered wrapper, not the image. Expected: still pixel-subject, sourceElement tag "img"</p>
+    <div id="bleed-wrapper" style="display:inline-block;padding:2px;border:1px dashed #999;">
+      <img width="300" height="150" alt="Full bleed art"
+        src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='150'%3E%3Crect width='300' height='150' fill='%231a1a2e'/%3E%3Crect x='30' y='30' width='240' height='90' fill='%2314b8a6'/%3E%3C/svg%3E">
+    </div>
+  </section>
+
+  <!-- 5. Component card: real text + buttons → dom-subtree; computed-style tokens
+       are the ground truth (exact hex, Georgia/Arial, 8px radius). -->
+  <section id="s5">
+    <h2>5 — Component card (dom-subtree → computed-style tokens)</h2>
+    <p class="label">Expected tokens from page styles: #1a1a2e text, #6c2bd9 background, #0066ff button, Georgia headlines / Arial body, radius 8px</p>
+    <div id="component-card" style="width:360px;background:#6c2bd9;border-radius:8px;padding:20px;color:#ffffff;">
+      <h2 style="margin:0 0 8px;color:#ffffff;">Faster carrier onboarding</h2>
+      <p style="margin:0 0 14px;color:#ffffff;">Route freight with less manual planning and clearer hand-offs for mid-size carriers.</p>
+      <button style="background:#0066ff;color:#ffffff;border:none;border-radius:8px;padding:10px 18px;font-family:Arial,sans-serif;font-weight:700;">Get started</button>
+      <button style="background:#14b8a6;color:#1a1a2e;border:none;border-radius:8px;padding:10px 18px;margin-left:8px;font-family:Arial,sans-serif;">Learn more</button>
+    </div>
+  </section>
+
+  <!-- 6. Cross-origin iframe → opaque element → pixel-subject (contentDocument
+       inaccessible). The crop is whatever the frame renders. -->
+  <section id="s6">
+    <h2>6 — Cross-origin iframe (iframe → pixel-subject, opaque)</h2>
+    <p class="label">Expected: classified pixel-subject; picker must NOT descend into the frame</p>
+    <iframe id="xorigin-frame" src="https://example.com/" width="480" height="200" title="Cross-origin embed"></iframe>
+  </section>
+  <section id="s7">
+    <h2>7 - Tall landing-page mock (multi-segment pixel-subject)</h2>
+    <p class="label">Expected segmented palette: includes lower-band colors #ffb000 and #ff3b30; scroll position returns after capture</p>
+    <div id="tall-pixel-design" style="width:520px;height:1900px;border-radius:8px;background:linear-gradient(to bottom,#6c2bd9 0%,#6c2bd9 24%,#ffffff 24%,#ffffff 48%,#14b8a6 48%,#14b8a6 72%,#ffb000 72%,#ffb000 86%,#ff3b30 86%,#ff3b30 100%);box-shadow:0 10px 28px rgba(26,26,46,0.18);"></div>
+    <p class="swatch-note">The orange and red bands sit below the first viewport on normal manual runs.</p>
+  </section>
+</body>
+</html>
