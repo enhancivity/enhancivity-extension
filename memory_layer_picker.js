@@ -24,6 +24,7 @@
   const MAX_DESCENDANT_SCAN = 200;
   const MAX_DOM_COLORS = 8;
   const MAX_DOM_FONTS = 2;
+  const MAX_DOM_RADII = 3;
   const MAX_CAPTURE_SEGMENTS = 4;
   // Visual-anchor snap: how far above the deepest hit we look for the perceived
   // design unit, and the coverage at which a candidate stops being a "unit" and
@@ -36,6 +37,7 @@
 
   const PIXEL_TAGS = new Set(['img', 'picture', 'canvas', 'video']);
   const HEADLINE_TAGS = new Set(['h1', 'h2', 'h3', 'h4']);
+  const HEADLINE_SELECTOR = [...HEADLINE_TAGS].join(',');
 
   // Pure classification decision table (exported for tests). The caller measures;
   // this decides. Order matters: an explicit drag-rect is always a pixel crop, a
@@ -167,6 +169,79 @@
     return raw.match(pattern) || [];
   }
 
+  // Pure: full authored font stack, exact and ordered. The first family is what
+  // the page ASKS for, not necessarily what renders — visitors without it get a
+  // fallback — so the next entries travel too as honest fallback context.
+  function parseFontFamilies(value) {
+    return String(value || '')
+      .split(',')
+      .map(part => part.replace(/["']/g, '').trim())
+      .filter(Boolean);
+  }
+
+  // The reported role is the hex's DOMINANT measured role, not first-seen: a brand
+  // purple hit 40x as background and once as a border must not read "border".
+  // Ties keep insertion order (first role measured wins the tie).
+  function dominantRole(roles) {
+    let best = null;
+    let bestHits = 0;
+    for (const [role, hits] of roles.entries()) {
+      if (hits > bestHits) {
+        bestHits = hits;
+        best = role;
+      }
+    }
+    return best || 'color';
+  }
+
+  // Pure aggregation of walk counts -> domTokens payload (exported for tests; the
+  // DOM walk itself is browser-only). Keeps `radii` as the single most frequent
+  // value for older backends and ADDS `radiiList` — a page has a radius SYSTEM
+  // (buttons vs cards vs pills) and one mode value flattens it.
+  function summarizeDomTokens({ colorCounts, fontMap, radiusCounts, totalColorHits }) {
+    const colors = [...colorCounts.entries()]
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, MAX_DOM_COLORS)
+      .map(([hex, entry]) => ({
+        hex,
+        role: dominantRole(entry.roles),
+        frequency: totalColorHits > 0 ? Math.round((entry.count / totalColorHits) * 1000) / 1000 : null,
+      }));
+
+    // where: a font used in BOTH contexts says so — "any headline hit wins" mislabeled
+    // a family carrying most of the body text as headlines-only, and wrongly crowned
+    // a minor family as THE body font.
+    const fontContexts = entry => (entry.headlineHits > 0 ? 1 : 0) + (entry.bodyHits > 0 ? 1 : 0);
+    const fonts = [...fontMap.entries()]
+      .sort((a, b) => b[1].weights.size + fontContexts(b[1]) - (a[1].weights.size + fontContexts(a[1])))
+      .slice(0, MAX_DOM_FONTS)
+      .map(([family, entry]) => ({
+        family,
+        weights: [...entry.weights].sort((a, b) => a - b),
+        ...(Array.isArray(entry.stack) && entry.stack.length > 0 ? { stack: entry.stack.slice(0, 2) } : {}),
+        where: entry.headlineHits > 0 && entry.bodyHits > 0
+          ? 'headlines+body'
+          : (entry.headlineHits > 0 ? 'headlines' : 'body'),
+      }));
+
+    const radiusEntries = [...radiusCounts.entries()].sort((a, b) => b[1] - a[1]);
+    const radiusTotal = radiusEntries.reduce((sum, [, count]) => sum + count, 0);
+    const radiiList = radiusEntries.slice(0, MAX_DOM_RADII).map(([value, count]) => ({
+      value,
+      share: radiusTotal > 0 ? Math.round((count / radiusTotal) * 1000) / 1000 : null,
+    }));
+
+    return {
+      colors,
+      fonts,
+      shape: {
+        radii: radiusEntries.length > 0 ? radiusEntries[0][0] : null,
+        ...(radiiList.length > 0 ? { radiiList } : {}),
+        spacingScale: null,
+      },
+    };
+  }
+
   const core = {
     classifySubject,
     isVisualBoundary,
@@ -178,6 +253,8 @@
     computeSegmentLayout,
     cssColorToHex,
     extractCssColorTokens,
+    parseFontFamilies,
+    summarizeDomTokens,
     MIN_SELECTION_CSS_PX,
     FULL_BLEED_COVERAGE,
     PAGE_VIEWPORT_COVERAGE,
@@ -499,11 +576,6 @@
     return result;
   }
 
-  function firstFontFamily(value) {
-    const first = String(value || '').split(',')[0] || '';
-    return first.replace(/["']/g, '').trim();
-  }
-
   // Scoped computed-style tokens for dom-subtree subjects: exact authored values,
   // ranked by frequency. Bounded BREADTH-FIRST walk — a huge subtree cannot stall
   // the page, and when the budget runs out it has covered every region of the
@@ -511,7 +583,7 @@
   // whole budget inside the first branch).
   function collectDomTokens(rootElement) {
     const colorCounts = new Map(); // hex -> {count, roles:Map(role -> hits)}
-    const fontMap = new Map(); // family -> {weights:Set, headlineHits, bodyHits}
+    const fontMap = new Map(); // family -> {weights:Set, stack, headlineHits, bodyHits}
     const radiusCounts = new Map();
     let visited = 0;
     let totalColorHits = 0;
@@ -525,35 +597,42 @@
       colorCounts.set(hex, entry);
     };
 
-    // The reported role is the hex's DOMINANT measured role, not first-seen: a brand
-    // purple hit 40x as background and once as a border must not read "border".
-    // Ties keep insertion order (first role measured wins the tie).
-    const dominantRole = roles => {
-      let best = null;
-      let bestHits = 0;
-      for (const [role, hits] of roles.entries()) {
-        if (hits > bestHits) {
-          bestHits = hits;
-          best = role;
-        }
-      }
-      return best || 'color';
-    };
-
     const queue = [rootElement];
     while (queue.length > 0 && visited < MAX_SUBTREE_ELEMENTS) {
       const element = queue.shift();
       if (!element) continue;
+      // The page path walks document.body, which also hosts the picker's own UI —
+      // apply the same self-skip the hit-test stack uses (topDocElementAt), or
+      // captures measure the extension (chip background/font/text, highlight
+      // border and radius) alongside the page it is supposed to describe.
+      if (state.overlay && (element === state.overlay || state.overlay.contains(element))) continue;
       visited += 1;
       if (isHiddenElement(element)) continue; // hidden prunes its whole subtree
       const style = viewOf(element).getComputedStyle(element);
       if (!style) continue;
 
-      if ((element.textContent || '').trim()) noteColor(cssColorToHex(style.color, probeCssColor), 'text');
+      // Only elements that render text THEMSELVES count for text color and fonts.
+      // textContent includes descendants, so every wrapper up the ancestor chain
+      // used to re-count its inherited color/font — text roles drowned the
+      // area-defining background even on dark pages.
+      const hasDirectText = Array.prototype.some.call(
+        element.childNodes || [],
+        node => node.nodeType === 3 && node.nodeValue && node.nodeValue.trim()
+      );
+
+      if (hasDirectText) noteColor(cssColorToHex(style.color, probeCssColor), 'text');
       noteColor(cssColorToHex(style.backgroundColor, probeCssColor), 'background');
-      if (style.borderTopStyle !== 'none' && parseFloat(style.borderTopWidth) > 0) {
-        noteColor(cssColorToHex(style.borderTopColor, probeCssColor), 'border');
+      // All four sides, deduped per element: a uniform border stays one hit while
+      // a border-left accent bar — a classic design signature — is no longer
+      // invisible to the old top-side-only check.
+      const borderHexes = new Set();
+      for (const side of ['Top', 'Right', 'Bottom', 'Left']) {
+        if (style[`border${side}Style`] !== 'none' && parseFloat(style[`border${side}Width`]) > 0) {
+          const borderHex = cssColorToHex(style[`border${side}Color`], probeCssColor);
+          if (borderHex) borderHexes.add(borderHex);
+        }
       }
+      for (const borderHex of borderHexes) noteColor(borderHex, 'border');
       // Gradient stops are brand identity too, and invisible to backgroundColor.
       const backgroundImage = style.backgroundImage || '';
       if (/gradient\(/i.test(backgroundImage)) {
@@ -562,14 +641,20 @@
         });
       }
 
-      const family = firstFontFamily(style.fontFamily);
-      if (family && (element.textContent || '').trim()) {
-        const entry = fontMap.get(family) || { weights: new Set(), headlineHits: 0, bodyHits: 0 };
-        const weight = parseInt(style.fontWeight, 10);
-        if (Number.isInteger(weight)) entry.weights.add(weight);
-        if (HEADLINE_TAGS.has(tagOf(element))) entry.headlineHits += 1;
-        else entry.bodyHits += 1;
-        fontMap.set(family, entry);
+      if (hasDirectText) {
+        const families = parseFontFamilies(style.fontFamily);
+        const family = families[0];
+        if (family) {
+          const entry = fontMap.get(family)
+            || { weights: new Set(), stack: families.slice(1, 3), headlineHits: 0, bodyHits: 0 };
+          const weight = parseInt(style.fontWeight, 10);
+          if (Number.isInteger(weight)) entry.weights.add(weight);
+          // closest() sees through text wrappers (<h1><span>…</span></h1>): the
+          // span carries the direct text, the heading carries the context.
+          if (element.closest && element.closest(HEADLINE_SELECTOR)) entry.headlineHits += 1;
+          else entry.bodyHits += 1;
+          fontMap.set(family, entry);
+        }
       }
 
       const radius = style.borderTopLeftRadius;
@@ -583,40 +668,7 @@
       }
     }
 
-    const colors = [...colorCounts.entries()]
-      .sort((a, b) => b[1].count - a[1].count)
-      .slice(0, MAX_DOM_COLORS)
-      .map(([hex, entry]) => ({
-        hex,
-        role: dominantRole(entry.roles),
-        frequency: totalColorHits > 0 ? Math.round((entry.count / totalColorHits) * 1000) / 1000 : null,
-      }));
-
-    // where: a font used in BOTH contexts says so — "any headline hit wins" mislabeled
-    // a family carrying most of the body text as headlines-only, and wrongly crowned
-    // a minor family as THE body font.
-    const fontContexts = entry => (entry.headlineHits > 0 ? 1 : 0) + (entry.bodyHits > 0 ? 1 : 0);
-    const fonts = [...fontMap.entries()]
-      .sort((a, b) => b[1].weights.size + fontContexts(b[1]) - (a[1].weights.size + fontContexts(a[1])))
-      .slice(0, MAX_DOM_FONTS)
-      .map(([family, entry]) => ({
-        family,
-        weights: [...entry.weights].sort((a, b) => a - b),
-        where: entry.headlineHits > 0 && entry.bodyHits > 0
-          ? 'headlines+body'
-          : (entry.headlineHits > 0 ? 'headlines' : 'body'),
-      }));
-
-    let radii = null;
-    let radiiBest = 0;
-    for (const [value, count] of radiusCounts.entries()) {
-      if (count > radiiBest) {
-        radiiBest = count;
-        radii = value;
-      }
-    }
-
-    return { colors, fonts, shape: { radii, spacingScale: null } };
+    return summarizeDomTokens({ colorCounts, fontMap, radiusCounts, totalColorHits });
   }
 
   function sanitizeElementSrc(element) {
