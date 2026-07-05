@@ -60,8 +60,7 @@ h3 {
   font-size: 13px;
 }
 
-.state-pill,
-.mini-pill {
+.state-pill {
   flex: 0 0 auto;
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 999px;
@@ -104,28 +103,6 @@ h3 {
   line-height: 1.45;
 }
 
-.auth-tabs {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 6px;
-  margin-bottom: 14px;
-  border-radius: 8px;
-  background: rgba(2, 6, 23, 0.5);
-  padding: 4px;
-}
-
-.auth-tab {
-  min-height: 34px;
-  border-radius: 6px;
-  background: transparent;
-  color: rgba(248, 250, 252, 0.72);
-}
-
-.auth-tab.active {
-  background: rgba(103, 232, 249, 0.16);
-  color: #ecfeff;
-}
-
 .auth-form {
   display: grid;
   gap: 9px;
@@ -146,6 +123,32 @@ h3 {
   height: 1px;
   flex: 1 1 auto;
   background: rgba(255, 255, 255, 0.12);
+}
+
+.auth-web-link {
+  margin: 8px 0 0;
+  color: rgba(248, 250, 252, 0.62);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: center;
+}
+
+.auth-web-link button {
+  display: inline;
+  min-height: auto;
+  border: 0;
+  background: transparent;
+  color: #bae6fd;
+  padding: 0;
+  font: inherit;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.auth-web-link button:hover,
+.auth-web-link button:focus-visible {
+  color: #e0f2fe;
+  text-decoration: underline;
 }
 
 .profile-panel {
@@ -278,7 +281,6 @@ h3 {
   gap: 9px;
 }
 
-.section-heading,
 .button-row {
   display: flex;
   align-items: center;
@@ -296,6 +298,29 @@ label {
   color: rgba(248, 250, 252, 0.72);
   font-size: 12px;
   font-weight: 700;
+}
+
+.field-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 0 7px;
+}
+
+.field-label-row label {
+  margin: 0;
+}
+
+.character-counter {
+  color: rgba(248, 250, 252, 0.44);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.character-counter.limit-reached {
+  color: #fca5a5;
 }
 
 select,
@@ -430,6 +455,61 @@ button:disabled {
   resize: vertical;
 }
 
+/* Review-stage transparency chips: what was used to build the prepared text
+   (memory count, project, destination, AI provider). */
+.review-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 8px;
+}
+
+.review-summary-chip {
+  border: 1px solid rgba(103, 232, 249, 0.28);
+  border-radius: 999px;
+  background: rgba(103, 232, 249, 0.08);
+  padding: 4px 10px;
+  color: rgba(207, 250, 254, 0.85);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.review-reassurance {
+  margin: 8px 0 10px;
+  color: rgba(248, 250, 252, 0.55);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* First-run "how it works" strip — shown to signed-in users until dismissed. */
+.first-run-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.first-run-steps {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0 0;
+  padding: 0 0 0 18px;
+  color: rgba(248, 250, 252, 0.72);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.first-run-steps strong {
+  color: #f8fafc;
+}
+
+.first-run-note {
+  margin: 10px 0 0;
+  color: rgba(248, 250, 252, 0.55);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
 /* Fix 2: visible capture failure, shown under the Capture button. */
 .capture-error {
   margin: 12px 0 0;
@@ -445,6 +525,44 @@ button:disabled {
 .insert-instruction {
   min-height: 74px;
   margin-bottom: 10px;
+}
+
+/* Finished-Content Side Capability (§13.1) — compact output-mode toggle. Mirrors the segmented
+   segmented pattern so it is familiar and on-brand, and stays quiet (small, muted) to avoid adding
+   visual weight. Hidden by default via .hidden until the capability is enabled. */
+.output-mode {
+  margin: 0 0 10px;
+}
+
+.output-mode-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.5);
+  padding: 4px;
+}
+
+.output-mode-tab {
+  min-height: 32px;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(248, 250, 252, 0.7);
+  font-size: 12px;
+  font-weight: 700;
+  padding: 6px 8px;
+}
+
+.output-mode-tab.active {
+  background: rgba(103, 232, 249, 0.16);
+  color: #ecfeff;
+}
+
+.output-mode-hint {
+  margin: 7px 0 0;
+  color: rgba(248, 250, 252, 0.58);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .insert-progress {

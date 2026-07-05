@@ -14,10 +14,41 @@
 
   /** Dev-only: `chrome.storage.local.memoryLayerDevPrimaryAiWriter` → Prepare sends `primaryAiWriter: true` (explicit opt-in). */
   const STORAGE_DEV_PRIMARY_AI_WRITER = "memoryLayerDevPrimaryAiWriter";
+  /**
+   * Privacy: user choice to share page CONTENT on Prepare. Absent/true = current
+   * behavior (content shared, only on explicit Prepare). false = metadata-only
+   * requests (tool, URL, title, field roles) — the side-panel request itself is
+   * always sent unchanged; it is the highest authority either way.
+   */
+  const STORAGE_SHARE_PAGE_CONTENT = "memoryLayerSharePageContent";
+  /** First-run guide: set once the user dismisses the "How Enhancivity works" strip. */
+  const STORAGE_FIRST_RUN_GUIDE_DISMISSED = "memoryLayerFirstRunGuideDismissed";
   const DEFAULT_MEMORY_LAYER_API_BASE = "https://api.enhancivity.com";
   const MEMORY_LAYER_CAPTURE_SUBJECT_SEGMENTS = true;
   const SEGMENT_CAPTURE_THROTTLE_MS = 650;
   const MAX_CAPTURE_SEGMENTS = 4;
+  const MAX_INSERT_INSTRUCTION_LENGTH = 4000;
+  const CAPTURE_SELECTION_OVERFLOW_MESSAGE = "This highlight is too large to capture at once. Highlight a smaller section and capture it, then repeat for the next section.";
+
+  // Finished-Content Side Capability (§13.1) — the output-mode toggle. ON (founder decision
+  // 2026-06-21): paired with the backend MEMORY_LAYER_FINISHED_ARTIFACT flag so "Write the draft"
+  // actually produces a draft. Flip back to false (and reload the extension) to hide it instantly.
+  const FINISHED_CONTENT_TOGGLE_ENABLED = true;
+  // Plain-language copy for the two delivery forms. Labels avoid jargon; the hint makes the
+  // memory-supply (prompt) vs finished-content (draft) distinction explicit.
+  const OUTPUT_MODE_COPY = {
+    prompt_for_destination: {
+      label: "Prompt the AI",
+      hint: "A prompt to paste into the AI tool — your project memory included.",
+    },
+    finished_artifact: {
+      label: "Write the draft",
+      hint: "The finished text itself — ready for you to review and send.",
+    },
+  };
+  // Known plain composers (no AI to consume a prompt) where a finished draft is the natural default.
+  // Capability-based by keyword, not an exhaustive tool list (§13).
+  const COMPOSER_SOURCE_TOOL_PATTERN = /(gmail|mail|outlook|yahoo|proton|linkedin|slack|discord|teams|whatsapp|messenger|reddit|word|google docs|docs|notion)/i;
 
   function parseDevBooleanFlag(value) {
     if (value === true) return true;
@@ -78,7 +109,6 @@
     activeTabId: null,
     activeFrameId: null,
     selectedProjectId: "",
-    authMode: "login",
     hasStoredApiBase: false,
     projects: [],
     contextPack: null,
@@ -106,30 +136,36 @@
     // backend returned none (notices off, nothing armed, or already shown this session).
     captureNotice: null,
     captureNoticeShownSession: false, // client one-per-session marker (§7.3)
+    // First-run "how it works" strip: shown to signed-in users until dismissed once.
+    firstRunGuideDismissed: false,
     providerKeysStatus: {
       supportedProviders: ["enhancivity", "openai", "anthropic"],
       activeProvider: "enhancivity",
       providers: [],
+      hostedAi: null,
     },
     tabSyncTimer: null,
     primaryAiWriterDevEnabled: false,
+    // Finished-Content Side Capability (§13.1) — output-mode toggle state.
+    //  - outputFormChoice: 'auto' (follow destination), or an explicit user lock
+    //    ('prompt_for_destination' | 'finished_artifact'). Ephemeral: reset to 'auto' on
+    //    destination/tab change (the panel re-reads it fresh on reopen).
+    //  - outputModeAutoValue: the smart default shown while in 'auto', inferred from the destination.
+    outputFormChoice: "auto",
+    outputModeAutoValue: "prompt_for_destination",
+    lastOutputModeSourceTool: null,
   };
 
   const el = {
     authCard: document.getElementById("auth-card"),
     authForm: document.getElementById("auth-form"),
     authTitle: document.getElementById("auth-title"),
-    authName: document.getElementById("auth-name"),
-    authNameLabel: document.getElementById("auth-name-label"),
     authEmail: document.getElementById("auth-email"),
     authPassword: document.getElementById("auth-password"),
-    authConfirmPassword: document.getElementById("auth-confirm-password"),
-    authConfirmPasswordLabel: document.getElementById("auth-confirm-password-label"),
     authSubmit: document.getElementById("auth-submit"),
     authGoogleBtn: document.getElementById("auth-google-btn"),
+    createAccountLink: document.getElementById("create-account-link"),
     authStatus: document.getElementById("auth-status"),
-    authLoginTab: document.getElementById("auth-login-tab"),
-    authSignupTab: document.getElementById("auth-signup-tab"),
     app: document.getElementById("memory-app"),
     profileBtn: document.getElementById("profile-btn"),
     profilePanel: document.getElementById("profile-panel"),
@@ -149,6 +185,8 @@
     removeProviderKeyBtn: document.getElementById("remove-provider-key-btn"),
     providerKeyStatus: document.getElementById("provider-key-status"),
     devPrimaryAiWriter: document.getElementById("dev-primary-ai-writer"),
+    sharePageContent: document.getElementById("share-page-content"),
+    sharePageContentNote: document.getElementById("share-page-content-note"),
     wakeState: document.getElementById("wake-state"),
     projectSelect: document.getElementById("project-select"),
     memoryScopeSelect: document.getElementById("memory-scope-select"),
@@ -156,18 +194,25 @@
     openDashboardBtn: document.getElementById("open-dashboard-btn"),
     wakeBtn: document.getElementById("wake-btn"),
     refreshBtn: document.getElementById("refresh-btn"),
+    firstRunGuide: document.getElementById("first-run-guide"),
+    dismissFirstRunBtn: document.getElementById("dismiss-first-run-btn"),
     toolStatus: document.getElementById("tool-status"),
     prepareContextBtn: document.getElementById("prepare-context-btn"),
     addContextBtn: document.getElementById("add-context-btn"),
     insertInstruction: document.getElementById("insert-instruction"),
+    insertInstructionCounter: document.getElementById("insert-instruction-counter"),
+    outputMode: document.getElementById("output-mode"),
+    outputModePromptBtn: document.getElementById("output-mode-prompt"),
+    outputModeDraftBtn: document.getElementById("output-mode-draft"),
+    outputModeHint: document.getElementById("output-mode-hint"),
     insertProgress: document.getElementById("insert-progress"),
     insertProgressBar: document.getElementById("insert-progress-bar"),
     insertProgressLabel: document.getElementById("insert-progress-label"),
     insertDiagnostics: document.getElementById("insert-diagnostics"),
     insertReview: document.getElementById("insert-review"),
+    insertReviewSummary: document.getElementById("insert-review-summary"),
     insertReviewLabel: document.getElementById("insert-review-label"),
     contextReview: document.getElementById("context-review"),
-    contextCount: document.getElementById("context-count"),
     insertReviewedBtn: document.getElementById("insert-reviewed-btn"),
     expandReviewBtn: document.getElementById("expand-review-btn"),
     insertReviewNotice: document.getElementById("insert-review-notice"),
@@ -192,9 +237,23 @@
     el.authStatus.textContent = message;
   }
 
-  function formatMemoryUsedCount(count) {
-    const value = Math.max(0, Number(count) || 0);
-    return `${value} ${value === 1 ? "memory" : "memories"} used`;
+  function clampText(value, maxLength) {
+    return String(value || "").slice(0, maxLength);
+  }
+
+  function updateInsertInstructionCounter() {
+    if (!el.insertInstructionCounter || !el.insertInstruction) return;
+    const remaining = Math.max(0, MAX_INSERT_INSTRUCTION_LENGTH - el.insertInstruction.value.length);
+    el.insertInstructionCounter.textContent = `${remaining} left`;
+    el.insertInstructionCounter.classList.toggle("limit-reached", remaining === 0);
+  }
+
+  function enforceInsertInstructionLimit() {
+    if (!el.insertInstruction) return;
+    if (el.insertInstruction.value.length > MAX_INSERT_INSTRUCTION_LENGTH) {
+      el.insertInstruction.value = clampText(el.insertInstruction.value, MAX_INSERT_INSTRUCTION_LENGTH);
+    }
+    updateInsertInstructionCounter();
   }
 
   function isLocalDevMemoryLayerApiBase() {
@@ -255,12 +314,13 @@
       supportedProviders: ["enhancivity", "openai", "anthropic"],
       activeProvider: "enhancivity",
       providers: [],
+      hostedAi: null,
     };
     el.wakeState.textContent = "Sleeping";
     el.wakeState.classList.remove("awake");
     el.contextReview.value = "";
-    el.contextCount.textContent = formatMemoryUsedCount(0);
     clearInsertDiagnostics();
+    clearInsertReviewSummary();
     el.insertReview.classList.add("hidden");
     el.captureReview.innerHTML = "";
   }
@@ -445,6 +505,41 @@
       : "Insert Reviewed Draft";
   }
 
+  // Review-stage transparency: a compact summary of what was used to build the
+  // prepared text (memory count, project, destination, AI provider) so the user
+  // can trust what they are about to insert without digging through metadata.
+  function renderInsertReviewSummary(contextPack) {
+    if (!el.insertReviewSummary) return;
+    el.insertReviewSummary.innerHTML = "";
+    const metadata = contextPack?.metadata || {};
+    const chips = [];
+    const itemCount = Number(metadata.itemCount || 0);
+    if (itemCount > 0) chips.push(`${itemCount} memor${itemCount === 1 ? "y" : "ies"} used`);
+    const activeTop = topLevelProjectFor(state.selectedProjectId);
+    if (activeTop?.name) chips.push(`Project: ${activeTop.name}`);
+    const sourceTool = state.lastInsertContext?.sourceTool || metadata.intent?.sourceTool || "";
+    const destination = outputModeDestinationLabel(sourceTool) || sourceTool;
+    if (destination) chips.push(`Destination: ${destination}`);
+    const provider = activeComputeProvider();
+    const trial = state.providerKeysStatus.hostedAi?.trial;
+    chips.push(provider === "enhancivity" && trial?.status === "active"
+      ? `AI: ${providerLabel(provider)} (trial)`
+      : `AI: ${providerLabel(provider)}`);
+    chips.forEach(text => {
+      const chip = document.createElement("span");
+      chip.className = "review-summary-chip";
+      chip.textContent = text;
+      el.insertReviewSummary.appendChild(chip);
+    });
+    el.insertReviewSummary.classList.toggle("hidden", chips.length === 0);
+  }
+
+  function clearInsertReviewSummary() {
+    if (!el.insertReviewSummary) return;
+    el.insertReviewSummary.innerHTML = "";
+    el.insertReviewSummary.classList.add("hidden");
+  }
+
   function providerLabel(provider) {
     if (provider === "enhancivity") return "Enhancivity";
     if (provider === "openai") return "OpenAI";
@@ -461,11 +556,11 @@
   }
 
   function activeProviderKeyRecord() {
-    return (state.providerKeysStatus.providers || []).find(record => record.hasKey === true) || null;
+    return providerRecord(activeComputeProvider());
   }
 
   function activeComputeProvider() {
-    return state.providerKeysStatus.activeProvider || activeProviderKeyRecord()?.provider || "enhancivity";
+    return state.providerKeysStatus.activeProvider || "enhancivity";
   }
 
   function normalizeProviderKeyStatus(data) {
@@ -488,26 +583,45 @@
       || providers.find(record => record.hasKey)?.provider
       || "enhancivity";
 
-    return { supportedProviders, activeProvider, providers };
+    return { supportedProviders, activeProvider, providers, hostedAi: providerKeys.hostedAi || null };
+  }
+
+  function hostedTrialSummary() {
+    const trial = state.providerKeysStatus.hostedAi?.trial;
+    if (!trial) return "";
+    if (trial.blockReason) return trial.message || "Hosted Enhancivity AI requires a subscription or your own API key.";
+    if (trial.status === "active") {
+      const prepareLeft = Number.isInteger(trial.remaining?.prepare) ? trial.remaining.prepare : null;
+      const captureLeft = Number.isInteger(trial.remaining?.capture) ? trial.remaining.capture : null;
+      const daysLeft = Number.isInteger(trial.daysRemaining) ? trial.daysRemaining : null;
+      return [
+        daysLeft !== null ? `${daysLeft}d trial left` : "Trial active",
+        prepareLeft !== null ? `${prepareLeft} prepares` : "",
+        captureLeft !== null ? `${captureLeft} captures` : "",
+      ].filter(Boolean).join(" | ");
+    }
+    if (trial.status === "not_started") return "Hosted trial starts on first hosted AI use.";
+    if (trial.status === "ineligible") return trial.message || "Hosted trial is not available for this account.";
+    return "";
   }
 
   function updateProviderKeyControls() {
     const selectedProvider = el.providerSelect.value;
-    const activeProvider = activeComputeProvider();
-    const hasActiveKey = activeProvider !== "enhancivity";
     const selectedNeedsKey = selectedProvider === "openai" || selectedProvider === "anthropic";
+    const selectedHasKey = selectedNeedsKey && hasProviderKey(selectedProvider);
 
-    el.providerKeyField.classList.toggle("hidden", !selectedNeedsKey || hasActiveKey);
-    el.providerKeyInput.required = selectedNeedsKey && !hasActiveKey;
-    el.providerKeyInput.disabled = !selectedNeedsKey || hasActiveKey;
-    el.providerSelect.disabled = hasActiveKey;
-    el.removeProviderKeyBtn.disabled = !hasActiveKey;
-    el.saveProviderKeyBtn.disabled = hasActiveKey;
+    el.providerKeyField.classList.toggle("hidden", !selectedNeedsKey || selectedHasKey);
+    el.providerKeyInput.required = selectedNeedsKey && !selectedHasKey;
+    el.providerKeyInput.disabled = !selectedNeedsKey || selectedHasKey;
+    el.providerSelect.disabled = false;
+    el.removeProviderKeyBtn.disabled = !selectedHasKey;
+    el.saveProviderKeyBtn.disabled = false;
   }
 
   function renderProviderKeyStatus() {
     const activeProvider = activeComputeProvider();
-    el.computeCurrent.textContent = `Current: ${providerLabel(activeProvider)}`;
+    const trialSummary = hostedTrialSummary();
+    el.computeCurrent.textContent = `Current: ${providerLabel(activeProvider)}${trialSummary ? ` - ${trialSummary}` : ""}`;
     el.providerSelect.value = activeProvider;
     el.providerKeyInput.value = "";
     updateProviderKeyControls();
@@ -518,6 +632,18 @@
     el.devPrimaryAiWriter.checked = state.primaryAiWriterDevEnabled === true;
   }
 
+  function sharePageContentEnabled() {
+    return state.sharePageContentEnabled !== false;
+  }
+
+  function syncSharePageContentControls() {
+    if (!el.sharePageContent) return;
+    el.sharePageContent.checked = sharePageContentEnabled();
+    if (el.sharePageContentNote) {
+      el.sharePageContentNote.classList.toggle("hidden", sharePageContentEnabled());
+    }
+  }
+
   function toggleSettingsPanel(forceOpen) {
     const shouldOpen = typeof forceOpen === "boolean"
       ? forceOpen
@@ -526,7 +652,10 @@
     el.computeSettingsPanel.classList.toggle("hidden", !shouldOpen);
     el.workflowPanel.classList.toggle("hidden", shouldOpen);
     el.settingsBtn.setAttribute("aria-expanded", String(shouldOpen));
-    if (shouldOpen) syncDevPrimaryAiWriterCheckbox();
+    if (shouldOpen) {
+      syncDevPrimaryAiWriterCheckbox();
+      syncSharePageContentControls();
+    }
   }
 
   function authHeaders() {
@@ -540,6 +669,10 @@
     return "https://enhancivity.com/dashboard/memory-layer";
   }
 
+  function signupUrl() {
+    return "https://enhancivity.com/signup?source=extension";
+  }
+
   function setProjectControlsEnabled(enabled) {
     el.wakeBtn.disabled = !enabled;
     el.prepareContextBtn.disabled = !enabled;
@@ -548,21 +681,10 @@
     if (el.captureDesignBtn) el.captureDesignBtn.disabled = !enabled;
   }
 
-  function setAuthMode(mode) {
-    state.authMode = mode === "signup" ? "signup" : "login";
-    const isSignup = state.authMode === "signup";
-    el.authTitle.textContent = isSignup ? "Create account" : "Sign in";
-    el.authSubmit.textContent = isSignup ? "Create account" : "Log in";
-    el.authName.classList.toggle("hidden", !isSignup);
-    el.authNameLabel.classList.toggle("hidden", !isSignup);
-    el.authConfirmPassword.classList.toggle("hidden", !isSignup);
-    el.authConfirmPasswordLabel.classList.toggle("hidden", !isSignup);
-    el.authName.required = isSignup;
-    el.authConfirmPassword.required = isSignup;
-    if (!isSignup) el.authConfirmPassword.value = "";
-    el.authPassword.autocomplete = isSignup ? "new-password" : "current-password";
-    el.authLoginTab.classList.toggle("active", !isSignup);
-    el.authSignupTab.classList.toggle("active", isSignup);
+  function resetAuthCopy() {
+    el.authTitle.textContent = "Sign in";
+    el.authSubmit.textContent = "Sign in";
+    el.authPassword.autocomplete = "current-password";
     setAuthStatus("Connects to the memory-layer backend.");
   }
 
@@ -580,6 +702,12 @@
     syncProfilePanel();
     closeProfilePanel();
     renderAccount();
+    syncFirstRunGuide();
+  }
+
+  function syncFirstRunGuide() {
+    if (!el.firstRunGuide) return;
+    el.firstRunGuide.classList.toggle("hidden", state.firstRunGuideDismissed);
   }
 
   function extractAuthToken(data) {
@@ -630,35 +758,26 @@
       "memoryLayerMemoryScope",
     ]);
     showAuth();
-    setAuthMode("login");
+    resetAuthCopy();
     setAuthStatus(message);
   }
 
-  async function loginOrSignup(event) {
+  async function loginWithEmail(event) {
     event.preventDefault();
     const email = el.authEmail.value.trim();
     const password = el.authPassword.value;
-    const confirmPassword = el.authConfirmPassword.value;
-    const name = el.authName.value.trim();
-    if (!email || !password || (state.authMode === "signup" && !name)) {
+    if (!email || !password) {
       setAuthStatus("Enter your account details first.");
-      return;
-    }
-    if (state.authMode === "signup" && password !== confirmPassword) {
-      setAuthStatus("Passwords do not match.");
       return;
     }
 
     try {
       setBusy(el.authSubmit, true);
-      setAuthStatus(state.authMode === "signup" ? "Creating account..." : "Signing in...");
-      const body = state.authMode === "signup"
-        ? { name, email, password }
-        : { email, password };
-      const response = await fetch(`${state.apiBase}/api/auth/extension/${state.authMode}`, {
+      setAuthStatus("Signing in...");
+      const response = await fetch(`${state.apiBase}/api/auth/extension/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ email, password }),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
@@ -667,7 +786,7 @@
 
       await persistAuthSession({
         token: extractAuthToken(data),
-        user: extractAuthUser(data, { email, name }),
+        user: extractAuthUser(data, { email }),
       });
       showApp();
       renderEvents();
@@ -676,7 +795,7 @@
       if (state.selectedProjectId) {
         setStatus("Choose a project, then wake Enhancivity when you want to use memory on this page.");
       }
-      addEvent(state.authMode === "signup" ? "Created account" : "Signed in");
+      addEvent("Signed in");
     } catch (error) {
       setAuthStatus(requestErrorMessage(error, "Could not sign in."));
     } finally {
@@ -684,24 +803,94 @@
     }
   }
 
+  function createGoogleOAuthState() {
+    const bytes = new Uint8Array(16);
+    if (globalThis.crypto?.getRandomValues) {
+      globalThis.crypto.getRandomValues(bytes);
+      return Array.from(bytes, value => value.toString(16).padStart(2, "0")).join("");
+    }
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+
+  function buildGoogleAuthUrl(oauthState) {
+    const manifest = chrome.runtime?.getManifest?.() || {};
+    const oauth2 = manifest.oauth2 || {};
+    const clientId = oauth2.client_id;
+    const scopes = Array.isArray(oauth2.scopes) && oauth2.scopes.length
+      ? oauth2.scopes
+      : ["email", "profile"];
+    if (!clientId || !chrome.identity?.getRedirectURL) {
+      throw new Error("Google sign-in is not configured for this extension build.");
+    }
+
+    const params = new URLSearchParams({
+      client_id: clientId,
+      response_type: "token",
+      redirect_uri: chrome.identity.getRedirectURL(),
+      scope: scopes.join(" "),
+      prompt: "select_account",
+      include_granted_scopes: "true",
+      state: oauthState,
+    });
+    return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+  }
+
+  function parseGoogleAccessTokenRedirect(redirectUrl, expectedState) {
+    let url;
+    try {
+      url = new URL(redirectUrl || "");
+    } catch (_error) {
+      throw new Error("Google sign-in returned an invalid response.");
+    }
+
+    const fragment = new URLSearchParams((url.hash || "").replace(/^#/, ""));
+    const query = new URLSearchParams((url.search || "").replace(/^\?/, ""));
+    const error = fragment.get("error") || query.get("error");
+    if (error) {
+      const description = fragment.get("error_description") || query.get("error_description") || "Google sign-in was cancelled.";
+      throw new Error(description);
+    }
+
+    const returnedState = fragment.get("state") || query.get("state");
+    if (expectedState && returnedState !== expectedState) {
+      throw new Error("Google sign-in could not be verified. Please try again.");
+    }
+
+    const token = fragment.get("access_token") || query.get("access_token");
+    if (!token) {
+      throw new Error("Google did not return an access token.");
+    }
+    return token;
+  }
+
   function requestGoogleAccessToken() {
     return new Promise((resolve, reject) => {
-      if (!chrome.identity?.getAuthToken) {
+      if (!chrome.identity?.launchWebAuthFlow) {
         reject(new Error("Google sign-in is not available in this Chrome profile."));
         return;
       }
 
-      chrome.identity.getAuthToken({ interactive: true }, token => {
+      let authUrl;
+      let oauthState;
+      try {
+        oauthState = createGoogleOAuthState();
+        authUrl = buildGoogleAuthUrl(oauthState);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+
+      chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, redirectUrl => {
         const runtimeError = chrome.runtime?.lastError;
         if (runtimeError) {
           reject(new Error(runtimeError.message || "Google sign-in was cancelled."));
           return;
         }
-        if (!token) {
-          reject(new Error("Google did not return an access token."));
-          return;
+        try {
+          resolve(parseGoogleAccessTokenRedirect(redirectUrl, oauthState));
+        } catch (error) {
+          reject(error);
         }
-        resolve(token);
       });
     });
   }
@@ -716,10 +905,13 @@
       const response = await fetch(`${state.apiBase}/api/auth/extension/google`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ access_token: googleAccessToken }),
+        body: JSON.stringify({ access_token: googleAccessToken, allowSignup: false, source: "extension" }),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) {
+        if (data.code === "ACCOUNT_NOT_FOUND") {
+          throw new Error("No Enhancivity account found for this Google account. Create one on the web, then return here.");
+        }
         throw new Error(data.error || data.message || "Google sign-in failed.");
       }
 
@@ -741,6 +933,10 @@
     } finally {
       setBusy(el.authGoogleBtn, false);
     }
+  }
+
+  async function openSignup() {
+    await chrome.tabs.create({ url: signupUrl(), active: true });
   }
 
   async function apiRequest(path, options = {}) {
@@ -881,11 +1077,6 @@
   async function saveProviderKey(event) {
     event.preventDefault();
     const provider = el.providerSelect.value;
-    const activeProvider = activeComputeProvider();
-    if (activeProvider !== "enhancivity") {
-      el.providerKeyStatus.textContent = `Remove the ${providerLabel(activeProvider)} key before changing providers.`;
-      return;
-    }
 
     if (provider === "enhancivity") {
       await safeApiRequest("/provider-keys", {
@@ -901,22 +1092,27 @@
     }
 
     const apiKey = el.providerKeyInput.value.trim();
-    if (!apiKey) {
+    const alreadySaved = hasProviderKey(provider);
+    if (!apiKey && !alreadySaved) {
       el.providerKeyStatus.textContent = "Paste a provider key before saving.";
       return;
     }
 
     try {
       setBusy(el.saveProviderKeyBtn, true);
-      el.providerKeyStatus.textContent = `Saving ${providerLabel(provider)} key...`;
+      el.providerKeyStatus.textContent = apiKey
+        ? `Saving ${providerLabel(provider)} key...`
+        : `Selecting ${providerLabel(provider)}...`;
       await safeApiRequest("/provider-keys", {
         method: "POST",
-        body: JSON.stringify({ provider, apiKey }),
+        body: JSON.stringify(apiKey ? { provider, apiKey } : { provider }),
       });
       el.providerKeyInput.value = "";
       await loadProviderKeyStatus();
-      el.providerKeyStatus.textContent = `${providerLabel(provider)} provider saved.`;
-      addEvent(`Saved ${providerLabel(provider)} key`);
+      el.providerKeyStatus.textContent = apiKey
+        ? `${providerLabel(provider)} provider saved.`
+        : `${providerLabel(provider)} provider selected.`;
+      addEvent(apiKey ? `Saved ${providerLabel(provider)} key` : `Selected ${providerLabel(provider)}`);
     } catch (error) {
       el.providerKeyStatus.textContent = error instanceof Error ? error.message : "Could not save provider key.";
     } finally {
@@ -925,8 +1121,8 @@
   }
 
   async function removeProviderKey() {
-    const provider = activeComputeProvider();
-    if (provider === "enhancivity") return;
+    const provider = el.providerSelect.value;
+    if (provider === "enhancivity" || !hasProviderKey(provider)) return;
 
     try {
       setBusy(el.removeProviderKeyBtn, true);
@@ -935,8 +1131,6 @@
         method: "DELETE",
       });
       await loadProviderKeyStatus();
-      el.providerSelect.value = "enhancivity";
-      updateProviderKeyControls();
       el.providerKeyStatus.textContent = `${providerLabel(provider)} key removed.`;
       addEvent(`Removed ${providerLabel(provider)} key`);
     } catch (error) {
@@ -1056,7 +1250,6 @@
       el.projectSelect.appendChild(option);
       state.selectedProjectId = "";
       el.projectSelect.disabled = true;
-      el.contextCount.textContent = formatMemoryUsedCount(0);
       clearInsertDiagnostics();
       el.insertReview.classList.add("hidden");
       setStatus("Create a project in the dashboard, then sync projects here before waking Enhancivity.");
@@ -1198,7 +1391,7 @@
     if (message?.type === "MEMORY_LAYER_GET_INSERT_CONTEXT") return !responseHasFocusedTarget(response);
     if (message?.type === "MEMORY_LAYER_GET_PAGE_CONTEXT") return !responseHasFocusedTarget(response);
     if (message?.type === "MEMORY_LAYER_INSERT_CONTEXT") {
-      return !response?.success && /No focused supported input|focused document surface did not accept insertion/i.test(response?.error || "");
+      return !response?.success && /No focused supported input|did not accept insertion/i.test(response?.error || "");
     }
     return false;
   }
@@ -1209,6 +1402,7 @@
 
     let score = response.success ? 10 : 0;
     if (response.hasFocusedInput === true || response.context?.hasFocusedInput === true) score += 100;
+    if (response.selectedText || response.context?.selectedText || response.context?.selectedTextOverflow === true) score += 90;
     if (response.frameHasFocus === true || response.context?.frameHasFocus === true) score += 30;
     if (response.focusedInputText || response.context?.focusedInputText) score += 20;
     const sourceTool = response.sourceTool || response.context?.sourceTool;
@@ -1299,6 +1493,7 @@
       const response = await sendTabMessage({ type: "MEMORY_LAYER_PING" });
       if (!response?.success) throw new Error(response?.error || "Could not wake this tab.");
       renderWakeState(true, wakeStatusMessage(response));
+      handleDestinationForOutputMode(response.sourceTool);
     } catch (error) {
       state.activeTabId = null;
       renderWakeState(false, error instanceof Error ? error.message : "Wake Enhancivity on this tab.");
@@ -1323,6 +1518,7 @@
       const response = await sendTabMessage({ type: "MEMORY_LAYER_PING" });
       if (!response?.success) throw new Error(response?.error || "Could not wake this tab.");
       renderWakeState(!!response?.success, wakeStatusMessage(response));
+      handleDestinationForOutputMode(response.sourceTool);
       addEvent("Woke memory layer");
     } catch (error) {
       renderWakeState(false, error instanceof Error ? error.message : "Could not wake this tab.");
@@ -1351,21 +1547,155 @@
       : `Will be saved project-wide: ${targetProject.name}`;
   }
 
+  // --- Finished-Content Side Capability (§13.1) — output-mode toggle ------------------------------
+  // The visible choice the backend treats as the HARD authority for the delivery form (§3.2 #1).
+  // While 'auto', the UI shows the destination-aware default, but no hard lock is sent.
+
+  function effectiveOutputForm() {
+    return state.outputFormChoice === "auto" ? state.outputModeAutoValue : state.outputFormChoice;
+  }
+
+  function outputModeDestinationLabel(sourceTool) {
+    const key = String(sourceTool || "").trim().toLowerCase();
+    if (!key) return "";
+    const labels = {
+      chatgpt: "ChatGPT",
+      claude: "Claude",
+      gemini: "Gemini",
+      google_ai_mode: "Google AI Mode",
+      gmail: "Gmail",
+      slack: "Slack",
+      notion: "Notion",
+      figma: "Figma",
+      canva: "Canva",
+      gamma: "Gamma",
+      google_docs: "Google Docs",
+      microsoft_word: "Microsoft Word",
+      reddit: "Reddit",
+    };
+    if (labels[key]) return labels[key];
+    return key
+      .replace(/[_-]+/g, " ")
+      .replace(/\b[a-z]/g, letter => letter.toUpperCase())
+      .slice(0, 40);
+  }
+
+  function outputModeAutoHint(active) {
+    const destination = outputModeDestinationLabel(state.lastOutputModeSourceTool);
+    const prefix = destination ? `${destination} detected. ` : "Auto-detected. ";
+    return active === "finished_artifact"
+      ? `${prefix}Enhancivity will write a draft for review.`
+      : `${prefix}Enhancivity will prepare a prompt for the AI.`;
+  }
+
+  function renderOutputMode() {
+    if (!el.outputMode) return;
+    if (!FINISHED_CONTENT_TOGGLE_ENABLED) {
+      el.outputMode.classList.add("hidden");
+      return;
+    }
+    el.outputMode.classList.remove("hidden");
+    const active = effectiveOutputForm();
+    const isDraft = active === "finished_artifact";
+    const hasExplicitChoice = state.outputFormChoice !== "auto";
+    if (el.outputModePromptBtn) {
+      el.outputModePromptBtn.classList.toggle("active", !isDraft);
+      el.outputModePromptBtn.setAttribute("aria-pressed", String(!isDraft));
+    }
+    if (el.outputModeDraftBtn) {
+      el.outputModeDraftBtn.classList.toggle("active", isDraft);
+      el.outputModeDraftBtn.setAttribute("aria-pressed", String(isDraft));
+    }
+    if (el.outputModeHint) {
+      if (!hasExplicitChoice) {
+        el.outputModeHint.textContent = outputModeAutoHint(active);
+        return;
+      }
+      const base = (OUTPUT_MODE_COPY[active] || OUTPUT_MODE_COPY.prompt_for_destination).hint;
+      el.outputModeHint.textContent = base;
+    }
+  }
+
+  function setOutputFormChoice(value) {
+    state.outputFormChoice = value === "finished_artifact" ? "finished_artifact" : "prompt_for_destination";
+    renderOutputMode();
+  }
+
+  function applyDestinationToOutputMode(sourceTool) {
+    // Smart default only; never overrides an explicit user lock.
+    state.outputModeAutoValue = COMPOSER_SOURCE_TOOL_PATTERN.test(String(sourceTool || ""))
+      ? "finished_artifact"
+      : "prompt_for_destination";
+    if (state.outputFormChoice === "auto") renderOutputMode();
+  }
+
+  function handleDestinationForOutputMode(sourceTool) {
+    const tool = String(sourceTool || "");
+    // Ephemeral lock (handoff §3.3): when the DESTINATION actually changes, drop the manual choice
+    // and fall back to auto. An in-place page update on the same destination keeps the user's lock.
+    if (state.lastOutputModeSourceTool != null && tool !== state.lastOutputModeSourceTool && state.outputFormChoice !== "auto") {
+      state.outputFormChoice = "auto";
+    }
+    state.lastOutputModeSourceTool = tool;
+    applyDestinationToOutputMode(tool);
+    renderOutputMode();
+  }
+
+  // Privacy toggle OFF: the request carries only page METADATA (tool, URL, title,
+  // field roles/kinds) — never page text. Extraction still runs locally in the tab
+  // (needed for surface/output-mode detection and insertion targeting); the strip
+  // happens before anything leaves the browser. The user's side-panel request is
+  // sent unchanged — it is the highest authority with or without page content.
+  function stripPageContentForPrivacy(context) {
+    const source = context && typeof context === "object" ? context : {};
+    const stripped = {
+      ...source,
+      selectedText: "",
+      focusedInputText: "",
+      visibleText: "",
+      toolSpecificContext: {},
+      relatedFields: [],
+      conversationTurns: [],
+      pageContentShared: false,
+    };
+    if (stripped.focusedField && typeof stripped.focusedField === "object") {
+      stripped.focusedField = {
+        ...stripped.focusedField,
+        // Keep structural targeting info (role/kind/tagName); drop anything that can
+        // echo page text (field text, labels, placeholders, names, DOM ids).
+        text: "",
+        isEmpty: true,
+        label: null,
+        placeholder: null,
+        name: null,
+        id: null,
+      };
+    }
+    return stripped;
+  }
+
   async function prepareContext(limit) {
     try {
       assertReady();
       setBusy(el.prepareContextBtn, true);
       setBusy(el.addContextBtn, true);
-      setInsertProgress("page", "Reading the current page...");
+      setInsertProgress("page", sharePageContentEnabled()
+        ? "Reading the current page..."
+        : "Reading page details (content sharing is off)...");
       const insertContextResponse = await sendTabMessage({ type: "MEMORY_LAYER_GET_INSERT_CONTEXT" });
       if (!insertContextResponse?.success) {
         throw new Error(insertContextResponse?.error || "Could not read current page context.");
       }
       state.lastInsertContext = insertContextResponse.context || null;
+      handleDestinationForOutputMode(state.lastInsertContext?.sourceTool);
+      enforceInsertInstructionLimit();
       const insertionInstruction = el.insertInstruction.value.trim();
       setInsertProgress("memory", "Finding relevant project memory...");
       const activeTop = topLevelProjectFor(state.selectedProjectId);
       const scopeFields = parseMemoryScopeSelection(state.memoryScopeSelection);
+      const contextForRequest = sharePageContentEnabled()
+        ? (insertContextResponse.context || {})
+        : stripPageContentForPrivacy(insertContextResponse.context);
       const requestBody = JSON.stringify({
         limit,
         llmOwnedSemanticPipeline: true,
@@ -1375,7 +1705,7 @@
         // a stale or unrelated value simply produces no signal.
         ...(state.lastInsert ? { priorInsert: state.lastInsert } : {}),
         clientContext: {
-          ...(insertContextResponse.context || {}),
+          ...contextForRequest,
           insertionInstruction,
           selectedProjectId: state.selectedProjectId,
           selectedProjectName: activeTop?.name || "",
@@ -1383,6 +1713,12 @@
           ...(scopeFields.selectedSubprojectName ? { selectedSubprojectName: scopeFields.selectedSubprojectName } : {}),
           ...(scopeFields.selectedMemoryScopeId ? { selectedMemoryScopeId: scopeFields.selectedMemoryScopeId } : {}),
           ...(scopeFields.selectedMemoryScopeName ? { selectedMemoryScopeName: scopeFields.selectedMemoryScopeName } : {}),
+          // §13.1 — send the explicit output-mode lock ONLY when the user actually chose it (not while
+          // 'auto'), so an untouched toggle leaves the backend's own surface+LLM classification in
+          // charge (§3.2 #2/#3) and the request payload stays unchanged from today.
+          ...(FINISHED_CONTENT_TOGGLE_ENABLED && state.outputFormChoice !== "auto"
+            ? { requestedOutputForm: state.outputFormChoice }
+            : {}),
           capabilityHints: {
             ...(insertContextResponse.context?.capabilityHints && typeof insertContextResponse.context.capabilityHints === "object"
               ? insertContextResponse.context.capabilityHints
@@ -1419,8 +1755,12 @@
       el.contextReview.disabled = contractBlocked;
       el.insertReviewedBtn.disabled = contractBlocked;
       el.contextReview.value = contractBlocked ? "" : (state.contextPack?.preparedText || "");
-      el.contextCount.textContent = formatMemoryUsedCount(state.contextPack?.metadata?.itemCount);
       syncInsertReviewLabels(state.contextPack);
+      if (contractBlocked) {
+        clearInsertReviewSummary();
+      } else {
+        renderInsertReviewSummary(state.contextPack);
+      }
       el.insertReview.classList.remove("hidden");
       setInsertProgress("hidden");
       // Unit 3f — at most one prepared-prompt disclosure notice per session (§7.3); absent /
@@ -1461,8 +1801,8 @@
     el.contextReview.value = "";
     el.contextReview.disabled = false;
     el.insertReviewedBtn.disabled = false;
-    el.contextCount.textContent = formatMemoryUsedCount(0);
     clearInsertDiagnostics();
+    clearInsertReviewSummary();
     el.insertReview.classList.add("hidden");
     setStatus(message);
   }
@@ -1481,6 +1821,31 @@
       intent: metadata.intent || null,
       matchedSubprojects: metadata.matchedSubprojects || [],
       clientContext: metadata.clientContext || null,
+    };
+  }
+
+  // Privacy: feedback carries bounded SIGNALS about the page context, never the raw
+  // transient page content (visible text, drafts, email bodies). The backend redacts
+  // too; sending signals keeps older backends from ever receiving raw content.
+  function feedbackClientContextSignals(clientContext) {
+    const toolSpecificContext = clientContext.toolSpecificContext && typeof clientContext.toolSpecificContext === "object"
+      ? clientContext.toolSpecificContext
+      : {};
+    return {
+      sourceTool: clientContext.sourceTool || null,
+      sourceUrl: clientContext.sourceUrl || null,
+      sourceSessionId: clientContext.sourceSessionId || null,
+      surfaceType: clientContext.surfaceType || null,
+      pageTitle: clientContext.pageTitle || null,
+      focusedTargetKind: clientContext.focusedTargetKind || null,
+      focusedFieldRole: clientContext.focusedField?.role || null,
+      hadSelectedText: Boolean(clientContext.selectedText),
+      hadFocusedInputText: Boolean(clientContext.focusedInputText),
+      visibleTextLength: typeof clientContext.visibleText === "string" ? clientContext.visibleText.length : 0,
+      hadToolSpecificContext: Object.values(toolSpecificContext).some(Boolean),
+      pageContentShared: sharePageContentEnabled(),
+      selectedProjectId: clientContext.selectedProjectId || null,
+      selectedSubprojectId: clientContext.selectedSubprojectId || null,
     };
   }
 
@@ -1505,7 +1870,7 @@
       finalText,
       insertedText,
       insertionInstruction: el.insertInstruction.value.trim(),
-      clientContext,
+      clientContext: feedbackClientContextSignals(clientContext),
       contextPackMetadata: insertFeedbackMetadata(contextPack),
       attributeInfluencePlan: metadata.attributeInfluencePlan || null,
       attributeSignals: [],
@@ -1543,6 +1908,8 @@
         setStatus("There is no prepared text to insert.");
         return;
       }
+      // Guard against double-clicks inserting the text twice.
+      el.insertReviewedBtn.disabled = true;
       const response = await sendTabMessage({
         type: "MEMORY_LAYER_INSERT_CONTEXT",
         text,
@@ -1564,10 +1931,24 @@
       recordReviewedInsertFeedback(text, response, state.lastInsertCompletedAt).catch(error => {
         console.warn("[MemoryLayer] Insert feedback learning skipped:", error);
       });
-      setStatus("Inserted into the focused input. Submit manually in the tool.");
+      const preparedFor = String(state.lastInsertContext?.sourceTool || "").toLowerCase();
+      const insertedInto = String(response?.sourceTool || "").toLowerCase();
+      if (preparedFor && insertedInto && preparedFor !== insertedInto) {
+        // Destination drift: prepared on one tool, inserted into another. The
+        // insert still honors the user's action; just make the mismatch visible.
+        const preparedLabel = outputModeDestinationLabel(preparedFor) || preparedFor;
+        const insertedLabel = outputModeDestinationLabel(insertedInto) || insertedInto;
+        setStatus(`Inserted, but this text was prepared for ${preparedLabel} and landed on ${insertedLabel}. Re-prepare here if it reads wrong.`);
+      } else {
+        setStatus("Inserted into the focused input. Submit manually in the tool.");
+      }
       addEvent("Inserted reviewed context");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Could not insert context.");
+    } finally {
+      const contractBlocked = state.contextPack?.finalContractBlocked === true
+        || state.contextPack?.metadata?.finalContractBlocked === true;
+      el.insertReviewedBtn.disabled = contractBlocked;
     }
   }
 
@@ -1719,6 +2100,26 @@
     block.setAttribute("role", "alert");
     block.textContent = message;
     el.captureReview.appendChild(block);
+  }
+
+  function hasSelectedTextCapture(context) {
+    return typeof context?.selectedText === "string" && context.selectedText.trim().length > 0;
+  }
+
+  function buildSelectedTextCaptureBody(context = {}) {
+    return {
+      ...context,
+      captureSourceMode: "selected_text",
+      focusedInputText: "",
+      focusedField: null,
+      relatedFields: [],
+      visibleText: "",
+      visibleTextBoundedByDom: false,
+      toolSpecificContext: {},
+      latestUserPrompt: "",
+      latestAssistantAnswer: "",
+      conversationTurns: [],
+    };
   }
 
   // Selection-first design capture: measured-vs-estimated provenance, real color
@@ -2041,18 +2442,28 @@
         userNote: el.captureNote.value,
       });
       if (!pageResponse?.success) throw new Error(pageResponse?.error || "Could not read visible page context.");
-      let body = pageResponse.context;
+      const pageContext = pageResponse.context || {};
+      if (!options.captureSubject && pageContext.selectedTextOverflow === true) {
+        state.captureSession = null;
+        state.captureNotice = null;
+        setStatus(CAPTURE_SELECTION_OVERFLOW_MESSAGE, { error: true });
+        renderCaptureError(CAPTURE_SELECTION_OVERFLOW_MESSAGE);
+        addEvent("Highlighted text was too large to capture");
+        return;
+      }
+      const selectedTextMode = !options.captureSubject && hasSelectedTextCapture(pageContext);
+      let body = selectedTextMode ? buildSelectedTextCaptureBody(pageContext) : pageContext;
       if (options.captureSubject) {
         // Selection-first design capture: measured values + (optional) transient
         // crop ride the same reviewed capture call. Tool identity comes from the
         // page context the extractor already detected.
         body = {
-          ...pageResponse.context,
+          ...pageContext,
           captureSubject: {
             ...options.captureSubject,
             toolContext: {
-              sourceTool: pageResponse.context?.sourceTool || null,
-              surfaceKind: pageResponse.context?.surfaceType || null,
+              sourceTool: pageContext.sourceTool || null,
+              surfaceKind: pageContext.surfaceType || null,
             },
           },
         };
@@ -2087,7 +2498,7 @@
       renderCaptureProposals();
       // Item 8: honest note when the capture was bounded by the mounted DOM, so the
       // user knows there may be more above/below than the region around their view.
-      const regionNote = pageResponse.context?.visibleTextBoundedByDom
+      const regionNote = !selectedTextMode && pageContext.visibleTextBoundedByDom
         ? " Captured the region around your view — scroll or select to capture more."
         : "";
       if (options.captureSubject) {
@@ -2100,8 +2511,9 @@
           : "Captured page text only — the design values did not come back. Pick the design itself (not its container) and try again.");
         addEvent(designCard ? "Captured design subject" : "Design capture fell back to page text");
       } else {
-        setStatus(`Prepared ${state.proposals.length} memory ${state.proposals.length === 1 ? "draft" : "drafts"} for review.${regionNote}`);
-        addEvent("Captured visible context");
+        const sourceLabel = selectedTextMode ? " from highlighted text" : "";
+        setStatus(`Prepared ${state.proposals.length} memory ${state.proposals.length === 1 ? "draft" : "drafts"}${sourceLabel} for review.${regionNote}`);
+        addEvent(selectedTextMode ? "Captured highlighted text" : "Captured visible context");
       }
     } catch (error) {
       // Item 1: capture is 100% LLM-driven with no fake fallback. When the LLM is
@@ -2435,6 +2847,8 @@
       "memoryLayerSelectedProjectId",
       "memoryLayerMemoryScope",
       STORAGE_DEV_PRIMARY_AI_WRITER,
+      STORAGE_SHARE_PAGE_CONTENT,
+      STORAGE_FIRST_RUN_GUIDE_DISMISSED,
     ]);
     state.token = storage.token || "";
     state.user = storage.memoryLayerUser || null;
@@ -2448,6 +2862,9 @@
     state.selectedProjectId = storage.memoryLayerSelectedProjectId || "";
     state.memoryScopeSelection = storage.memoryLayerMemoryScope || "";
     state.primaryAiWriterDevEnabled = parseDevBooleanFlag(storage[STORAGE_DEV_PRIMARY_AI_WRITER]);
+    // Absent = true: default stays the current behavior; false only on explicit opt-out.
+    state.sharePageContentEnabled = storage[STORAGE_SHARE_PAGE_CONTENT] !== false;
+    state.firstRunGuideDismissed = storage[STORAGE_FIRST_RUN_GUIDE_DISMISSED] === true;
 
     if (!state.token) {
       showAuth();
@@ -2456,6 +2873,7 @@
 
     showApp();
     syncDevPrimaryAiWriterCheckbox();
+    syncSharePageContentControls();
     try {
       await loadProjects();
       await loadProviderKeyStatus();
@@ -2484,9 +2902,29 @@
   }
   el.wakeBtn.addEventListener("click", wakeMemoryLayer);
   el.refreshBtn.addEventListener("click", refreshMemoryLayerData);
+  if (el.dismissFirstRunBtn) {
+    el.dismissFirstRunBtn.addEventListener("click", async () => {
+      state.firstRunGuideDismissed = true;
+      syncFirstRunGuide();
+      await chrome.storage.local.set({ [STORAGE_FIRST_RUN_GUIDE_DISMISSED]: true });
+    });
+  }
   el.prepareContextBtn.addEventListener("click", () => prepareContext(12));
   el.addContextBtn.addEventListener("click", () => prepareContext(24));
+  // §13.1 output-mode toggle (no-ops while hidden/disabled). Each tap is an explicit user lock.
+  if (el.outputModePromptBtn) {
+    el.outputModePromptBtn.addEventListener("click", () => setOutputFormChoice("prompt_for_destination"));
+  }
+  if (el.outputModeDraftBtn) {
+    el.outputModeDraftBtn.addEventListener("click", () => setOutputFormChoice("finished_artifact"));
+  }
+  renderOutputMode();
+  if (el.insertInstruction) {
+    el.insertInstruction.maxLength = MAX_INSERT_INSTRUCTION_LENGTH;
+    enforceInsertInstructionLimit();
+  }
   el.insertInstruction.addEventListener("input", () => {
+    enforceInsertInstructionLimit();
     if (!state.contextPack) return;
     if (el.insertInstruction.value.trim() === state.lastPreparedInsertInstruction) return;
     invalidatePreparedInsertReview();
@@ -2516,19 +2954,36 @@
   });
   el.providerKeyForm.addEventListener("submit", saveProviderKey);
   el.removeProviderKeyBtn.addEventListener("click", removeProviderKey);
-  el.providerSelect.addEventListener("change", updateProviderKeyControls);
+  el.providerSelect.addEventListener("change", () => {
+    el.providerKeyInput.value = "";
+    updateProviderKeyControls();
+  });
   el.openDashboardBtn.addEventListener("click", openDashboard);
   el.logoutBtn.addEventListener("click", logout);
-  el.authForm.addEventListener("submit", loginOrSignup);
+  el.authForm.addEventListener("submit", loginWithEmail);
   el.authGoogleBtn.addEventListener("click", loginWithGoogle);
-  el.authLoginTab.addEventListener("click", () => setAuthMode("login"));
-  el.authSignupTab.addEventListener("click", () => setAuthMode("signup"));
+  el.createAccountLink.addEventListener("click", openSignup);
 
   if (el.devPrimaryAiWriter) {
     el.devPrimaryAiWriter.addEventListener("change", async () => {
       const on = el.devPrimaryAiWriter.checked === true;
       state.primaryAiWriterDevEnabled = on;
       await chrome.storage.local.set({ [STORAGE_DEV_PRIMARY_AI_WRITER]: on });
+    });
+  }
+
+  if (el.sharePageContent) {
+    el.sharePageContent.addEventListener("change", async () => {
+      const on = el.sharePageContent.checked === true;
+      state.sharePageContentEnabled = on;
+      await chrome.storage.local.set({ [STORAGE_SHARE_PAGE_CONTENT]: on });
+      syncSharePageContentControls();
+      // A prepared pack built with different page visibility is stale — force a fresh Prepare.
+      invalidatePreparedInsertReview("Page content sharing changed. Prepare context again before inserting.");
+      addEvent(on ? "Enabled page content sharing" : "Disabled page content sharing");
+      setStatus(on
+        ? "Page content sharing is on. Prepare reads this page only when you click it."
+        : "Page content sharing is off. Enhancivity will use only page details — results may be less helpful.");
     });
   }
 
@@ -2556,6 +3011,6 @@
   });
   document.addEventListener("click", closeProfilePanel);
 
-  setAuthMode("login");
+  resetAuthCopy();
   init();
 })();

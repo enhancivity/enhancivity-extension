@@ -27,28 +27,24 @@
           <section id="auth-card" class="profile-section hidden">
             <div class="auth-heading">
               <h2 id="auth-title">Sign in</h2>
-              <p>Use reviewed project memory with the AI tools and work pages you already have open.</p>
-            </div>
-            <div class="auth-tabs" role="group" aria-label="Authentication mode">
-              <button id="auth-login-tab" class="auth-tab active" type="button">Log in</button>
-              <button id="auth-signup-tab" class="auth-tab" type="button">Sign up</button>
+              <p>Use the same Enhancivity account you created on the web.</p>
             </div>
             <form id="auth-form" class="auth-form">
-              <label id="auth-name-label" class="hidden" for="auth-name">Name</label>
-              <input id="auth-name" class="hidden" name="name" autocomplete="name" placeholder="Name">
               <label for="auth-email">Email</label>
               <input id="auth-email" name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
               <label for="auth-password">Password</label>
               <input id="auth-password" name="password" type="password" autocomplete="current-password" placeholder="Password" required>
-              <label id="auth-confirm-password-label" class="hidden" for="auth-confirm-password">Confirm password</label>
-              <input id="auth-confirm-password" class="hidden" name="confirmPassword" type="password" autocomplete="new-password" placeholder="Repeat password">
-              <button id="auth-submit" class="primary-btn full" type="submit">Log in</button>
+              <button id="auth-submit" class="primary-btn full" type="submit">Sign in</button>
             </form>
             <div class="auth-divider"><span>or</span></div>
             <button id="auth-google-btn" class="google-btn full" type="button">
               <span class="google-mark" aria-hidden="true">G</span>
               Continue with Google
             </button>
+            <p class="auth-web-link">
+              New to Enhancivity?
+              <button id="create-account-link" type="button">Create account on web</button>
+            </p>
             <p id="auth-status" class="status-line">Connects to the memory-layer backend.</p>
           </section>
         </div>
@@ -80,6 +76,14 @@
           </div>
         </form>
         <p id="provider-key-status" class="status-line">Enhancivity is selected by default.</p>
+        <div class="settings-checkbox-block">
+          <h3>Privacy</h3>
+          <label class="settings-checkbox-row" for="share-page-content">
+            <input id="share-page-content" type="checkbox" checked />
+            <span>Share page content when preparing. When you click Prepare, Enhancivity reads this page (selected text, your draft, the email or chat in view) to make the result more relevant. Nothing is read in the background, and page content is never saved as memory unless you capture it yourself.</span>
+          </label>
+          <p id="share-page-content-note" class="status-line hidden">Page content sharing is off: only the site name, address, and page title are sent. Prepared prompts and drafts may be less helpful. Manual capture still reads the page when you ask it to capture.</p>
+        </div>
         <div class="settings-checkbox-block hidden">
           <label class="settings-checkbox-row" for="dev-primary-ai-writer">
             <input id="dev-primary-ai-writer" type="checkbox" />
@@ -104,27 +108,63 @@
             <button id="open-dashboard-btn" class="primary-btn full" type="button">Open dashboard</button>
           </div>
           <div class="button-row">
-            <button id="wake-btn" class="primary-btn" type="button">Wake Enhancivity</button>
-            <button id="refresh-btn" class="ghost-btn" type="button">Sync Projects</button>
+            <button id="wake-btn" class="primary-btn" type="button" title="Connects Enhancivity to this tab. Nothing runs and no page is read until you ask.">Wake Enhancivity</button>
+            <button id="refresh-btn" class="ghost-btn" type="button" title="Reload your projects from the dashboard.">Sync Projects</button>
           </div>
           <p id="tool-status" class="status-line">Wake Enhancivity when you want to insert context or capture memory from this tab.</p>
         </section>
 
-        <section class="panel-card">
-          <div class="section-heading">
-            <h2>Prepare Context</h2>
-            <span id="context-count" class="mini-pill">0 memories used</span>
+        <section id="first-run-guide" class="panel-card first-run-guide hidden" aria-label="How Enhancivity works">
+          <div class="first-run-header">
+            <h2>How Enhancivity works</h2>
+            <button id="dismiss-first-run-btn" class="icon-btn" type="button" aria-label="Dismiss guide" title="Dismiss">&#215;</button>
           </div>
-          <label for="insert-instruction">Context goal</label>
+          <ol class="first-run-steps">
+            <li><strong>Wake</strong> Enhancivity on the tab where you are working.</li>
+            <li><strong>Prepare</strong> — your request plus the right project memory becomes a ready-to-paste prompt.</li>
+            <li><strong>Review &amp; insert</strong> — you approve every word and submit in the tool yourself.</li>
+          </ol>
+          <p class="first-run-note">Enhancivity only reads a page when you click Wake, Prepare, or Capture — never in the background — and it never submits anything for you.</p>
+        </section>
+
+        <section class="panel-card">
+          <h2>Prepare Context</h2>
+          <div class="field-label-row">
+            <label for="insert-instruction">Context goal</label>
+            <span id="insert-instruction-counter" class="character-counter" aria-live="polite">4000 left</span>
+          </div>
           <textarea
             id="insert-instruction"
             class="insert-instruction"
+            maxlength="4000"
             rows="3"
             placeholder="Example: Brief Claude on the launch plan using this project memory."
           ></textarea>
+          <!-- Finished-Content Side Capability (§13.1). Hidden by default so the panel is unchanged
+               until the capability is enabled. Two plain-language choices: supply memory as a prompt
+               for an AI tool, vs. write the finished draft itself. -->
+          <div id="output-mode" class="output-mode hidden" role="group" aria-label="What Enhancivity should prepare">
+            <div class="output-mode-options">
+              <button
+                id="output-mode-prompt"
+                class="output-mode-tab active"
+                type="button"
+                aria-pressed="true"
+                title="Supplies your project memory as a prompt for the AI tool. The tool does the work — this is Enhancivity's core."
+              >Prompt the AI</button>
+              <button
+                id="output-mode-draft"
+                class="output-mode-tab"
+                type="button"
+                aria-pressed="false"
+                title="Enhancivity writes the finished email, post, or message for you to review and send. No AI tool needed."
+              >Write the draft</button>
+            </div>
+            <p id="output-mode-hint" class="output-mode-hint">Auto-detected. Enhancivity will prepare a prompt for the AI.</p>
+          </div>
           <div class="button-row">
-            <button id="prepare-context-btn" class="primary-btn" type="button">Prepare Context</button>
-            <button id="add-context-btn" class="ghost-btn" type="button">Use More Memory</button>
+            <button id="prepare-context-btn" class="primary-btn" type="button" title="Builds a prompt from your request plus the right project memory. You review it before anything is inserted.">Prepare Context</button>
+            <button id="add-context-btn" class="ghost-btn" type="button" title="Prepare again with more memory items included.">Use More Memory</button>
           </div>
           <div id="insert-progress" class="insert-progress hidden" aria-live="polite">
             <div class="progress-message">
@@ -140,7 +180,9 @@
               <label id="insert-review-label" for="context-review">Review before inserting</label>
               <button id="expand-review-btn" class="ghost-btn review-expand-btn" type="button" aria-expanded="false">Expand</button>
             </div>
+            <div id="insert-review-summary" class="review-summary hidden"></div>
             <textarea id="context-review" rows="8"></textarea>
+            <p class="review-reassurance">This is everything that will be inserted. Edit it freely — nothing is sent until you insert it, and you submit in the tool yourself.</p>
             <button id="insert-reviewed-btn" class="primary-btn full" type="button">Insert Reviewed Context</button>
           </div>
         </section>
@@ -149,8 +191,8 @@
           <h2>Capture Memory</h2>
           <label for="capture-note">Capture note</label>
           <textarea id="capture-note" rows="3" placeholder="Example: Save the decision and the reasoning from this page."></textarea>
-          <button id="capture-btn" class="primary-btn full" type="button">Capture Memory</button>
-          <button id="capture-design-btn" class="ghost-btn full" type="button">Capture This Design</button>
+          <button id="capture-btn" class="primary-btn full" type="button" title="Proposes memory from this page for you to review. Nothing is saved until you approve it.">Capture Memory</button>
+          <button id="capture-design-btn" class="ghost-btn full" type="button" title="Captures colors and layout from a selection on this page — you review before saving.">Capture This Design</button>
           <div id="capture-review" class="proposal-list"></div>
         </section>
       </div>

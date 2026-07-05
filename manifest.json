@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Enhancivity Memory Layer",
-  "version": "2.0",
+  "version": "2.0.3",
   "description": "Project memory for AI and work tools. Review context before inserting or saving.",
   "permissions": [
     "activeTab",
@@ -12,11 +12,7 @@
     "sidePanel"
   ],
   "host_permissions": [
-    "<all_urls>",
-    "https://api.enhancivity.com/*",
-    "https://enhancivity.com/*",
-    "http://localhost:3001/*",
-    "http://localhost:3099/*"
+    "<all_urls>"
   ],
   "content_scripts": [
     {

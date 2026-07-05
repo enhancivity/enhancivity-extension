@@ -69,8 +69,34 @@
     return host || "browser";
   }
 
+  // Selection keeps its real line breaks and indentation: selecting is how users
+  // deliberately capture code and structured text, and the backend preserves that
+  // structure for code_snippet cards. Only per-line trailing whitespace and long
+  // blank runs are cleaned.
+  function normalizeMultilineText(value, limit) {
+    const text = String(value || "")
+      .replace(/\r\n?/g, "\n")
+      .split("\n")
+      .map(line => line.replace(/[ \t]+$/g, ""))
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/^\n+|\n+$/g, "");
+    return Number.isInteger(limit) && limit >= 0 ? text.slice(0, limit) : text;
+  }
+
+  function getSelectedTextInfo() {
+    const text = normalizeMultilineText(window.getSelection?.().toString() || "");
+    const selectedTextOverflow = text.length > SELECTED_TEXT_CHAR_BUDGET;
+    return {
+      selectedText: selectedTextOverflow ? "" : text,
+      selectedTextOriginalLength: text.length,
+      selectedTextLimit: SELECTED_TEXT_CHAR_BUDGET,
+      selectedTextOverflow,
+    };
+  }
+
   function getSelectedText() {
-    return normalizeText(window.getSelection?.().toString() || "", 8000);
+    return getSelectedTextInfo().selectedText;
   }
 
   function elementContextSignal(element) {
@@ -104,6 +130,14 @@
   // Item 7 (extension side): grab generously by character; the BACKEND token budget
   // is the real single source of truth. This is the cheap client-side ceiling.
   const VISIBLE_TEXT_CHAR_BUDGET = 12000;
+  // Item 7 continued: these match the backend per-field caps (turns are uncapped
+  // server-side and trimmed by the token budget oldest-first) so the extension is
+  // never the silent limiter on the highest-value capture fields — a long assistant
+  // answer must reach the backend budget, not die at a client clip.
+  const TURN_TEXT_CHAR_BUDGET = 8000;
+  const LATEST_USER_PROMPT_CHAR_BUDGET = 3000;
+  const LATEST_ASSISTANT_ANSWER_CHAR_BUDGET = 5000;
+  const SELECTED_TEXT_CHAR_BUDGET = 8000;
   // Bound the DOM walk so a huge/virtualized page cannot stall the capture (no agent
   // behavior, no scrolling — we only read what is already mounted).
   const MAX_WALK_ELEMENTS = 20000;
@@ -296,7 +330,7 @@
       .map(element => ({
         element,
         role: roleFromElement(element, fallbackRole),
-        text: normalizeText(element.textContent, 3000),
+        text: normalizeText(element.textContent, TURN_TEXT_CHAR_BUDGET),
       }))
       .filter(turn => turn.text);
     return selectViewportAnchoredTurns(turns, 12).map(turn => ({ role: turn.role, text: turn.text }));
@@ -528,7 +562,9 @@
       emailSubject: firstText([".hP", "[data-thread-perm-id] h2", "h1", "h2"], 200),
       emailFrom: senderLabel,
       emailTo: firstText([".hb .g2", "[aria-label*='To:']", "[email][name='to']"], 300),
-      emailBody: textsFromSelectors([".a3s", ".ii.gt", "[role='listitem'] .a3s", "[data-message-id]"], 2200),
+      // Grab the thread generously; the BACKEND page-context token budget is the
+      // real limiter (flag-gated server-side; older backends clip to their caps).
+      emailBody: textsFromSelectors([".a3s", ".ii.gt", "[role='listitem'] .a3s", "[data-message-id]"], 8000),
       focusedReplyText: stripQuotedEmailText(focusedInputText),
     };
   }
@@ -546,7 +582,7 @@
       emailSubject: subject,
       emailFrom: firstText(["[data-sender]", "[class*='sender' i]", "[class*='from' i]", "[aria-label*='From']"], 200),
       emailTo: firstText(["[data-recipient]", "[class*='recipient' i]", "[class*='to' i]", "[aria-label*='To']"], 300),
-      emailBody: textsFromSelectors(["[class*='message' i]", "[class*='email' i]", "article", "main"], 2200),
+      emailBody: textsFromSelectors(["[class*='message' i]", "[class*='email' i]", "article", "main"], 8000),
       focusedReplyText: stripQuotedEmailText(focusedInputText),
       inputSignal: labelText,
     };
@@ -567,7 +603,7 @@
         "[data-qa='virtual-list-item']",
         "[role='listitem']",
         "[class*='message' i]",
-      ], 2200),
+      ], 6000),
     };
   }
 
@@ -581,7 +617,7 @@
       "[aria-label*='editor' i]",
       "article",
       "main",
-    ], 1600);
+    ], 4000);
     const currentSurfaceContext = capabilities.has("presentation_generation")
       ? "Presentation generation surface for building slide decks, outlines, and narrative structure."
       : capabilities.has("document_drafting")
@@ -657,8 +693,8 @@
   }
 
   function extractAiChatContext(options = {}) {
-    const latestUserPrompt = normalizeText(options.latestUserTurn?.text || "", 1200);
-    const latestAssistantAnswer = normalizeText(options.latestAssistantTurn?.text || "", 1600);
+    const latestUserPrompt = normalizeText(options.latestUserTurn?.text || "", LATEST_USER_PROMPT_CHAR_BUDGET);
+    const latestAssistantAnswer = normalizeText(options.latestAssistantTurn?.text || "", LATEST_ASSISTANT_ANSWER_CHAR_BUDGET);
     const surfaceCapabilities = Array.isArray(options.surfaceCapabilities) ? options.surfaceCapabilities : [];
     const aiMode = options.aiMode || inferAiMode({
       tool: options.tool,
@@ -761,6 +797,8 @@
       surfaceCapabilities,
     });
 
+    const selectedTextInfo = getSelectedTextInfo();
+
     return {
       sourceType: conversationTurns.length ? "ai_conversation_visible_context" : "browser_visible_context",
       sourceTool,
@@ -773,7 +811,11 @@
       },
       sourceUrl: location.href,
       pageTitle: document.title || "",
-      selectedText: getSelectedText(),
+      selectedText: selectedTextInfo.selectedText,
+      selectedTextOriginalLength: selectedTextInfo.selectedTextOriginalLength,
+      selectedTextLimit: selectedTextInfo.selectedTextLimit,
+      selectedTextOverflow: selectedTextInfo.selectedTextOverflow,
+      ...(selectedTextInfo.selectedText ? { captureSourceMode: "selected_text" } : {}),
       focusedInputText,
       focusedField,
       relatedFields,
@@ -798,6 +840,7 @@
     extractToolSpecificContext,
     inferSurfaceCapabilities,
     inferSurfaceType,
+    getSelectedTextInfo,
     getSelectedText,
     getVisibleText,
   };

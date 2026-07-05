@@ -510,8 +510,8 @@
   // selection evenly instead of starving later siblings (depth-first spent the
   // whole budget inside the first branch).
   function collectDomTokens(rootElement) {
-    const colorCounts = new Map(); // hex -> {count, roles:Set}
-    const fontMap = new Map(); // family -> {weights:Set, where:Set}
+    const colorCounts = new Map(); // hex -> {count, roles:Map(role -> hits)}
+    const fontMap = new Map(); // family -> {weights:Set, headlineHits, bodyHits}
     const radiusCounts = new Map();
     let visited = 0;
     let totalColorHits = 0;
@@ -519,10 +519,25 @@
     const noteColor = (hex, role) => {
       if (!hex) return;
       totalColorHits += 1;
-      const entry = colorCounts.get(hex) || { count: 0, roles: new Set() };
+      const entry = colorCounts.get(hex) || { count: 0, roles: new Map() };
       entry.count += 1;
-      entry.roles.add(role);
+      entry.roles.set(role, (entry.roles.get(role) || 0) + 1);
       colorCounts.set(hex, entry);
+    };
+
+    // The reported role is the hex's DOMINANT measured role, not first-seen: a brand
+    // purple hit 40x as background and once as a border must not read "border".
+    // Ties keep insertion order (first role measured wins the tie).
+    const dominantRole = roles => {
+      let best = null;
+      let bestHits = 0;
+      for (const [role, hits] of roles.entries()) {
+        if (hits > bestHits) {
+          bestHits = hits;
+          best = role;
+        }
+      }
+      return best || 'color';
     };
 
     const queue = [rootElement];
@@ -549,10 +564,11 @@
 
       const family = firstFontFamily(style.fontFamily);
       if (family && (element.textContent || '').trim()) {
-        const entry = fontMap.get(family) || { weights: new Set(), where: new Set() };
+        const entry = fontMap.get(family) || { weights: new Set(), headlineHits: 0, bodyHits: 0 };
         const weight = parseInt(style.fontWeight, 10);
         if (Number.isInteger(weight)) entry.weights.add(weight);
-        entry.where.add(HEADLINE_TAGS.has(tagOf(element)) ? 'headlines' : 'body');
+        if (HEADLINE_TAGS.has(tagOf(element))) entry.headlineHits += 1;
+        else entry.bodyHits += 1;
         fontMap.set(family, entry);
       }
 
@@ -572,17 +588,23 @@
       .slice(0, MAX_DOM_COLORS)
       .map(([hex, entry]) => ({
         hex,
-        role: [...entry.roles][0] || 'color',
+        role: dominantRole(entry.roles),
         frequency: totalColorHits > 0 ? Math.round((entry.count / totalColorHits) * 1000) / 1000 : null,
       }));
 
+    // where: a font used in BOTH contexts says so — "any headline hit wins" mislabeled
+    // a family carrying most of the body text as headlines-only, and wrongly crowned
+    // a minor family as THE body font.
+    const fontContexts = entry => (entry.headlineHits > 0 ? 1 : 0) + (entry.bodyHits > 0 ? 1 : 0);
     const fonts = [...fontMap.entries()]
-      .sort((a, b) => b[1].weights.size + b[1].where.size - (a[1].weights.size + a[1].where.size))
+      .sort((a, b) => b[1].weights.size + fontContexts(b[1]) - (a[1].weights.size + fontContexts(a[1])))
       .slice(0, MAX_DOM_FONTS)
       .map(([family, entry]) => ({
         family,
         weights: [...entry.weights].sort((a, b) => a - b),
-        where: entry.where.has('headlines') ? 'headlines' : 'body',
+        where: entry.headlineHits > 0 && entry.bodyHits > 0
+          ? 'headlines+body'
+          : (entry.headlineHits > 0 ? 'headlines' : 'body'),
       }));
 
     let radii = null;

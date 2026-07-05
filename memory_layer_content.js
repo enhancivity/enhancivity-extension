@@ -205,12 +205,23 @@
     return null;
   }
 
+  // The user's most recent action is authoritative: a supported field that is
+  // focused right now outranks the prepare-time hint and any remembered target.
+  function getLiveFocusedEditable() {
+    const active = deepActiveElement();
+    if (isSupportedEditable(active) && isVisibleElement(active)) return active;
+    return null;
+  }
+
   function findTargetFromHint(targetHint) {
     const focusedField = targetHint?.focusedField;
     if (!focusedField || typeof focusedField !== "object") return null;
 
+    // A re-render can leave the hinted id on a hidden clone; only trust the id
+    // lookup when the element is actually visible, otherwise fall through to
+    // the role-matched scan below (which already checks visibility).
     const hintedElement = queryElementByIdDeep(focusedField.id);
-    if (hintedElement) {
+    if (hintedElement && isVisibleElement(hintedElement)) {
       if (isSupportedEditable(hintedElement)) return { kind: "editable", element: hintedElement };
       const documentSurface = findDocumentSurface(hintedElement);
       const resolvedEditable = resolveDocumentSurfaceEditable(documentSurface, {
@@ -408,34 +419,124 @@
     element.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
+  function setNativeValue(element, value) {
+    const prototype = element instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : element instanceof HTMLInputElement
+        ? HTMLInputElement.prototype
+        : null;
+    const nativeSetter = prototype ? Object.getOwnPropertyDescriptor(prototype, "value")?.set : null;
+    if (nativeSetter) {
+      // Bypass instance-level value interceptors (React's value tracker) so the
+      // framework sees the dispatched input event as a real change instead of
+      // silently ignoring it.
+      nativeSetter.call(element, value);
+    } else {
+      element.value = value;
+    }
+  }
+
   function insertIntoInputLike(element, text) {
+    // Single-line inputs strip newlines on assignment, gluing lines together;
+    // join lines with spaces instead.
+    const insertText = element.tagName?.toLowerCase() === "input"
+      ? text.replace(/\s*\r?\n+\s*/g, " ")
+      : text;
     const value = String(element.value || "");
     const start = Number.isFinite(element.selectionStart) ? element.selectionStart : value.length;
     const end = Number.isFinite(element.selectionEnd) ? element.selectionEnd : start;
-    element.value = `${value.slice(0, start)}${text}${value.slice(end)}`;
-    const cursor = start + text.length;
+    setNativeValue(element, `${value.slice(0, start)}${insertText}${value.slice(end)}`);
+    const cursor = start + insertText.length;
     if (typeof element.setSelectionRange === "function") {
       element.setSelectionRange(cursor, cursor);
     }
     dispatchEditableEvents(element);
+    // A framework that rejects the change reverts synchronously in its input
+    // handler; read back so a rejected insert is reported honestly.
+    return String(element.value || "") !== value;
   }
 
-  function insertIntoContentEditable(element, text) {
+  // Editors that manage their own state (ProseMirror, Lexical, Quill) may revert
+  // unobserved DOM mutations asynchronously via MutationObserver; wait a tick so
+  // verification sees the editor's settled state, not the pre-revert DOM.
+  function settleEditorMutations() {
+    return new Promise(resolve => setTimeout(resolve, 0));
+  }
+
+  function selectionIsInside(element) {
+    const selection = window.getSelection?.();
+    return !!(selection && selection.rangeCount > 0 && element.contains(selection.anchorNode));
+  }
+
+  function placeCaretAtEnd(element) {
+    try {
+      const selection = window.getSelection();
+      if (!selection) return;
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      range.collapse(false);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } catch (_error) {
+      // Keep whatever selection exists; the fallback rungs do not need a caret.
+    }
+  }
+
+  // One attempt through the editor's own input pipeline: execCommand (fires the
+  // native beforeinput/input the editor already handles) → synthetic beforeinput
+  // → synthetic paste. Returns true only when the editor visibly accepted the
+  // text or explicitly claimed it by canceling a synthetic event.
+  async function insertThroughEditorPipeline(element, text, options = {}) {
+    const beforeText = getEditableText(element);
+    if (typeof element.focus === "function") element.focus();
+    const canUseSelectionInsertion = element.isContentEditable || element.getAttribute("role") === "textbox";
+    if (canUseSelectionInsertion) {
+      if (options.placeCaret) placeCaretAtEnd(element);
+      if (document.queryCommandSupported?.("insertText") && document.execCommand?.("insertText", false, text)) {
+        await settleEditorMutations();
+        if (getEditableText(element) !== beforeText) {
+          dispatchEditableEvents(element);
+          return true;
+        }
+      }
+    }
+    const handledByEditor = dispatchTextInputFallback(element, text);
+    await settleEditorMutations();
+    if (handledByEditor || getEditableText(element) !== beforeText) {
+      dispatchEditableEvents(element);
+      return true;
+    }
+    return false;
+  }
+
+  async function insertIntoContentEditable(element, text) {
+    const beforeText = getEditableText(element);
+    const caretInside = selectionIsInside(element);
+    // When we append programmatically (no user caret) to an existing draft,
+    // separate the inserted text instead of gluing it to the last word.
+    const insertText = !caretInside && beforeText.trim() !== "" ? `\n\n${text}` : text;
+    if (await insertThroughEditorPipeline(element, insertText, { placeCaret: !caretInside })) {
+      return true;
+    }
+    // Last resort: raw range insertion for editors that only reconcile DOM
+    // mutations, then verify the editor did not revert it.
     element.focus();
     const selection = window.getSelection();
     if (selection && selection.rangeCount > 0 && element.contains(selection.anchorNode)) {
       const range = selection.getRangeAt(0);
       range.deleteContents();
-      const textNode = document.createTextNode(text);
+      const textNode = document.createTextNode(insertText);
       range.insertNode(textNode);
       range.setStartAfter(textNode);
       range.collapse(true);
       selection.removeAllRanges();
       selection.addRange(range);
     } else {
-      element.appendChild(document.createTextNode(text));
+      element.appendChild(document.createTextNode(insertText));
     }
     dispatchEditableEvents(element);
+    await settleEditorMutations();
+    return getEditableText(element) !== beforeText;
   }
 
   function dispatchTextInputFallback(element, text) {
@@ -466,58 +567,50 @@
   }
 
   function insertIntoDocumentSurface(element, text) {
-    const beforeText = getEditableText(element);
-    if (typeof element.focus === "function") element.focus();
-
-    const canUseSelectionInsertion = element.isContentEditable || element.getAttribute("role") === "textbox";
-    if (canUseSelectionInsertion && document.queryCommandSupported?.("insertText") && document.execCommand?.("insertText", false, text)) {
-      dispatchEditableEvents(element);
-      return true;
-    }
-
-    const handledByEditor = dispatchTextInputFallback(element, text);
-    const afterText = getEditableText(element);
-    if (handledByEditor || afterText !== beforeText) {
-      dispatchEditableEvents(element);
-      return true;
-    }
-    return false;
+    return insertThroughEditorPipeline(element, text);
   }
 
-  function insertIntoResolvedEditable(element, text) {
+  async function insertIntoResolvedEditable(element, text) {
     if (!element) return false;
     if (typeof element.focus === "function") element.focus();
     if ("value" in element) {
-      insertIntoInputLike(element, text);
-      return true;
+      return insertIntoInputLike(element, text);
     }
-    insertIntoContentEditable(element, text);
-    return true;
+    return insertIntoContentEditable(element, text);
   }
 
-  function insertContext(text, targetHint = null) {
-    const target = findTargetFromHint(targetHint) || getInsertionTarget();
-    if (!target) {
-      return { success: false, error: "No focused supported input found." };
-    }
+  async function insertContext(text, targetHint = null) {
     const normalizedText = String(text || "");
     if (!normalizedText.trim()) {
       return { success: false, error: "No context text provided." };
     }
+    const liveFocused = getLiveFocusedEditable();
+    const target = (liveFocused ? { kind: "editable", element: liveFocused } : null)
+      || findTargetFromHint(targetHint)
+      || getInsertionTarget();
+    if (!target) {
+      return { success: false, error: "No focused supported input found." };
+    }
     const element = target.element;
     if (typeof element.focus === "function") element.focus();
     if (target.kind === "editable") {
-      insertIntoResolvedEditable(element, normalizedText);
-    } else if (!insertIntoDocumentSurface(element, normalizedText)) {
+      if (!(await insertIntoResolvedEditable(element, normalizedText))) {
+        return {
+          success: false,
+          error: "The focused input did not accept insertion. Click inside the input and try again.",
+        };
+      }
+    } else if (!(await insertIntoDocumentSurface(element, normalizedText))) {
       const fallbackEditable = resolveDocumentSurfaceEditable(element, {
         preferredRole: targetHint?.focusedField?.role,
         preferredKind: targetHint?.focusedTargetKind || target.kind,
       });
-      if (fallbackEditable && insertIntoResolvedEditable(fallbackEditable, normalizedText)) {
+      if (fallbackEditable && (await insertIntoResolvedEditable(fallbackEditable, normalizedText))) {
         return {
           success: true,
           insertedLength: normalizedText.length,
           focusedInputText: getEditableText(fallbackEditable),
+          sourceTool: detectSourceTool(),
         };
       }
       return {
@@ -529,6 +622,7 @@
       success: true,
       insertedLength: normalizedText.length,
       focusedInputText: getEditableText(element),
+      sourceTool: detectSourceTool(),
     };
   }
 
@@ -613,10 +707,19 @@
         : null,
       sourceUrl: truncate(pageContext.sourceUrl || location.href, 500),
       pageTitle: truncate(pageContext.pageTitle || document.title || "", 200),
-      selectedText: truncate(pageContext.selectedText, 2000),
-      focusedInputText: truncate(pageContext.focusedInputText, 1200),
-      visibleText: truncate(pageContext.visibleText, 3000),
+      // Generous client-side ceilings (match the extractor budgets); the BACKEND
+      // page-context token budget is the single real limiter — older backends
+      // simply clip to their own caps, so sending more is always safe.
+      selectedText: truncate(pageContext.selectedText, 8000),
+      focusedInputText: truncate(pageContext.focusedInputText, 8000),
+      visibleText: truncate(pageContext.visibleText, 12000),
       toolSpecificContext: pageContext.toolSpecificContext || {},
+      // Recent AI-chat turns for Prepare (top-level so backends that don't know
+      // the field drop it at their normalize boundary; flag-on backends budget it,
+      // newest-first). Extractor already bounds to 12 viewport-anchored turns.
+      conversationTurns: Array.isArray(pageContext.conversationTurns)
+        ? pageContext.conversationTurns.slice(-12)
+        : [],
       focusedField: pageContext.focusedField || null,
       relatedFields: Array.isArray(pageContext.relatedFields) ? pageContext.relatedFields.slice(0, 8) : [],
       hasFocusedInput: pageContext.hasFocusedInput === true,
@@ -666,7 +769,9 @@
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     const response = handleMessage(message);
     if (response === false) return false;
-    sendResponse(response);
+    // Insertion is async (it waits for editor reconcilers to settle before
+    // verifying); resolve before responding. Plain-object responses pass through.
+    Promise.resolve(response).then(sendResponse);
     return true;
   });
 })();
