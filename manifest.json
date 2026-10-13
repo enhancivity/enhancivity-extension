@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Enhancivity Memory Layer",
-  "version": "2.0.4",
+  "version": "2.0.6",
+  "version_name": "2.0.6 — supervised Capture",
   "description": "Project memory for AI and work tools. Review context before inserting or saving.",
   "permissions": [
     "activeTab",

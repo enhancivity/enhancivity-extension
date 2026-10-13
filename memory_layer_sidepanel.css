@@ -565,6 +565,8 @@ button:disabled {
   line-height: 1.4;
 }
 
+/* Shared activity strip: #insert-progress (Prepare) and #capture-progress (Capture/Save)
+   use the same class so both long operations look and animate identically. */
 .insert-progress {
   margin-top: 12px;
   border: 1px solid rgba(103, 232, 249, 0.16);
@@ -713,6 +715,47 @@ button:disabled {
 .attribute-notice-actions .ghost-btn {
   padding: 4px 12px;
   font-size: 12px;
+}
+
+/* Phase 5 — source text capture held back from the drafts (below the cards). */
+.held-back-source {
+  margin-top: 8px;
+  border: 1px dashed rgba(251, 191, 36, 0.45);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.held-back-heading {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fde68a;
+}
+
+.held-back-note {
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #cbd5e1;
+}
+
+.held-back-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.held-back-text {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #e2e8f0;
+  background: rgba(15, 23, 42, 0.6);
+  border-radius: 6px;
+  padding: 6px 8px;
 }
 
 .proposal-target {

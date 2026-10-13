@@ -273,6 +273,15 @@
     && chrome.runtime?.onMessage;
   if (!inBrowser) return core;
 
+  // The side panel re-injects this file on wake (injectMemoryLayerContent uses
+  // chrome.scripting.executeScript) on top of the manifest content script.
+  // Without this guard every injection wired ANOTHER picker instance: one pick
+  // message mounted N stacked overlays, and each instance's token walk skipped
+  // only its OWN overlay while measuring its siblings' — chip and highlight
+  // styles leaked into page design specs as "page colors".
+  if (window.__enhancivityMemoryLayerPickerWired) return core;
+  window.__enhancivityMemoryLayerPickerWired = true;
+
   let isTopFrame = true;
   try {
     isTopFrame = window.top === window;
@@ -343,6 +352,9 @@
     const stack = document.elementsFromPoint(x, y) || [];
     for (const node of stack) {
       if (state.overlay && (node === state.overlay || state.overlay.contains(node))) continue;
+      // Sibling instances' overlays (double-injection/orphaned) are not page
+      // content either — same marker-attribute skip as the token walk.
+      if (typeof node.closest === 'function' && node.closest('[data-enhancivity-picker]')) continue;
       return node;
     }
     return null;
@@ -601,10 +613,12 @@
     while (queue.length > 0 && visited < MAX_SUBTREE_ELEMENTS) {
       const element = queue.shift();
       if (!element) continue;
-      // The page path walks document.body, which also hosts the picker's own UI —
-      // apply the same self-skip the hit-test stack uses (topDocElementAt), or
-      // captures measure the extension (chip background/font/text, highlight
-      // border and radius) alongside the page it is supposed to describe.
+      // The page path walks document.body, which also hosts picker UI — skip
+      // EVERY picker overlay by its marker attribute, not just this instance's
+      // (double-injection and orphaned pre-reload instances mount sibling
+      // overlays this closure does not own), or captures measure the extension
+      // (chip background/font/text, highlight border and radius) as the page.
+      if (typeof element.getAttribute === 'function' && element.getAttribute('data-enhancivity-picker')) continue;
       if (state.overlay && (element === state.overlay || state.overlay.contains(element))) continue;
       visited += 1;
       if (isHiddenElement(element)) continue; // hidden prunes its whole subtree

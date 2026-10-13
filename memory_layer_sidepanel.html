@@ -193,6 +193,16 @@
           <textarea id="capture-note" rows="3" placeholder="Example: Save the decision and the reasoning from this page."></textarea>
           <button id="capture-btn" class="primary-btn full" type="button" title="Proposes memory from this page for you to review. Nothing is saved until you approve it.">Capture Memory</button>
           <button id="capture-design-btn" class="ghost-btn full" type="button" title="Captures colors and layout from a selection on this page — you review before saving.">Capture This Design</button>
+          <!-- Capture/save activity, shown where the user is actually looking (the shared
+               status line lives in a different card). Reuses the .insert-progress visual
+               so both long operations in the panel look and animate the same. -->
+          <div id="capture-progress" class="insert-progress hidden" aria-live="polite">
+            <div class="progress-message">
+              <span class="progress-star" aria-hidden="true">✦</span>
+              <p id="capture-progress-label">Capturing…</p>
+            </div>
+            <div class="progress-track" aria-hidden="true"><span id="capture-progress-bar"></span></div>
+          </div>
           <div id="capture-review" class="proposal-list"></div>
         </section>
       </div>

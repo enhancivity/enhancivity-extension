@@ -4,6 +4,14 @@ Open-source Chrome extension for using Enhancivity project memory from the brows
 
 The extension lets users sign in, choose a project memory space, review prepared context, insert context into AI/work tools, and capture useful project knowledge for later review.
 
+## Supervised Capture 2.0.6
+
+This early-user release supports complete, self-contained short-text highlights. Capture proposes editable memories; you must open and review the complete original, approve the current edited memory, and then save. Editing a proposal invalidates its previous approval. Capture never saves these proposals unattended.
+
+Use a verified Enhancivity account that has been enabled for the supervised beta. New accounts must complete normal email verification and be enrolled before using this beta build. For an unpacked installation, use email/password sign-in. Long or fragmented sources and connected-source ingestion are outside this release.
+
+If you already use an unpacked installation, replace its files from this repository and press **Reload** on its card at `chrome://extensions/`. Keep the same folder to retain the extension identity and stored login.
+
 ## What Is Open Source
 
 This repository contains only the browser extension code.

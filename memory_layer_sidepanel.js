@@ -25,6 +25,8 @@
   const STORAGE_FIRST_RUN_GUIDE_DISMISSED = "memoryLayerFirstRunGuideDismissed";
   const DEFAULT_MEMORY_LAYER_API_BASE = "https://api.enhancivity.com";
   const MEMORY_LAYER_CAPTURE_SUBJECT_SEGMENTS = true;
+  // Qualified locally before activation; no new review/source requests by default.
+  const MEMORY_LAYER_CAPTURE_EVIDENCE_REVIEW = true;
   const SEGMENT_CAPTURE_THROTTLE_MS = 650;
   const MAX_CAPTURE_SEGMENTS = 4;
   const MAX_INSERT_INSTRUCTION_LENGTH = 4000;
@@ -131,11 +133,23 @@
     // ORIGINAL (pre-edit) snapshot of each proposal, so the backend can diff what
     // the user saved against what was proposed. No UI of its own.
     captureSession: null,
+    // Source text the current capture held back from the drafts (it read like an instruction
+    // to the system processing the page). Shown for review; saved only if the user restores it.
+    heldBack: [],
     // Unit 2c — the at-most-one Tier-2 disclosure notice for the current review panel
     // (id + lint-clean copy + surface only; never any attribute internals). Null when the
     // backend returned none (notices off, nothing armed, or already shown this session).
     captureNotice: null,
     captureNoticeShownSession: false, // client one-per-session marker (§7.3)
+    // In-flight guards. Without them a second press while the first request was
+    // still running fired a DUPLICATE backend call (and the late re-render tore the
+    // card the user was pointing at out from under them), which is what made the
+    // panel feel stiff and unresponsive rather than simply slow.
+    captureInFlight: false,
+    prepareInFlight: false,
+    savingProposalKeys: new Set(), // fingerprints of proposals currently being saved
+    savingAllProposals: false,
+    suppressProposalRender: false,
     // First-run "how it works" strip: shown to signed-in users until dismissed once.
     firstRunGuideDismissed: false,
     providerKeysStatus: {
@@ -219,13 +233,43 @@
     captureNote: document.getElementById("capture-note"),
     captureBtn: document.getElementById("capture-btn"),
     captureDesignBtn: document.getElementById("capture-design-btn"),
+    captureProgress: document.getElementById("capture-progress"),
+    captureProgressLabel: document.getElementById("capture-progress-label"),
     captureReview: document.getElementById("capture-review"),
     eventHistory: document.getElementById("event-history"),
   };
 
-  function setBusy(button, busy) {
+  // A disabled button alone reads as "broken" during a multi-second capture or save.
+  // The optional busyLabel says what is happening ON the control the user just pressed;
+  // the idle label is restored automatically, so callers never have to remember it.
+  function setBusy(button, busy, busyLabel) {
     if (!button) return;
     button.disabled = !!busy;
+    const dataset = button.dataset;
+    if (!dataset) return;
+    if (busy) {
+      if (!busyLabel) return;
+      if (dataset.idleLabel === undefined) dataset.idleLabel = button.textContent;
+      button.textContent = busyLabel;
+      return;
+    }
+    if (dataset.idleLabel !== undefined) {
+      button.textContent = dataset.idleLabel;
+      delete dataset.idleLabel;
+    }
+  }
+
+  // Capture-side activity strip (mirrors setInsertProgress for the Prepare card). Capture
+  // and save both take seconds of real backend work; without this the panel looked frozen.
+  function setCaptureProgress(label) {
+    if (!el.captureProgress) return;
+    if (!label) {
+      el.captureProgress.classList.add("hidden");
+      if (el.captureProgressLabel) el.captureProgressLabel.textContent = "";
+      return;
+    }
+    el.captureProgress.classList.remove("hidden");
+    if (el.captureProgressLabel) el.captureProgressLabel.textContent = label;
   }
 
   function setStatus(message, options = {}) {
@@ -310,6 +354,11 @@
     state.captureSession = null;
     state.captureNotice = null;
     state.captureNoticeShownSession = false;
+    state.captureInFlight = false;
+    state.prepareInFlight = false;
+    state.savingProposalKeys.clear();
+    state.savingAllProposals = false;
+    state.suppressProposalRender = false;
     state.providerKeysStatus = {
       supportedProviders: ["enhancivity", "openai", "anthropic"],
       activeProvider: "enhancivity",
@@ -323,6 +372,7 @@
     clearInsertReviewSummary();
     el.insertReview.classList.add("hidden");
     el.captureReview.innerHTML = "";
+    setCaptureProgress(null);
   }
 
   function syncProfilePanel() {
@@ -377,8 +427,16 @@
     const progressByStep = {
       hidden: 0,
       page: 25,
+      // Honest pipeline stages streamed by the backend (see /context-pack/stream):
+      // understanding -> finding -> reasoning (writer dispatched, no token yet) ->
+      // writing (first token seen) -> refining (post-writer validation).
+      understanding: 35,
       memory: 55,
+      finding: 55,
+      reasoning: 70,
       ai: 82,
+      writing: 82,
+      refining: 92,
       ready: 100,
     };
     if (step === "hidden") {
@@ -660,6 +718,7 @@
 
   function authHeaders() {
     return {
+      "X-Enhancivity-Capture-Beta": "reviewed_short_text_v1",
       "Content-Type": "application/json",
       Authorization: `Bearer ${state.token}`,
     };
@@ -1024,15 +1083,43 @@
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    // Honest AI activity states. We cannot see the model's private reasoning, but we
+    // can truthfully infer it: a dispatched writer that has not emitted a token yet IS
+    // reasoning, the first token means writing, and a second writer dispatch means the
+    // pipeline is iterating on a draft that failed its quality contract. Never fake
+    // model thoughts — only surface real backend events.
+    let writerTokenSeen = false;
+    let writerAttempts = 0;
     const handle = (evt) => {
       if (evt.event === "progress") {
-        if (evt.data && evt.data.stage === "writing") {
+        const stage = evt.data && evt.data.stage;
+        if (stage === "writing") {
+          // Writer attempt dispatched (legacy event name kept for compatibility).
+          // Reasoning models emit nothing until their internal reasoning finishes,
+          // so show "Reasoning"/"Iterating" until the first real token arrives.
           if (evt.data.reset) el.contextReview.value = "";
-          setInsertProgress("ai", "Writing your prompt...");
-        } else if (evt.data && evt.data.stage === "selecting") {
+          writerTokenSeen = false;
+          writerAttempts += 1;
+          setInsertProgress(
+            writerAttempts > 1 ? "refining" : "reasoning",
+            writerAttempts > 1
+              ? "Iterating — rewriting to meet quality checks..."
+              : "Reasoning about your request and memory..."
+          );
+        } else if (stage === "understanding") {
+          setInsertProgress("understanding", "Understanding your request...");
+        } else if (stage === "finding") {
+          setInsertProgress("finding", "Finding relevant memories...");
+        } else if (stage === "refining") {
+          setInsertProgress("refining", "Refining and checking quality...");
+        } else if (stage === "selecting") {
           setInsertProgress("memory", "Selecting relevant memory...");
         }
       } else if (evt.event === "token") {
+        if (!writerTokenSeen) {
+          writerTokenSeen = true;
+          setInsertProgress("writing", "Writing your prompt...");
+        }
         el.contextReview.value += (evt.data && evt.data.text) || "";
       } else if (evt.event === "final") {
         finalData = evt.data;
@@ -1385,11 +1472,27 @@
     return response?.hasFocusedInput === true || response?.context?.hasFocusedInput === true;
   }
 
+  // The frame fallback injects three scripts into EVERY frame and then runs a script in
+  // every frame — seconds of work on ad/embed-heavy pages. It must run only when it can
+  // still change the outcome.
+  function pageContextIsAlreadyDecided(response) {
+    const context = response?.context || response || {};
+    // Highlight capture is the settled case: selected_text mode deliberately drops
+    // visible text, the focused draft, and tool context (buildSelectedTextCaptureBody),
+    // so no other frame can add anything. Overflow is likewise already decided — the
+    // capture is refused before any request goes out.
+    const selected = typeof context.selectedText === "string" ? context.selectedText.trim() : "";
+    return selected.length > 0 || context.selectedTextOverflow === true;
+  }
+
   function shouldTryFrameFallback(message, response) {
     if (!chrome.scripting?.executeScript) return false;
     if (message?.type === "MEMORY_LAYER_PING") return !responseHasFocusedTarget(response);
     if (message?.type === "MEMORY_LAYER_GET_INSERT_CONTEXT") return !responseHasFocusedTarget(response);
-    if (message?.type === "MEMORY_LAYER_GET_PAGE_CONTEXT") return !responseHasFocusedTarget(response);
+    if (message?.type === "MEMORY_LAYER_GET_PAGE_CONTEXT") {
+      if (pageContextIsAlreadyDecided(response)) return false;
+      return !responseHasFocusedTarget(response);
+    }
     if (message?.type === "MEMORY_LAYER_INSERT_CONTEXT") {
       return !response?.success && /No focused supported input|did not accept insertion/i.test(response?.error || "");
     }
@@ -1675,9 +1778,13 @@
   }
 
   async function prepareContext(limit) {
+    // Re-entry guard: pressing Prepare again mid-run used to start a second full
+    // pipeline whose late result overwrote the first one's review text.
+    if (state.prepareInFlight) return;
     try {
       assertReady();
-      setBusy(el.prepareContextBtn, true);
+      state.prepareInFlight = true;
+      setBusy(el.prepareContextBtn, true, "Preparing…");
       setBusy(el.addContextBtn, true);
       setInsertProgress("page", sharePageContentEnabled()
         ? "Reading the current page..."
@@ -1784,6 +1891,7 @@
       setInsertProgress("hidden");
       setStatus(error instanceof Error ? error.message : "Could not prepare context.", { error: true });
     } finally {
+      state.prepareInFlight = false;
       setBusy(el.prepareContextBtn, false);
       setBusy(el.addContextBtn, false);
       setTimeout(() => {
@@ -1973,6 +2081,11 @@
       next.evolutionMetadata = undefined;
     }
     state.proposals[index] = next;
+    if (MEMORY_LAYER_CAPTURE_EVIDENCE_REVIEW) {
+      state.captureSession?.evidenceReview?.decisions?.delete(proposalKey(proposal));
+      const checkbox = state.captureSession?.evidenceReview?.checkboxes?.get(proposalKey(proposal));
+      if (checkbox) checkbox.checked = false;
+    }
   }
 
   function setProposalRecommendations(index, recommendations) {
@@ -2044,25 +2157,93 @@
     card.appendChild(list);
   }
 
-  function fallbackCaptureProposal(pageContext = {}) {
-    return {
-      type: "note",
-      title: pageContext.pageTitle || "Captured memory",
-      content: pageContext.userNote || pageContext.visibleText || "Captured visible context.",
-      sourceType: pageContext.sourceType || "browser_visible_context",
-      sourceTool: pageContext.sourceTool || "browser",
-      sourceUrl: pageContext.sourceUrl || null,
-      sourceSessionId: pageContext.sourceSessionId || null,
-      importance: 3,
-      sensitivity: "standard",
-      status: "ACTIVE",
-      metadata: { combinedProposalCount: 0 },
-    };
+  // An empty list is the backend's answer (no_op, duplicate, deferred, quarantined, retryable),
+  // never a gap to fill: a draft made from raw page text would put back exactly what capture
+  // declined or held back.
+  // Phase 5.1 (§38.16): poll the automatic resolution of ONE capture (at most ~5 min): verified
+  // missing details (A) and legitimate held-back text (B) arrive as ordinary drafts in the same
+  // review; recovered held-back passages leave the held-back list. Waiting for verification and
+  // "needs review" are said plainly — never silent. Nothing is saved here. Stops if the user has
+  // moved on to another capture or the route is unavailable.
+  async function pollAutomaticResolution(projectId, captureId, sourceContext, attempt = 0) {
+    if (attempt >= 28) {
+      if (state.captureSession?.captureId === captureId) setStatus("Some details are still waiting for automatic verification; they will be offered when it completes.");
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, attempt < 12 ? 5000 : 15000));
+    if (state.captureSession?.captureId !== captureId) return;
+    let data = null;
+    try {
+      data = await safeApiRequest(`/projects/${encodeURIComponent(projectId)}/captures/${encodeURIComponent(captureId)}/automatic-resolution`);
+    } catch (_error) {
+      return;
+    }
+    if (!data || data.success === false) return;
+    if (state.captureSession?.captureId !== captureId) return;
+    const quarantine = data.quarantine || {};
+    const omission = data.omission || {};
+    const recoveredIds = new Set(Array.isArray(quarantine.recoveredHeldIds) ? quarantine.recoveredHeldIds : []);
+    if (recoveredIds.size && Array.isArray(state.heldBack)) state.heldBack = state.heldBack.filter(item => !recoveredIds.has(item?.id));
+    const seen = state.captureSession.autoResolved || (state.captureSession.autoResolved = new Set());
+    const fresh = [...(quarantine.proposals || []), ...(omission.proposals || [])]
+      .filter(proposal => proposal && !seen.has(captureProposalFingerprint(proposal)));
+    const recovered = normalizeCaptureProposalsForReview(fresh, sourceContext);
+    for (const proposal of recovered) {
+      seen.add(captureProposalFingerprint(proposal));
+      state.captureSession.originals.set(captureProposalFingerprint(proposal), captureProposalSnapshot(proposal));
+    }
+    if (recovered.length) state.proposals = [...state.proposals, ...recovered];
+    // The escape hatch: details that could not be verified automatically after bounded retries.
+    if (omission.state === "needs_review" && Array.isArray(omission.review)) {
+      state.unverified = omission.review.map(item => ({ id: `unverified-${captureId}-${item.ref}`, text: item.text }));
+    }
+    renderCaptureProposals();
+    if (recovered.length) setStatus(`Added ${recovered.length} verified ${recovered.length === 1 ? "detail" : "details"} to review below.`);
+    else if (omission.state === "needs_review" || quarantine.state === "needs_review") setStatus("Some details could not be verified automatically — they are listed below for you to review.");
+    if (data.state === "pending") pollAutomaticResolution(projectId, captureId, sourceContext, attempt + 1);
+  }
+
+  function renderUnverifiedDetails() {
+    const items = Array.isArray(state.unverified) ? state.unverified : [];
+    if (items.length === 0) return;
+    const section = document.createElement("div");
+    section.className = "held-back-source";
+    const heading = document.createElement("p");
+    heading.className = "held-back-heading";
+    heading.textContent = `Could not be verified automatically (${items.length})`;
+    const note = document.createElement("p");
+    note.className = "held-back-note";
+    note.textContent = "These passages from your source were not in the drafts, and automatic verification was unavailable. Add one only if it is a current fact you want to keep.";
+    section.append(heading, note);
+    items.forEach(item => {
+      const row = document.createElement("div");
+      row.className = "held-back-item";
+      const text = document.createElement("p");
+      text.className = "held-back-text";
+      text.textContent = item?.text || "";
+      const add = document.createElement("button");
+      add.className = "ghost-btn";
+      add.type = "button";
+      add.textContent = "Add as draft";
+      add.addEventListener("click", () => {
+        state.unverified = state.unverified.filter(x => x.id !== item.id);
+        // Same title rule as the backend addendum (§38.18, falsifier R7-9): the whole single-line text when it fits
+        // 90 code points, else a neutral title — never a cut prefix that can drop a trailing "not" / a column.
+        const reviewText = String(item.text || "");
+        const reviewTitleChars = Array.from(reviewText.replace(/\s+/gu, " ").trim());
+        const reviewTitle = !/\r?\n/u.test(reviewText) && reviewTitleChars.length > 0 && reviewTitleChars.length <= 90 ? reviewTitleChars.join("") : "Verbatim detail from the source";
+        state.proposals.push({ type: "note", title: reviewTitle, content: item.text, summary: null, metadata: { reviewProposalIndex: item.id, extractionMode: "unverified_omission_manual" } });
+        setStatus("Added as a draft. Review it before saving.");
+        renderCaptureProposals();
+      });
+      row.append(text, add);
+      section.appendChild(row);
+    });
+    el.captureReview.appendChild(section);
   }
 
   function normalizeCaptureProposalsForReview(proposals, pageContext = {}) {
     const safeProposals = Array.isArray(proposals) ? proposals.filter(Boolean) : [];
-    if (safeProposals.length === 0) return [fallbackCaptureProposal(pageContext)];
     const comparableText = value => String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
     return safeProposals.map((proposal, index) => {
       const title = String(proposal.title || "").trim() || `Captured memory ${index + 1}`;
@@ -2094,12 +2275,81 @@
   // top of the panel (which sits in a different card and is easily missed).
   function renderCaptureError(message) {
     state.proposals = [];
+    state.heldBack = [];
     el.captureReview.innerHTML = "";
     const block = document.createElement("p");
     block.className = "capture-error";
     block.setAttribute("role", "alert");
     block.textContent = message;
     el.captureReview.appendChild(block);
+  }
+
+  function renderCaptureOutcome(message) {
+    state.proposals = [];
+    el.captureReview.innerHTML = "";
+    const block = document.createElement("p");
+    block.className = "proposal-target";
+    block.setAttribute("role", "status");
+    block.textContent = message;
+    el.captureReview.appendChild(block);
+    renderHeldBackSource();
+    renderUnverifiedDetails();
+  }
+
+  // A restored held-back passage was never a model proposal, so it must not become capture
+  // feedback: saved and dismissed feedback turn into examples in future capture prompts.
+  function isRestoredHeldBack(proposal) {
+    // Also a manually added unverified detail (Phase 5.1 needs_review): never a model proposal.
+    return Boolean(proposal?.metadata?.capture?.heldBack) || proposal?.metadata?.extractionMode === "unverified_omission_manual";
+  }
+
+  // What the capture held back from the drafts, shown as inert text below them. Nothing here is
+  // saved unless the reviewer restores it; a restored passage becomes an ordinary draft (the
+  // backend built it with the capture's identity inputs) that they edit and save as usual.
+  function renderHeldBackSource() {
+    const items = Array.isArray(state.heldBack) ? state.heldBack : [];
+    if (items.length === 0) return;
+    const section = document.createElement("div");
+    section.className = "held-back-source";
+    const heading = document.createElement("p");
+    heading.className = "held-back-heading";
+    heading.textContent = `Held back from memory (${items.length})`;
+    const note = document.createElement("p");
+    note.className = "held-back-note";
+    note.textContent = "This text read like an instruction to the system processing this page, so it was not used for the drafts. Restore it only if it is part of your work.";
+    section.append(heading, note);
+    items.forEach(item => {
+      const row = document.createElement("div");
+      row.className = "held-back-item";
+      const text = document.createElement("p");
+      text.className = "held-back-text";
+      text.textContent = item?.text || "";
+      const restore = document.createElement("button");
+      restore.className = "ghost-btn";
+      restore.type = "button";
+      restore.textContent = "Restore as draft";
+      restore.addEventListener("click", () => restoreHeldBack(item?.id));
+      row.append(text, restore);
+      section.appendChild(row);
+    });
+    el.captureReview.appendChild(section);
+  }
+
+  function restoreHeldBack(id) {
+    const index = state.heldBack.findIndex(item => item?.id === id);
+    if (index < 0) return;
+    const [item] = state.heldBack.splice(index, 1);
+    const draft = item?.draft && typeof item.draft === "object" ? item.draft : null;
+    if (draft) {
+      state.proposals.push({
+        ...draft,
+        // Unique review key (proposalKey) for a card that has no model fingerprint.
+        metadata: { ...(draft.metadata || {}), reviewProposalIndex: `held-${id}` },
+      });
+      setStatus("Restored held-back text as a draft. Review it before saving.");
+      addEvent("Restored held-back source text");
+    }
+    renderCaptureProposals();
   }
 
   function hasSelectedTextCapture(context) {
@@ -2188,9 +2438,107 @@
     captureDesign();
   }
 
+  // Stable per-proposal identity for the in-flight set: array indexes shift on splice,
+  // the capture fingerprint (or the normalize-time review index) does not.
+  function proposalKey(proposal) {
+    return captureProposalFingerprint(proposal);
+  }
+
+  function isProposalSaving(proposal) {
+    return state.savingAllProposals || state.savingProposalKeys.has(proposalKey(proposal));
+  }
+
+  function evidenceReviewFor(proposal) {
+    const review = MEMORY_LAYER_CAPTURE_EVIDENCE_REVIEW && state.captureSession?.evidenceReview;
+    return review && proposal.metadata?.capture?.captureId === state.captureSession.captureId ? review : null;
+  }
+
+  function evidenceReviewSignature(proposal) {
+    return JSON.stringify([proposal.type, proposal.title, proposal.content, proposal.summary ?? null]);
+  }
+
+  function evidenceReviewAcknowledgement(proposal) {
+    const review = evidenceReviewFor(proposal);
+    if (!review) return null;
+    if (!review.originalViewed || !review.baseHash || review.decisions.get(proposalKey(proposal)) !== evidenceReviewSignature(proposal)) {
+      throw new Error("View the original source and explicitly review this memory before saving.");
+    }
+    return { decision: "reviewed_original", checkedBaseHash: review.baseHash };
+  }
+
+  function renderEvidenceReview(card, proposal) {
+    const review = evidenceReviewFor(proposal);
+    if (!review) return;
+    const note = document.createElement("p");
+    note.textContent = ["uncertain", "needs_review"].includes(review.verdict)
+      ? "The automatic check did not confirm this draft. Review the original facts and conditions before saving."
+      : "Review the captured original alongside this memory.";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ghost-btn";
+    button.textContent = "View original source";
+    const sourceText = document.createElement("pre");
+    sourceText.style.whiteSpace = "pre-wrap";
+    sourceText.style.maxHeight = "240px";
+    sourceText.style.overflow = "auto";
+    const label = document.createElement("label");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.disabled = !review.originalViewed;
+    checkbox.checked = review.decisions.get(proposalKey(proposal)) === evidenceReviewSignature(proposal);
+    review.checkboxes.set(proposalKey(proposal), checkbox);
+    const caption = document.createElement("span");
+    caption.textContent = "I reviewed this memory against the original, including its conditions.";
+    label.append(checkbox, caption);
+    checkbox.addEventListener("change", () => {
+      if (state.captureSession?.evidenceReview !== review || !review.originalViewed) { checkbox.checked = false; return; }
+      const current = state.proposals.find(item => proposalKey(item) === proposalKey(proposal));
+      if (!current) { checkbox.checked = false; return; }
+      if (checkbox.checked) review.decisions.set(proposalKey(current), evidenceReviewSignature(current));
+      else review.decisions.delete(proposalKey(current));
+    });
+    button.addEventListener("click", async () => {
+      const session = state.captureSession, token = state.token, selectedProjectId = state.selectedProjectId;
+      button.disabled = true;
+      try {
+        if (!review.available || !review.sha256) throw new Error("The original is unavailable. Recapture the complete passage before saving.");
+        const data = await apiRequest(`/projects/${encodeURIComponent(review.projectId)}/captures/${encodeURIComponent(session.captureId)}/source`);
+        if (state.captureSession !== session || state.token !== token || state.selectedProjectId !== selectedProjectId) return;
+        const source = data.source;
+        if (!data.success || source?.captureId !== session.captureId || source.sha256 !== review.sha256 || !Array.isArray(source.units) || !source.units.length
+          || source.byteLength > 2 * 1024 * 1024 || source.units.some(unit => unit.text !== null && typeof unit.text !== "string")) {
+          throw new Error("The original is unavailable or changed. Recapture the complete passage before saving.");
+        }
+        // Every source field is data. Never render source markup or execute links.
+        sourceText.textContent = `Captured: ${source.createdAt || "unknown"}\n\n` + source.units.map(unit =>
+          `${unit.speaker || unit.role || "Unknown speaker"} — source time: ${unit.sourceTime || "unknown"}${unit.timeProvenance ? ` (${unit.timeProvenance})` : ""}\n${unit.text ?? ""}`
+        ).join("\n\n");
+        review.originalViewed = true;
+        for (const control of review.checkboxes.values()) control.disabled = false;
+      } catch (error) {
+        if (state.captureSession === session && state.token === token && state.selectedProjectId === selectedProjectId) {
+          review.originalViewed = false;
+          review.decisions.clear();
+          for (const control of review.checkboxes.values()) { control.disabled = true; control.checked = false; }
+          sourceText.textContent = error instanceof Error ? error.message : "The original could not be read.";
+          setStatus(sourceText.textContent);
+        }
+      } finally { button.disabled = false; }
+    });
+    card.append(note, button, sourceText, label);
+  }
+
   function renderCaptureProposals() {
+    // "Save All" applies items one after another (order matters — each item is compared
+    // against memory the previous one may have just created). Rebuilding the whole list
+    // between every item was pure churn the user saw as stutter; render once at the end.
+    if (state.suppressProposalRender) return;
     el.captureReview.innerHTML = "";
-    if (state.proposals.length === 0) return;
+    if (state.proposals.length === 0) {
+      renderHeldBackSource();
+    renderUnverifiedDetails();
+      return;
+    }
 
     renderAttributeNotice();
 
@@ -2202,6 +2550,7 @@
       saveAll.className = "primary-btn full";
       saveAll.type = "button";
       saveAll.textContent = "Save All Reviewed";
+      saveAll.disabled = state.savingAllProposals;
       saveAll.addEventListener("click", saveAllReviewedProposals);
 
       bulkActions.appendChild(saveAll);
@@ -2240,12 +2589,18 @@
       const actions = document.createElement("div");
       actions.className = "proposal-actions";
 
+      const busy = isProposalSaving(proposal);
+
       const dismiss = document.createElement("button");
       dismiss.className = "ghost-btn";
       dismiss.type = "button";
       dismiss.textContent = "Dismiss";
+      dismiss.disabled = busy;
       dismiss.addEventListener("click", () => {
-        sendCaptureFeedback([buildCaptureFeedbackEvent(state.proposals[index], "dismissed")]);
+        if (isProposalSaving(state.proposals[index])) return;
+        if (!isRestoredHeldBack(state.proposals[index])) {
+          sendCaptureFeedback([buildCaptureFeedbackEvent(state.proposals[index], "dismissed")]);
+        }
         state.proposals.splice(index, 1);
         renderCaptureProposals();
       });
@@ -2253,17 +2608,23 @@
       const save = document.createElement("button");
       save.className = "primary-btn";
       save.type = "button";
-      save.textContent = proposal.recommendations ? "Confirm Save" : "Save Reviewed Memory";
-      save.addEventListener("click", () => saveProposal(index));
+      save.textContent = busy
+        ? "Saving…"
+        : (proposal.recommendations ? "Confirm Save" : "Save Reviewed Memory");
+      save.disabled = busy;
+      save.addEventListener("click", () => saveProposal(index, { button: save }));
 
       actions.append(dismiss, save);
       card.append(target);
       renderBrandSnapshotProvenance(card, proposal, index);
       card.append(type, title, content);
+      if (MEMORY_LAYER_CAPTURE_EVIDENCE_REVIEW) renderEvidenceReview(card, proposal);
       renderRecommendationCards(card, proposal, index);
       card.appendChild(actions);
       el.captureReview.appendChild(card);
     });
+    renderHeldBackSource();
+    renderUnverifiedDetails();
   }
 
   // --- Unit 2c: Tier-2 disclosure notice (non-blocking; never disturbs save/dismiss) ---
@@ -2431,11 +2792,19 @@
   });
 
   async function captureMemory(options = {}) {
+    if (state.captureInFlight) return;
     try {
       assertReady();
-      setBusy(el.captureBtn, true);
+      state.captureInFlight = true;
+      setBusy(el.captureBtn, true, "Capturing…");
+      // Capture is a multi-second round trip (read the page, then the model proposes
+      // memory). Without a visible marker beside the button the panel looked crashed.
+      setCaptureProgress(options.captureSubject
+        ? "Preparing design memory…"
+        : "Reading this page…");
       // A new capture abandons any leftover proposals from the previous one.
       flushIgnoredCaptureProposals();
+      state.heldBack = [];
       if (!options.captureSubject) state.lastDesignCrop = null;
       const pageResponse = await sendTabMessage({
         type: "MEMORY_LAYER_GET_PAGE_CONTEXT",
@@ -2452,6 +2821,11 @@
         return;
       }
       const selectedTextMode = !options.captureSubject && hasSelectedTextCapture(pageContext);
+      if (!options.captureSubject) {
+        setCaptureProgress(selectedTextMode
+          ? "Reading your highlight for what's worth remembering…"
+          : "Reading this page for what's worth remembering…");
+      }
       let body = selectedTextMode ? buildSelectedTextCaptureBody(pageContext) : pageContext;
       if (options.captureSubject) {
         // Selection-first design capture: measured values + (optional) transient
@@ -2476,6 +2850,14 @@
         data.capture?.proposedMemoryItems || data.proposedMemoryItems || [],
         pageResponse.context
       );
+      const captureOutcome = data.capture?.outcome || (state.proposals.length ? "proposed" : "no_op");
+      const turnLossMessage = data.capture?.metadata?.deferredReason === "conversation_turn_truncated"
+        ? "Capture deferred because an included conversation turn was clipped. Highlight a complete passage with its conditions and capture that selection."
+        : null;
+      state.heldBack = Array.isArray(data.capture?.heldBackSource) ? data.capture.heldBackSource : [];
+      const heldBackNote = state.heldBack.length > 0
+        ? ` ${state.heldBack.length} ${state.heldBack.length === 1 ? "passage was" : "passages were"} held back — review below.`
+        : "";
       // Remember this batch + the pre-edit snapshots for capture feedback.
       state.captureSession = {
         captureId: data.capture?.captureId || null,
@@ -2485,6 +2867,14 @@
           captureProposalFingerprint(proposal),
           captureProposalSnapshot(proposal),
         ])),
+        ...(MEMORY_LAYER_CAPTURE_EVIDENCE_REVIEW ? { evidenceReview: {
+          projectId: state.selectedProjectId,
+          available: data.capture?.metadata?.sourceEvidence?.available === true,
+          sha256: data.capture?.metadata?.sourceEvidence?.sha256 || null,
+          baseHash: data.capture?.metadata?.fidelity?.binding?.assessedPayloadHash || null,
+          verdict: data.capture?.metadata?.fidelity?.verdict || "not_checked",
+          originalViewed: false, decisions: new Map(), checkboxes: new Map(),
+        } } : {}),
       };
       // Unit 2c — accept at most ONE disclosure notice per panel session (§7.3). The
       // backend already returns only the oldest queued; this client marker is the
@@ -2495,7 +2885,20 @@
       } else {
         state.captureNotice = null;
       }
-      renderCaptureProposals();
+      if (state.proposals.length > 0) {
+        renderCaptureProposals();
+      } else {
+        const outcomeMessage = captureOutcome === "duplicate"
+          ? "This source claim is already in memory. Nothing new was proposed."
+          : captureOutcome === "deferred_context"
+            ? turnLossMessage || "More source context is required before this can be captured safely."
+            : captureOutcome === "quarantined"
+              ? "Suspicious source instructions were quarantined and were not turned into memory."
+              : captureOutcome === "failed_retryable"
+                ? "Capture could not safely finish. Please try again."
+                : "Nothing meaningful to remember was found. No memory draft was created.";
+        renderCaptureOutcome(outcomeMessage);
+      }
       // Item 8: honest note when the capture was bounded by the mounted DOM, so the
       // user knows there may be more above/below than the region around their view.
       const regionNote = !selectedTextMode && pageContext.visibleTextBoundedByDom
@@ -2510,10 +2913,29 @@
           ? `Design memory draft ready — ${measuredCount} measured value${measuredCount === 1 ? "" : "s"}. Review and save.`
           : "Captured page text only — the design values did not come back. Pick the design itself (not its container) and try again.");
         addEvent(designCard ? "Captured design subject" : "Design capture fell back to page text");
-      } else {
+      } else if (state.proposals.length > 0) {
         const sourceLabel = selectedTextMode ? " from highlighted text" : "";
-        setStatus(`Prepared ${state.proposals.length} memory ${state.proposals.length === 1 ? "draft" : "drafts"}${sourceLabel} for review.${regionNote}`);
+        setStatus(`Prepared ${state.proposals.length} memory ${state.proposals.length === 1 ? "draft" : "drafts"}${sourceLabel} for review.${regionNote}${heldBackNote}`);
         addEvent(selectedTextMode ? "Captured highlighted text" : "Captured visible context");
+      } else {
+        const outcomeStatus = captureOutcome === "duplicate"
+          ? "Already remembered — no duplicate draft created."
+          : captureOutcome === "deferred_context"
+            ? turnLossMessage || "Capture deferred until the missing context is available."
+            : captureOutcome === "quarantined"
+              ? "Suspicious source instructions quarantined."
+              : captureOutcome === "failed_retryable"
+                ? "Capture could not safely finish. Please try again."
+                : "Nothing meaningful to remember — no draft created.";
+        setStatus(`${outcomeStatus}${heldBackNote}`);
+        addEvent(`Capture outcome: ${captureOutcome}`);
+      }
+      // Phase 5.1: held-back text (B) and flagged missing details (A) are resolved automatically in
+      // the background; pick up what they recover as ordinary drafts for this review.
+      state.unverified = [];
+      if (data.capture?.captureId && (data.capture?.metadata?.quarantineResolution?.state === "pending"
+        || data.capture?.metadata?.anchorAccountability?.resolution?.state === "pending")) {
+        pollAutomaticResolution(state.selectedProjectId, data.capture.captureId, pageResponse.context);
       }
     } catch (error) {
       // Item 1: capture is 100% LLM-driven with no fake fallback. When the LLM is
@@ -2525,7 +2947,9 @@
       setStatus(message);
       renderCaptureError(message);
     } finally {
+      state.captureInFlight = false;
       setBusy(el.captureBtn, false);
+      setCaptureProgress(null);
     }
   }
 
@@ -2608,6 +3032,7 @@
       for (let index = 0; index < layout.length; index += 1) {
         if (index > 0) await sleep(SEGMENT_CAPTURE_THROTTLE_MS);
         setStatus(`Sampling design colors (segment ${index + 1} of ${layout.length})...`);
+        setCaptureProgress(`Sampling design colors — segment ${index + 1} of ${layout.length}…`);
         const measured = await chrome.tabs.sendMessage(tab.id, {
           type: "MEMORY_LAYER_SCROLL_TO_SEGMENT",
           scrollY: layout[index].scrollY,
@@ -2684,12 +3109,14 @@
         return;
       }
       setBusy(el.captureDesignBtn, true);
+      el.captureDesignBtn.textContent = "Capturing Design…";
 
       const captureSubject = { ...picked.payload };
       state.lastDesignCrop = null; // no stale thumbnail from a previous pick
 
       if (captureSubject.subjectType === "pixel-subject") {
         setStatus("Sampling design colors…");
+        setCaptureProgress("Sampling design colors…");
         const shouldSegment = MEMORY_LAYER_CAPTURE_SUBJECT_SEGMENTS
           && captureSubject.selection?.docRectCss;
         const pixels = shouldSegment
@@ -2714,17 +3141,20 @@
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Could not capture the design.");
     } finally {
-      el.captureDesignBtn.textContent = "Capture This Design";
       setBusy(el.captureDesignBtn, false);
+      el.captureDesignBtn.textContent = "Capture This Design";
+      setCaptureProgress(null);
     }
   }
 
   async function prepareProposalRecommendations(proposal, index) {
+    const assertCurrent = reviewedSaveGuard(proposal, index);
     const targetProjectId = proposalTargetProjectId(proposal);
     const recommendationData = await apiRequest(`/projects/${encodeURIComponent(targetProjectId)}/memory/evolution-recommendations`, {
       method: "POST",
       body: JSON.stringify({ proposedMemoryItem: proposal }),
     });
+    assertCurrent();
     const recommendations = recommendationData.memoryEvolution?.recommendations || [];
     const evolutionMetadata = recommendationData.memoryEvolution?.metadata || null;
     if (recommendations.length === 0) {
@@ -2745,18 +3175,66 @@
       return { appliedCount: 0, skippedCount: acceptedRecommendations.length };
     }
 
+    const acknowledgement = MEMORY_LAYER_CAPTURE_EVIDENCE_REVIEW ? evidenceReviewAcknowledgement(proposal) : null;
+    const reviewedRecommendations = acknowledgement
+      ? acceptedRecommendations.map(recommendation => ({ ...recommendation, fidelityAcknowledgement: acknowledgement }))
+      : acceptedRecommendations;
     const applyData = await apiRequest(`/projects/${encodeURIComponent(targetProjectId)}/memory/evolution-recommendations/apply`, {
       method: "POST",
-      body: JSON.stringify({ acceptedRecommendations }),
+      body: JSON.stringify({ acceptedRecommendations: reviewedRecommendations }),
     });
     return applyData.memoryEvolutionApply?.metadata || { appliedCount: 0, skippedCount: 0 };
+  }
+
+  // Recommendations that rewrite, supersede, or archive EXISTING memory are destructive,
+  // and creating a subproject is a structural change — both keep the explicit second
+  // "Confirm Save" click so the user sees what will happen before it happens. A plain
+  // "add" changes nothing that already exists, and the destination is already printed on
+  // the card, so a second click there only made saving feel broken. Flip this constant to
+  // false to restore the old confirm-everything behavior exactly.
+  const ONE_CLICK_SAVE_FOR_PLAIN_ADD = true;
+  const DESTRUCTIVE_RECOMMENDATION_ACTIONS = new Set(["update", "supersede", "archive"]);
+
+  // A recommendation belongs to the reviewed draft and account/project that
+  // requested it. A later edit cannot approve an earlier in-flight snapshot.
+  function reviewedSaveGuard(proposal, index) {
+    if (!MEMORY_LAYER_CAPTURE_EVIDENCE_REVIEW) return () => {};
+    const session = state.captureSession, token = state.token, projectId = state.selectedProjectId;
+    const key = proposalKey(proposal), signature = evidenceReviewSignature(proposal);
+    return () => {
+      const current = state.proposals[index];
+      if (state.captureSession !== session || state.token !== token || state.selectedProjectId !== projectId
+        || !current || proposalKey(current) !== key || evidenceReviewSignature(current) !== signature) {
+        throw new Error("The reviewed memory or account/project changed. Review it and save again.");
+      }
+    };
+  }
+
+  function recommendationsNeedConfirmClick(recommendations, evolutionMetadata) {
+    if (!ONE_CLICK_SAVE_FOR_PLAIN_ADD) return true;
+    if (evolutionMetadata?.willCreateSubproject) return true;
+    if (evolutionMetadata?.willEnsureGeneralFallback) return true;
+    return (Array.isArray(recommendations) ? recommendations : []).some(recommendation => (
+      recommendation?.requiresUserConfirmation === true
+      || DESTRUCTIVE_RECOMMENDATION_ACTIONS.has(recommendation?.action)
+    ));
   }
 
   async function saveProposal(index, options = {}) {
     const proposal = state.proposals[index];
     if (!proposal) return false;
+    // A press while this proposal's own save is already running must not fire a second
+    // backend call — that was the "hit it several times and nothing happens" symptom.
+    const key = proposalKey(proposal);
+    if (state.savingProposalKeys.has(key)) return false;
+    state.savingProposalKeys.add(key);
+    const button = options.button || null;
+    const assertCurrent = reviewedSaveGuard(proposal, index);
     try {
+      if (MEMORY_LAYER_CAPTURE_EVIDENCE_REVIEW) evidenceReviewAcknowledgement(proposal);
       if (!proposal.recommendations) {
+        setBusy(button, true, "Checking…");
+        if (!options.quiet) setCaptureProgress("Checking where this memory belongs…");
         const recommendations = await prepareProposalRecommendations(proposal, index);
         if (recommendations.length === 0) {
           throw new Error("No memory recommendation was returned.");
@@ -2767,14 +3245,19 @@
           ...recommendation,
           confirmed: true,
         })));
-        // Fix 2: show + confirm. Stop here on the individual Save so the user can see
-        // WHERE it will be saved (the destination label + actions just rendered) and
-        // confirm with a second click. The bulk "Save All" path passes autoApply.
-        if (!options.autoApply) {
+        // Show + confirm, but only where the confirmation buys the user something: a
+        // destructive or structural outcome. The bulk "Save All" path passes autoApply.
+        const needsConfirm = recommendationsNeedConfirmClick(
+          state.proposals[index].recommendations,
+          state.proposals[index].evolutionMetadata
+        );
+        if (!options.autoApply && needsConfirm) {
+          state.savingProposalKeys.delete(key);
           // Re-render so the checkboxes reflect the pre-confirmed state and the button
           // shows "Confirm Save".
           renderCaptureProposals();
           if (!options.quiet) {
+            setCaptureProgress(null);
             const targetLabel = proposalTargetLabel(state.proposals[index]);
             setStatus(targetLabel
               ? `${targetLabel}. Review and click Confirm Save.`
@@ -2784,6 +3267,8 @@
         }
       }
 
+      if (!options.quiet) setCaptureProgress("Saving to memory…");
+      assertCurrent();
       const result = await applyReviewedRecommendations(state.proposals[index]);
       if (!result.appliedCount) {
         if (!options.quiet) setStatus("No memory changes were applied.");
@@ -2792,8 +3277,11 @@
       }
       // The backend diffs this final version against the original proposal and
       // records saved vs edited_saved itself.
-      sendCaptureFeedback([buildCaptureFeedbackEvent(state.proposals[index], "saved")]);
-      await loadProjects();
+      if (!isRestoredHeldBack(state.proposals[index])) {
+        sendCaptureFeedback([buildCaptureFeedbackEvent(state.proposals[index], "saved")]);
+      }
+      // The project list only has to be re-read once per batch, not once per item.
+      if (!options.deferProjectRefresh) await refreshProjectsAfterSave();
       state.proposals.splice(index, 1);
       renderCaptureProposals();
       if (!options.quiet) {
@@ -2811,30 +3299,57 @@
     } catch (error) {
       if (!options.quiet) setStatus(error instanceof Error ? error.message : "Could not save memory.");
       return false;
+    } finally {
+      state.savingProposalKeys.delete(key);
+      setBusy(button, false);
+      if (!options.quiet) setCaptureProgress(null);
+    }
+  }
+
+  // The memory itself is already written at this point; a failed project re-read must
+  // never be reported to the user as a failed save.
+  async function refreshProjectsAfterSave() {
+    try {
+      await loadProjects();
+    } catch (_error) {
+      // Non-fatal: the panel keeps the project list it already has.
     }
   }
 
   async function saveAllReviewedProposals() {
-    if (state.proposals.length === 0) return;
+    if (state.proposals.length === 0 || state.savingAllProposals) return;
     const startingCount = state.proposals.length;
+    state.savingAllProposals = true;
     setBusy(el.captureBtn, true);
-    setStatus(`Saving ${startingCount} reviewed memories...`);
+    // Every card shows the batch is running, then the list is rebuilt once at the end.
+    renderCaptureProposals();
+    state.suppressProposalRender = true;
+    setStatus(`Saving ${startingCount} reviewed ${startingCount === 1 ? "memory" : "memories"}...`);
     let savedCount = 0;
 
     try {
       while (state.proposals.length > 0) {
-        const saved = await saveProposal(0, { quiet: true, autoApply: true });
+        setCaptureProgress(`Saving memory ${savedCount + 1} of ${startingCount}…`);
+        const saved = await saveProposal(0, {
+          quiet: true,
+          autoApply: true,
+          deferProjectRefresh: true,
+        });
         if (!saved) break;
         savedCount += 1;
       }
-      renderCaptureProposals();
+      if (savedCount > 0) await refreshProjectsAfterSave();
       if (state.proposals.length === 0) {
         setStatus(`Saved ${savedCount} reviewed ${savedCount === 1 ? "memory" : "memories"}.`);
       } else {
         setStatus(`Saved ${savedCount} reviewed ${savedCount === 1 ? "memory" : "memories"}. Review the remaining ${state.proposals.length}.`);
       }
     } finally {
+      state.suppressProposalRender = false;
+      state.savingAllProposals = false;
       setBusy(el.captureBtn, false);
+      setCaptureProgress(null);
+      renderCaptureProposals();
     }
   }
 

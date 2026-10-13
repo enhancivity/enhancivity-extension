@@ -327,13 +327,47 @@
 
   function extractTurnsFromSelectors(selectors, fallbackRole = "unknown") {
     const turns = uniqueElements(selectors)
-      .map(element => ({
+      .map((element, index) => {
+        // Measure the same normalized DOM basis before the operating turn cap.
+        // Only included turns carry loss diagnostics; viewport scope is separate.
+        const fullText = normalizeText(element.textContent, Number.MAX_SAFE_INTEGER);
+        return {
         element,
         role: roleFromElement(element, fallbackRole),
-        text: normalizeText(element.textContent, TURN_TEXT_CHAR_BUDGET),
-      }))
+        text: fullText.slice(0, TURN_TEXT_CHAR_BUDGET),
+        ...(fullText.length > TURN_TEXT_CHAR_BUDGET ? {
+          textTruncated: true,
+          textOriginalLength: fullText.length,
+          textLimit: TURN_TEXT_CHAR_BUDGET,
+        } : {}),
+        turnId: element.getAttribute("data-message-id")
+          || element.getAttribute("data-turn-id")
+          || element.getAttribute("data-testid")
+          || `visible-turn-${index}`,
+        branchId: element.getAttribute("data-branch-id")
+          || element.closest("[data-branch-id]")?.getAttribute("data-branch-id")
+          || null,
+      };
+      })
       .filter(turn => turn.text);
-    return selectViewportAnchoredTurns(turns, 12).map(turn => ({ role: turn.role, text: turn.text }));
+    turns.forEach((turn, index) => {
+      turn.parentTurnId = index > 0 ? turns[index - 1].turnId : null;
+    });
+    const selected = selectViewportAnchoredTurns(turns, 12);
+    const selectedIds = new Set(selected.map(turn => turn.turnId));
+    return selected.map(turn => ({
+      role: turn.role,
+      text: turn.text,
+      turnId: turn.turnId,
+      parentTurnId: turn.parentTurnId,
+      parentAvailable: !turn.parentTurnId || selectedIds.has(turn.parentTurnId),
+      branchId: turn.branchId,
+      ...(turn.textTruncated ? {
+        textTruncated: true,
+        textOriginalLength: turn.textOriginalLength,
+        textLimit: turn.textLimit,
+      } : {}),
+    }));
   }
 
   function extractChatGptTurns() {
@@ -375,11 +409,61 @@
     return extractTurnsFromSelectors(["article", "[class*='query']", "[class*='response']"]);
   }
 
+  // Generic conversation extraction for AI surfaces WITHOUT a dedicated adapter.
+  // Strong chat-structure markers only — nothing broad enough to false-positive on
+  // mail/docs/design surfaces. Turns extracted this way are marked
+  // conversationExtraction: "generic_heuristic" so the backend treats them as
+  // unvetted page-visible content instead of adapter-verified conversation.
+  const GENERIC_AI_CHAT_TURN_SELECTORS = [
+    "[data-message-author-role]",
+    "[data-role='user']",
+    "[data-role='assistant']",
+    "[data-testid*='user-message']",
+    "[data-testid*='assistant-message']",
+    "[data-testid*='conversation-turn']",
+    "[data-testid*='user-query']",
+    "[data-testid*='model-response']",
+    "[class*='conversation-turn']",
+  ];
+
+  function extractGenericAiChatTurns() {
+    const turns = extractTurnsFromSelectors(GENERIC_AI_CHAT_TURN_SELECTORS);
+    // A single role-less match is more likely page noise than a conversation.
+    if (turns.length < 2 && !turns.some(turn => turn.role !== "unknown")) return [];
+    return turns;
+  }
+
+  function extractGoogleAiModeTurns() {
+    const structured = extractGenericAiChatTurns();
+    if (structured.length) return structured;
+    // Google AI Mode's DOM is obfuscated and churns, so selector-based extraction is
+    // unreliable long-term. Durable fallback: the query box is the user turn and the
+    // visible answer region is one assistant turn — enough for the latest exchange to
+    // travel. Downstream this is marked generic_heuristic (unvetted) by construction.
+    const queryBox = document.querySelector("textarea[name='q'], input[name='q']");
+    const query = normalizeText(queryBox && queryBox.value ? queryBox.value : "", Number.MAX_SAFE_INTEGER);
+    const answer = firstText(["main", "[role='main']"], Number.MAX_SAFE_INTEGER);
+    if (!answer || answer.length < 80) return [];
+    const turns = [];
+    if (query) turns.push({ role: "user", text: query });
+    turns.push({ role: "assistant", text: answer });
+    return turns.map(turn => ({
+      ...turn,
+      text: turn.text.slice(0, TURN_TEXT_CHAR_BUDGET),
+      ...(turn.text.length > TURN_TEXT_CHAR_BUDGET ? {
+        textTruncated: true,
+        textOriginalLength: turn.text.length,
+        textLimit: TURN_TEXT_CHAR_BUDGET,
+      } : {}),
+    }));
+  }
+
   function extractConversationTurns(tool = detectSourceTool()) {
     if (tool === "chatgpt") return extractChatGptTurns();
     if (tool === "claude") return extractClaudeTurns();
     if (tool === "gemini") return extractGeminiTurns();
-    return [];
+    if (tool === "google_ai_mode") return extractGoogleAiModeTurns();
+    return extractGenericAiChatTurns();
   }
 
   function inferSurfaceCapabilities(options = {}) {
@@ -708,12 +792,19 @@
         : aiMode === "deep_research"
           ? "Deep research mode with source collection and a research plan."
           : "Standard AI chat conversation.";
+    // Provenance marker: adapter-extracted turns are trusted conversation; turns from
+    // the generic/heuristic path are unvetted page-visible content and the backend
+    // writer receives an extra caution rule keyed on this exact value.
+    const conversationExtraction = (options.conversationTurns || []).length
+      ? (["chatgpt", "claude", "gemini"].includes(options.tool) ? "tool_adapter" : "generic_heuristic")
+      : null;
     return {
       aiMode: aiMode || null,
       conversationTitle: normalizeText(document.title || "", 200),
       latestUserPrompt,
       latestAssistantAnswer,
       currentSurfaceContext,
+      ...(conversationExtraction ? { conversationExtraction } : {}),
     };
   }
 
@@ -798,6 +889,10 @@
     });
 
     const selectedTextInfo = getSelectedTextInfo();
+    const sourceContextGaps = conversationTurns
+      .filter(turn => turn.parentTurnId && turn.parentAvailable === false)
+      .map(turn => ({ missingTurnId: turn.parentTurnId, requiredByTurnId: turn.turnId }));
+    const activeBranchId = [...conversationTurns].reverse().find(turn => turn.branchId)?.branchId || null;
 
     return {
       sourceType: conversationTurns.length ? "ai_conversation_visible_context" : "browser_visible_context",
@@ -830,6 +925,8 @@
       latestUserPrompt: latestUserTurn?.text || "",
       latestAssistantAnswer: latestAssistantTurn?.text || "",
       conversationTurns,
+      activeBranchId,
+      sourceContextGaps,
     };
   }
 
